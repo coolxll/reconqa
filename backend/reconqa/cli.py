@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import typer
@@ -173,6 +174,46 @@ def cmd_import_har(
             "out_file": str(out_dir / "js_endpoints.json"),
             "endpoints_found": len(js_res.get("endpoints", [])) if isinstance(js_res, dict) else 0,
         }
+    console.print_json(data=result)
+
+
+@app.command("import-text")
+def cmd_import_text(
+    source: str = typer.Argument(
+        "-",
+        help="Path to text file containing cURL / fetch / Raw HTTP / HAR JSON, or '-' for stdin.",
+    ),
+    scenario: str = typer.Option("01_devtools", "--scenario", help="Scenario name for output HAR."),
+    fmt: str = typer.Option(
+        "auto", "--format", help="Input format: auto, curl, fetch, raw_http, or har_json."
+    ),
+    domain: str | None = typer.Option(None, "--domain", help="Filter entries by target domain."),
+    out_dir: Path = typer.Option(Path("./workspaces/imported/har"), "-o", "--out-dir"),
+) -> None:
+    """Import Chrome DevTools cURL / fetch / Raw HTTP / pasted HAR JSON into a HAR 1.2 file."""
+    from reconqa.modules.recorder.text_importer import import_traffic_text
+
+    if source == "-":
+        content = sys.stdin.read()
+    else:
+        src_path = Path(source)
+        if not src_path.is_file():
+            console.print(f"[red]File not found:[/red] {src_path}")
+            raise typer.Exit(code=1)
+        content = src_path.read_text(encoding="utf-8")
+
+    result = import_traffic_text(
+        content,
+        out_dir,
+        scenario_name=scenario,
+        format_hint=fmt,
+        target_domain=domain,
+    )
+    if result.get("requests_imported", 0) == 0:
+        console.print(
+            f"[red]No valid requests parsed[/red] (detected_format={result.get('detected_format')})"
+        )
+        raise typer.Exit(code=1)
     console.print_json(data=result)
 
 
@@ -419,6 +460,34 @@ def cmd_serve(
     import uvicorn
 
     uvicorn.run("reconqa.server.app:app", host=host, port=port, reload=reload)
+
+
+@app.command("mcp")
+def cmd_mcp(
+    api_url: str | None = typer.Option(
+        None,
+        "--api-url",
+        help="ReconQA FastAPI base URL (defaults to RECONQA_API_URL or http://127.0.0.1:8000).",
+    ),
+    transport: str = typer.Option(
+        "stdio",
+        "--transport",
+        help="MCP transport: stdio, streamable-http, or sse.",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host for HTTP/SSE transports."),
+    port: int = typer.Option(8001, "--port", help="Bind port for HTTP/SSE transports."),
+) -> None:
+    """Start the ReconQA MCP server for AI Agent collaboration (Human-in-the-Loop)."""
+    try:
+        from reconqa.mcp_server import run_mcp_server
+    except ImportError as exc:
+        console.print(
+            "[red]MCP server dependencies not installed.[/red] "
+            "Run [cyan]uv sync --extra mcp[/cyan] and try again."
+        )
+        raise typer.Exit(code=1) from exc
+
+    run_mcp_server(api_url=api_url, transport=transport, host=host, port=port)
 
 
 if __name__ == "__main__":
