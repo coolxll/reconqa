@@ -754,7 +754,27 @@ def _load_credential_headers(profile: AuthProfile, target_host: str) -> dict[str
 
 
 _DENIED_BIZ_CODES = {401, 403, 10001, 40001, 40100, 40300}
-_DENIED_MSG_KEYWORDS = ("无权限", "未登录", "unauthorized", "forbidden", "token", "登录过期", "失效")
+_DENIED_MSG_KEYWORDS = (
+    "无权限",
+    "未登录",
+    "请登录",
+    "请先登录",
+    "重新登录",
+    "登录过期",
+    "登录已过期",
+    "登录信息已失效",
+    "登录失效",
+    "登录超时",
+    "失效",
+    "unauthorized",
+    "unauthenticated",
+    "forbidden",
+    "token",
+    "session expired",
+    "login required",
+    "not logged in",
+    "authentication required",
+)
 
 
 def _validate_replay_target(method_raw: str, url_raw: str) -> tuple[str, str, str]:
@@ -884,10 +904,13 @@ def _classify_matrix_verdict(
     body_json: Any,
 ) -> tuple[int | str | None, str]:
     biz_code: int | str | None = None
-    if isinstance(body_json, dict) and "code" in body_json:
-        raw_code = body_json.get("code")
-        if isinstance(raw_code, (int, str)) and not isinstance(raw_code, bool):
-            biz_code = raw_code
+    lower_body: dict[str, Any] = {}
+    if isinstance(body_json, dict):
+        lower_body = {str(k).lower(): v for k, v in body_json.items()}
+        if "code" in lower_body:
+            raw_code = lower_body.get("code")
+            if isinstance(raw_code, (int, str)) and not isinstance(raw_code, bool):
+                biz_code = raw_code
 
     if status_code == 0 or status_code >= 500:
         return biz_code, "error"
@@ -900,9 +923,14 @@ def _classify_matrix_verdict(
     if isinstance(biz_code, str) and biz_code.isdigit() and int(biz_code) in _DENIED_BIZ_CODES:
         return biz_code, "denied"
 
-    if isinstance(body_json, dict):
-        msg = str(body_json.get("message") or body_json.get("msg") or "").lower()
-        if any(kw in msg for kw in _DENIED_MSG_KEYWORDS):
+    if lower_body:
+        msg_parts = [
+            str(lower_body.get(k) or "").lower()
+            for k in ("message", "msg", "errmsg", "error", "detail", "desc")
+            if lower_body.get(k) is not None
+        ]
+        msg = " ".join(msg_parts)
+        if any(kw in msg for kw in _DENIED_MSG_KEYWORDS) or ("登录" in msg and "解锁" in msg):
             return biz_code, "denied"
 
     if 200 <= status_code < 300:

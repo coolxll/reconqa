@@ -39,7 +39,11 @@ from reconqa.modules.codegen_java.schemathesis_run import (
     _parse_stdout_fallback,
 )
 from reconqa.modules.hub.capability_map import build_capability_map
-from reconqa.modules.hub.har_parser import normalize_path
+from reconqa.modules.hub.har_parser import (
+    has_session_cookies,
+    normalize_path,
+    parse_cookie_header_names,
+)
 from reconqa.modules.performance.k6_generator import generate_k6_script
 from reconqa.modules.security.nuclei_runner import run_nuclei_scan
 from reconqa.server.routers.projects import _load_credential_headers
@@ -212,8 +216,14 @@ def _extract_auth_headers_from_hars(
                     continue
                 h_name = str(h.get("name") or "").strip()
                 h_val = str(h.get("value") or "").strip()
-                if h_name.lower() in _AUTH_HEADER_KEYS and _is_usable_auth_value(h_val):
-                    found_auth.append((h_name, h_val))
+                h_low = h_name.lower()
+                if h_low not in _AUTH_HEADER_KEYS or not _is_usable_auth_value(h_val):
+                    continue
+                if h_low == "cookie" and not has_session_cookies(
+                    parse_cookie_header_names(h_val)
+                ):
+                    continue
+                found_auth.append((h_name, h_val))
 
             if not found_auth:
                 continue

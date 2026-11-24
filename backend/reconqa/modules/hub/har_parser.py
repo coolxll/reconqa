@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,81 @@ AUTH_HEADER_NAMES = {
     "token",
     "access-token",
 }
+
+NON_AUTH_COOKIE_EXACT = frozenset(
+    {
+        "_bl_uid",
+        "_gid",
+        "_gcl_au",
+        "_fbp",
+        "_fbc",
+        "_clck",
+        "_clsk",
+        "acw_tc",
+        "acw_sc__v2",
+        "aliyungf_tc",
+        "__cf_bm",
+        "cf_clearance",
+        "ssuid",
+        "gr_user_id",
+        "distinct_id",
+        "deviceid",
+        "device_id",
+        "lang",
+        "locale",
+        "theme",
+        "timezone",
+        "currency",
+    }
+)
+
+NON_AUTH_COOKIE_PREFIXES = (
+    "_ga",
+    "_gat",
+    "hm_lvt_",
+    "hm_lpvt_",
+    "_ym_",
+    "sensorsdata",
+    "sajssdk_",
+    "sa_jssdk_",
+    "um_distinctid",
+    "cnzzdata",
+    "_hj",
+    "amplitude_",
+    "mp_",
+    "intercom-",
+    "ajs_",
+    "aliyungf_",
+    "acw_",
+)
+
+
+def is_non_auth_cookie_name(name: str) -> bool:
+    """Return True if a cookie name is a known analytics, RUM, WAF, or UI preference cookie."""
+    low = str(name or "").strip().lower()
+    if not low:
+        return True
+    if low in NON_AUTH_COOKIE_EXACT:
+        return True
+    return any(low.startswith(prefix) for prefix in NON_AUTH_COOKIE_PREFIXES)
+
+
+def parse_cookie_header_names(cookie_header: str) -> list[str]:
+    """Parse cookie names from an HTTP Cookie header string."""
+    names: list[str] = []
+    for part in str(cookie_header or "").split(";"):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        name = chunk.split("=", 1)[0].strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def has_session_cookies(cookie_names: Iterable[str]) -> bool:
+    """Return True if at least one cookie name looks like an auth/session cookie."""
+    return any(not is_non_auth_cookie_name(name) for name in cookie_names)
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -582,8 +658,16 @@ def parse_har_file(
         ts_ms = _parse_timestamp_ms(started_dt)
         normalized_path, path_params = normalize_path(raw_path)
 
-        lower_req_headers = {k.lower() for k in req_headers}
-        has_auth = bool(lower_req_headers & AUTH_HEADER_NAMES) or bool(req_cookies)
+        explicit_auth_headers = AUTH_HEADER_NAMES - {"cookie"}
+        has_explicit_auth = any(
+            k.lower() in explicit_auth_headers and str(v or "").strip() != ""
+            for k, v in req_headers.items()
+        )
+        cookie_names: list[str] = list(req_cookies.keys())
+        for k, v in req_headers.items():
+            if k.lower() == "cookie":
+                cookie_names.extend(parse_cookie_header_names(v))
+        has_auth = has_explicit_auth or has_session_cookies(cookie_names)
 
         entry = HarEntry(
             index=raw_idx,

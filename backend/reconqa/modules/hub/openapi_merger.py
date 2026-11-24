@@ -101,6 +101,60 @@ BIZ_CODE_CANDIDATE_KEYS = (
 
 HTTP_METHODS_WITH_BODY = {"POST", "PUT", "PATCH", "DELETE"}
 
+_AUTH_ERROR_MSG_PHRASES = (
+    "未登录",
+    "请登录",
+    "请先登录",
+    "重新登录",
+    "登录已过期",
+    "登录信息已失效",
+    "登录失效",
+    "登录超时",
+    "令牌无效",
+    "令牌过期",
+    "无权限",
+    "unauthorized",
+    "not logged in",
+    "login required",
+    "please login",
+    "please sign in",
+    "session expired",
+    "token expired",
+    "invalid token",
+    "authentication required",
+    "unauthenticated",
+)
+
+_AUTH_ERROR_MSG_KEYS = ("msg", "message", "errmsg", "error", "detail", "desc")
+
+
+def _response_indicates_auth_required(entry: HarEntry) -> bool:
+    """Return True if a HAR response clearly indicates authentication/session is required."""
+    if entry.status in (401, 403):
+        return True
+    if not isinstance(entry.response_json, dict):
+        return False
+
+    lower_map = {str(k).lower(): v for k, v in entry.response_json.items()}
+    for key in _AUTH_ERROR_MSG_KEYS:
+        val = lower_map.get(key)
+        if not isinstance(val, str) or not val.strip():
+            continue
+        msg = val.lower()
+        if any(phrase in msg for phrase in _AUTH_ERROR_MSG_PHRASES):
+            return True
+        if "登录" in msg and "解锁" in msg:
+            return True
+
+    if entry.status == 200 and lower_map.get("success") is not True:
+        raw_code = lower_map.get("code")
+        if isinstance(raw_code, int) and not isinstance(raw_code, bool) and raw_code in (401, 403):
+            return True
+        if isinstance(raw_code, str) and raw_code.strip() in {"401", "403"}:
+            return True
+
+    return False
+
 
 def _percentile(values: list[float], pct: float) -> float:
     if not values:
@@ -302,7 +356,9 @@ def _infer_biz_success(
     dict_responses = [
         e.response_json
         for e in entries
-        if 200 <= e.status < 300 and isinstance(e.response_json, dict)
+        if 200 <= e.status < 300
+        and isinstance(e.response_json, dict)
+        and not _response_indicates_auth_required(e)
     ]
     if not dict_responses:
         return global_fallback
@@ -595,7 +651,9 @@ def merge_to_openapi(
         }
 
         custom_headers = _extract_custom_headers(har_group)
-        requires_auth = any(e.has_auth for e in har_group)
+        requires_auth = any(
+            e.has_auth or _response_indicates_auth_required(e) for e in har_group
+        )
         biz_success = _infer_biz_success(
             har_group,
             norm_path,

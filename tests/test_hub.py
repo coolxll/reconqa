@@ -516,3 +516,147 @@ def test_openapi_merger_multihost_origins_and_clean_custom_headers(tmp_path: Pat
         "https://pc-api.example.com",
         "https://acctrade-api.example.com",
     ]
+
+
+def test_har_parser_ignores_analytics_waf_cookies_for_has_auth(tmp_path: Path) -> None:
+    """Verify telemetry/WAF cookies (_bl_uid, _ga, acw_tc) do not trigger has_auth while real session/Bearer do."""
+
+    def _entry(url: str, headers: list[dict[str, str]], cookies: list[dict[str, str]] | None = None) -> dict:
+        body = json.dumps({"code": 0, "data": {}})
+        return {
+            "startedDateTime": "2026-11-24T03:00:00.000Z",
+            "time": 10.0,
+            "request": {
+                "method": "GET",
+                "url": url,
+                "httpVersion": "HTTP/2",
+                "headers": headers,
+                "queryString": [],
+                "cookies": cookies or [],
+            },
+            "response": {
+                "status": 200,
+                "statusText": "OK",
+                "httpVersion": "HTTP/2",
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "cookies": [],
+                "content": {"size": len(body), "mimeType": "application/json", "text": body},
+            },
+            "timings": {"send": 1, "wait": 5, "receive": 4},
+        }
+
+    har_payload = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                _entry(
+                    "https://api.example.com/api/v1/public-telemetry",
+                    [{"name": "Cookie", "value": "_bl_uid=abc123; _ga=GA1.1.12345; acw_tc=xyz; lang=zh"}],
+                    cookies=[
+                        {"name": "_bl_uid", "value": "abc123"},
+                        {"name": "_ga", "value": "GA1.1.12345"},
+                    ],
+                ),
+                _entry(
+                    "https://api.example.com/api/v1/session-auth",
+                    [{"name": "Cookie", "value": "_bl_uid=abc123; session_id=real-sess-999"}],
+                    cookies=[
+                        {"name": "_bl_uid", "value": "abc123"},
+                        {"name": "session_id", "value": "real-sess-999"},
+                    ],
+                ),
+                _entry(
+                    "https://api.example.com/api/v1/bearer-auth",
+                    [
+                        {"name": "Cookie", "value": "_bl_uid=abc123"},
+                        {"name": "Authorization", "value": "Bearer jwt-token-123"},
+                    ],
+                ),
+            ],
+        }
+    }
+    har_file = tmp_path / "cookies_auth.har"
+    har_file.write_text(json.dumps(har_payload), encoding="utf-8")
+
+    entries = {e.normalized_path: e for e in parse_har_file(har_file)}
+    assert entries["/api/v1/public-telemetry"].has_auth is False
+    assert entries["/api/v1/session-auth"].has_auth is True
+    assert entries["/api/v1/bearer-auth"].has_auth is True
+
+
+def test_openapi_merger_infers_requires_auth_from_unauthenticated_responses(tmp_path: Path) -> None:
+    """Verify anonymous HTTP 200 auth-denial responses set x-requires-auth=True and do NOT pollute x-biz-success."""
+    har_dir = tmp_path / "anon_auth_err"
+    har_dir.mkdir(parents=True, exist_ok=True)
+
+    def _entry(ts: str, url: str, resp_obj: dict, status: int = 200) -> dict:
+        body = json.dumps(resp_obj, ensure_ascii=False)
+        return {
+            "startedDateTime": ts,
+            "time": 15.0,
+            "request": {
+                "method": "GET",
+                "url": url,
+                "httpVersion": "HTTP/2",
+                "headers": [{"name": "Cookie", "value": "_bl_uid=rum-only-id"}],
+                "queryString": [],
+                "cookies": [{"name": "_bl_uid", "value": "rum-only-id"}],
+            },
+            "response": {
+                "status": status,
+                "statusText": "OK",
+                "httpVersion": "HTTP/2",
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "cookies": [],
+                "content": {"size": len(body.encode("utf-8")), "mimeType": "application/json", "text": body},
+            },
+            "timings": {"send": 1, "wait": 10, "receive": 4},
+        }
+
+    har_payload = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                _entry(
+                    "2026-11-24T04:00:01.000Z",
+                    "https://api.example.com/api/v1/public/banner",
+                    {"code": 0, "data": {"items": []}},
+                ),
+                _entry(
+                    "2026-11-24T04:00:02.000Z",
+                    "https://api.example.com/api/v1/user/wallet",
+                    {"code": 84101, "msg": "登录信息已失效"},
+                ),
+                _entry(
+                    "2026-11-24T04:00:03.000Z",
+                    "https://api.example.com/api/v1/user/orders",
+                    {"Code": 2002, "Msg": "未登录"},
+                ),
+                _entry(
+                    "2026-11-24T04:00:04.000Z",
+                    "https://api.example.com/api/v1/user/favorites",
+                    {"Code": 84103, "Msg": "登录悠悠有品，解锁更多功能"},
+                ),
+            ],
+        }
+    }
+    (har_dir / "01_anon.har").write_text(json.dumps(har_payload, ensure_ascii=False), encoding="utf-8")
+
+    spec = merge_to_openapi(har_dir, tmp_path / "hub_anon", target_domain="example.com")
+    paths = spec["paths"]
+
+    # Public endpoint stays unauthenticated with biz_success code=0
+    banner_op = paths["/api/v1/public/banner"]["get"]
+    assert banner_op["x-requires-auth"] is False
+    assert banner_op["x-biz-success"] == {"field": "code", "value": 0}
+
+    # All 3 auth-denied endpoints infer x-requires-auth=True and do NOT adopt 84101/2002/84103 as biz_success
+    for ep_path, bad_code in (
+        ("/api/v1/user/wallet", 84101),
+        ("/api/v1/user/orders", 2002),
+        ("/api/v1/user/favorites", 84103),
+    ):
+        op = paths[ep_path]["get"]
+        assert op["x-requires-auth"] is True, f"Expected x-requires-auth=True on {ep_path}"
+        assert op["x-biz-success"] == {"field": "code", "value": 0}
+        assert op["x-biz-success"]["value"] != bad_code

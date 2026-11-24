@@ -541,3 +541,69 @@ async def test_custom_business_roles_and_replay_matrix_bfla_detection(
     finally:
         srv.shutdown()
         await asyncio.sleep(0)
+
+
+def test_extract_auth_headers_skips_analytics_cookies_and_matrix_verdict_case_insensitive(
+    tmp_path: Path,
+) -> None:
+    """Verify _extract_auth_headers_from_hars skips telemetry-only cookies and _classify_matrix_verdict handles Code/Msg."""
+    from reconqa.server.routers.acceptance import _extract_auth_headers_from_hars
+    from reconqa.server.routers.projects import _classify_matrix_verdict
+
+    def _write_har(name: str, headers: list[dict[str, str]]) -> Path:
+        p = tmp_path / name
+        p.write_text(
+            json.dumps(
+                {
+                    "log": {
+                        "version": "1.2",
+                        "entries": [
+                            {
+                                "request": {
+                                    "method": "GET",
+                                    "url": "https://api.example.com/api/v1/profile",
+                                    "headers": headers,
+                                },
+                                "response": {
+                                    "status": 200,
+                                    "content": {"mimeType": "application/json", "text": '{"code":0}'},
+                                },
+                            }
+                        ],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return p
+
+    # 1. Anonymous HAR with only _bl_uid / _ga cookies -> extracts nothing
+    anon_har = _write_har(
+        "anon.har",
+        [{"name": "Cookie", "value": "_bl_uid=arms-123; _ga=GA1.2.3.4; acw_tc=waf-99"}],
+    )
+    extracted_anon, host_anon = _extract_auth_headers_from_hars([anon_har])
+    assert extracted_anon == {}
+    assert host_anon == ""
+
+    # 2. Authenticated HAR with real session cookie + Bearer token -> extracts both
+    auth_har = _write_har(
+        "auth.har",
+        [
+            {"name": "Cookie", "value": "_bl_uid=arms-123; sid=real-session-abc"},
+            {"name": "Authorization", "value": "Bearer live-jwt-token"},
+        ],
+    )
+    extracted_auth, host_auth = _extract_auth_headers_from_hars([auth_har])
+    assert host_auth == "api.example.com"
+    assert extracted_auth["Authorization"] == "Bearer live-jwt-token"
+    assert "sid=real-session-abc" in extracted_auth["Cookie"]
+
+    # 3. _classify_matrix_verdict handles case-insensitive Code/Msg & auth-denial phrases
+    assert _classify_matrix_verdict(200, {"Code": 2002, "Msg": "未登录"}) == (2002, "denied")
+    assert _classify_matrix_verdict(200, {"code": 84101, "msg": "登录信息已失效"}) == (84101, "denied")
+    assert _classify_matrix_verdict(200, {"Code": 84103, "Msg": "登录悠悠有品，解锁更多功能"}) == (
+        84103,
+        "denied",
+    )
+    assert _classify_matrix_verdict(200, {"Code": 0, "Msg": "OK", "Data": {"ok": True}}) == (0, "allowed")
