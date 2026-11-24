@@ -21,6 +21,16 @@ services:
       timeout: 5s
       retries: 3
 
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    image: reconqa-frontend:latest
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
   mitmproxy:
     image: reconqa-backend:latest
     profiles: ["recorder"]
