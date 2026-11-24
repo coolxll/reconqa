@@ -428,6 +428,9 @@ class BusinessCapability(BaseModel):
     module: str
     resource: str
     display_name: str
+    title_zh: str = ""
+    title_en: str = ""
+    is_core: bool = False
     total_endpoints: int = 0
     live_endpoints: int = 0
     write_endpoints: int = 0
@@ -448,6 +451,7 @@ class BusinessCapability(BaseModel):
 class CapabilityQualityMetrics(BaseModel):
     total_endpoints: int = 0
     total_capabilities: int = 0
+    core_capabilities: int = 0
     live_capabilities: int = 0
     target_capabilities: int = 0
     capability_coverage_pct: float = 0.0
@@ -460,6 +464,10 @@ class CapabilityQualityMetrics(BaseModel):
     negative_slots_total: int = 0
     negative_slots_tested: int = 0
     negative_coverage_pct: float = 0.0
+    slots_passed: int = 0
+    slots_failed: int = 0
+    slots_pending: int = 0
+    slots_missing: int = 0
     invariant_assertions_total: int = 0
     invariant_assertions_passed: int = 0
     invariant_pass_rate_pct: float = 0.0
@@ -484,6 +492,7 @@ class PromoteCapabilityRequest(BaseModel):
     capability_key: str = Field(..., min_length=1, max_length=255)
     priority: ScenarioPriority | None = None
     name: str | None = Field(default=None, max_length=255)
+    lang: Literal["zh", "en"] = "zh"
 
 
 # --- Autonomous External-System Acceptance Glue DTOs ---

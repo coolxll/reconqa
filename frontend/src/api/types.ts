@@ -906,6 +906,9 @@ export interface BusinessCapability {
   module: string;
   resource: string;
   display_name: string;
+  title_zh?: string;
+  title_en?: string;
+  is_core?: boolean;
   total_endpoints: number;
   live_endpoints: number;
   write_endpoints: number;
@@ -926,6 +929,7 @@ export interface BusinessCapability {
 export interface CapabilityQualityMetrics {
   total_endpoints: number;
   total_capabilities: number;
+  core_capabilities?: number;
   live_capabilities: number;
   target_capabilities: number;
   capability_coverage_pct: number;
@@ -941,6 +945,10 @@ export interface CapabilityQualityMetrics {
   invariant_assertions_total: number;
   invariant_assertions_passed: number;
   invariant_pass_rate_pct: number;
+  slots_passed?: number;
+  slots_failed?: number;
+  slots_pending?: number;
+  slots_missing?: number;
 }
 
 export interface CapabilityModuleSummary {
@@ -962,6 +970,7 @@ export interface PromoteCapabilityRequest {
   capability_key: string;
   priority?: ScenarioPriority;
   name?: string;
+  lang?: "zh" | "en";
 }
 
 // --- SSE Events ---

@@ -118,6 +118,84 @@ _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _ROLE_ORDER = {"admin": 0, "pharmacy": 1, "doctor": 2, "assistant": 3, "patient": 4, "common": 5}
 _SLOT_PRECEDENCE = {"failed": 3, "covered": 2, "pending": 1, "missing": 0}
 
+_NOISE_MODULES = {
+    "v1",
+    "v2",
+    "v3",
+    "v4",
+    "api",
+    "root",
+    "index",
+    "file",
+    "tool",
+    "tuikit",
+    "static",
+    "assets",
+    "public",
+    "health",
+    "actuator",
+}
+
+_RESOURCE_TITLES: dict[str, tuple[str, str]] = {
+    "order": ("订单管理", "Orders"),
+    "drugs": ("药品与商品", "Drugs & Goods"),
+    "pres": ("处方管理", "Prescriptions"),
+    "con": ("在线问诊", "Consultations"),
+    "bill": ("账单与结算", "Billing & Refunds"),
+    "coupon": ("优惠券营销", "Coupons"),
+    "schedule": ("排班管理", "Scheduling"),
+    "role": ("角色与权限", "RBAC Roles"),
+    "user": ("用户管理", "Users"),
+    "doctor": ("医生管理", "Doctors"),
+    "dept": ("科室管理", "Departments"),
+    "disease": ("疾病库", "Diseases"),
+    "commission": ("分佣配置", "Commissions"),
+    "invoice": ("发票管理", "Invoices"),
+    "salesperson": ("销售与推广", "Salespersons"),
+    "shop": ("门店管理", "Shops"),
+    "manage": ("经营看板", "Analytics"),
+    "config": ("系统配置", "Config"),
+    "tj": ("体检服务", "Health Checkup"),
+    "itv": ("随访管理", "Follow-up"),
+    "know": ("科普知识", "Knowledge"),
+    "news": ("资讯管理", "News"),
+    "pay": ("支付管理", "Payments"),
+    "registerorder": ("挂号订单", "Registration Orders"),
+    "payorder": ("缴费订单", "Payment Orders"),
+    "checkitem": ("检查检验", "Lab & Exam"),
+    "complaint": ("客诉反馈", "Complaints"),
+    "level": ("会员等级", "Membership"),
+    "label": ("标签管理", "Labels"),
+    "brand": ("品牌管理", "Brands"),
+    "category": ("分类管理", "Categories"),
+    "freight": ("运费模板", "Freight"),
+    "sms": ("短信模板", "SMS Templates"),
+    "prt": ("推广分账", "Promo Settlement"),
+    "cloud-bill": ("云账单", "Cloud Billing"),
+    "permission": ("权限树", "Permissions"),
+    "dictionary": ("数据字典", "Dictionaries"),
+    "menu": ("菜单权限", "Menus"),
+    "paymentcode": ("收款码", "Payment Codes"),
+    "paymentrecords": ("收款与退费记录", "Payment Records"),
+}
+
+
+def resolve_capability_titles(module: str, resource: str) -> tuple[str, str]:
+    """Return localized (title_zh, title_en) for a business capability."""
+    res_low = (resource or "").strip().lower()
+    if res_low in _RESOURCE_TITLES:
+        return _RESOURCE_TITLES[res_low]
+    if res_low.endswith("s") and res_low[:-1] in _RESOURCE_TITLES:
+        return _RESOURCE_TITLES[res_low[:-1]]
+    fallback = f"{module} / {resource}"
+    return fallback, fallback
+
+
+def endpoint_capability_key(path: str, host: str = "") -> str:
+    """Return normalized '{module}/{resource}' capability key for an API endpoint."""
+    module, resource, _ = _normalize_endpoint_parts(path, host=host)
+    return f"{module}/{resource}"
+
 
 def _natural_sort_key(value: str) -> list[Any]:
     return [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", str(value or ""))]
@@ -287,6 +365,8 @@ def build_capability_map(
     scenarios: list[Any],
     project_id: str,
     project_name: str,
+    *,
+    include_noise: bool = False,
 ) -> dict[str, Any]:
     """Group flat API endpoints into normalized Business Capabilities (Resource x Action x Role x State)."""
     endpoints = list(inventory.get("endpoints") or [])
@@ -320,6 +400,8 @@ def build_capability_map(
         is_write = method in _WRITE_METHODS
 
         module, resource, role = _normalize_endpoint_parts(path, host=host)
+        if not include_noise and module in _NOISE_MODULES:
+            continue
         action = _classify_action(method, path)
         key = f"{module}/{resource}"
 
@@ -460,9 +542,9 @@ def build_capability_map(
         assertion_statuses = [str(a.get("status") or "pending").lower() for a in all_assertions]
         if "failed" in assertion_statuses:
             hp_status = "failed"
-        elif live_ep > 0 and len(all_assertions) >= 1:
+        elif "passed" in assertion_statuses:
             hp_status = "covered"
-        elif live_ep > 0:
+        elif live_ep > 0 or all_assertions:
             hp_status = "pending"
         else:
             hp_status = "missing"
@@ -511,12 +593,18 @@ def build_capability_map(
             ),
         )
 
+        is_core = (live_ep >= 2) or (live_ep >= 1 and write_ep >= 1) or (total_ep >= 12)
+        title_zh, title_en = resolve_capability_titles(b["module"], b["resource"])
+
         capabilities_out.append(
             {
                 "key": key,
                 "module": b["module"],
                 "resource": b["resource"],
                 "display_name": b["display_name"],
+                "title_zh": title_zh,
+                "title_en": title_en,
+                "is_core": is_core,
                 "total_endpoints": total_ep,
                 "live_endpoints": live_ep,
                 "write_endpoints": write_ep,
@@ -561,6 +649,8 @@ def build_capability_map(
     # 3. Compute 5-Dimensional Quality Metrics
     total_endpoints = len(endpoints)
     total_capabilities = len(capabilities_out)
+    core_caps = [c for c in capabilities_out if c["is_core"]]
+    core_capabilities = len(core_caps)
     live_capabilities = sum(1 for c in capabilities_out if c["live_endpoints"] > 0)
     target_capabilities = (
         max(min(30, live_capabilities), 1)
@@ -616,6 +706,23 @@ def build_capability_map(
         else 0.0
     )
 
+    slot_scope_caps = core_caps if core_caps else scope_caps
+    slots_passed = 0
+    slots_failed = 0
+    slots_pending = 0
+    slots_missing = 0
+    for c in slot_scope_caps:
+        for slot in c["case_matrix"]:
+            st = slot["status"]
+            if st == "covered":
+                slots_passed += 1
+            elif st == "failed":
+                slots_failed += 1
+            elif st == "pending":
+                slots_pending += 1
+            else:
+                slots_missing += 1
+
     all_project_assertions = [
         a for sc in norm_scenarios for a in (sc.get("assertions") or []) if isinstance(a, dict)
     ]
@@ -635,6 +742,7 @@ def build_capability_map(
         "metrics": {
             "total_endpoints": total_endpoints,
             "total_capabilities": total_capabilities,
+            "core_capabilities": core_capabilities,
             "live_capabilities": live_capabilities,
             "target_capabilities": target_capabilities,
             "capability_coverage_pct": capability_coverage_pct,
@@ -647,6 +755,10 @@ def build_capability_map(
             "negative_slots_total": negative_slots_total,
             "negative_slots_tested": negative_slots_tested,
             "negative_coverage_pct": negative_coverage_pct,
+            "slots_passed": slots_passed,
+            "slots_failed": slots_failed,
+            "slots_pending": slots_pending,
+            "slots_missing": slots_missing,
             "invariant_assertions_total": invariant_assertions_total,
             "invariant_assertions_passed": invariant_assertions_passed,
             "invariant_pass_rate_pct": invariant_pass_rate_pct,

@@ -260,6 +260,7 @@ export function getProjectInventoryOpenApiUrl(projectId: string): string {
 export interface CapabilityMapFilters {
   module?: string;
   role?: string;
+  core_only?: boolean;
   live_only?: boolean;
   has_writes?: boolean;
   q?: string;
@@ -272,6 +273,7 @@ export function getProjectCapabilities(
   const search = new URLSearchParams();
   if (params?.module && params.module !== "ALL") search.set("module", params.module);
   if (params?.role && params.role !== "ALL") search.set("role", params.role);
+  if (params?.core_only) search.set("core_only", "true");
   if (params?.live_only) search.set("live_only", "true");
   if (params?.has_writes) search.set("has_writes", "true");
   if (params?.q && params.q.trim()) search.set("q", params.q.trim());

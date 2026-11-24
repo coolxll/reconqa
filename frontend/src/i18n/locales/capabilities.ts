@@ -2,74 +2,89 @@ import { registerMessages } from "../index";
 
 registerMessages({
   zh: {
-    "cap.loading": "正在聚合业务能力图谱（资源 × 动作 × 角色 × 状态机）...",
-    "cap.errorLoad": "加载业务能力图谱失败。",
+    "cap.loading": "正在聚合业务能力质量矩阵…",
+    "cap.errorLoad": "加载业务能力矩阵失败。",
     "cap.errorPromote": "生成 5 用例业务场景失败。",
     "cap.emptyTitle": "暂无业务能力聚类数据",
     "cap.emptyDesc":
-      "请先通过「资产探索」或「测试运行」导入 HAR / cURL 流量，系统将自动按 资源 × 动作 × 角色 × 状态机 聚类压缩接口资产。",
-    "cap.emptyFilteredTitle": "没有符合当前筛选条件的业务能力",
-    "cap.emptyFilteredDesc": "尝试关闭「仅看活跃能力」/「仅含写接口」开关，或清空搜索与模块筛选。",
-    "cap.clearFilters": "重置筛选条件",
+      "请先通过「资产探索」或「测试运行」导入 HAR / cURL 流量，系统将自动把零散接口聚合成核心业务能力并追踪 5 道质量防线。",
+    "cap.emptyFilteredTitle": "当前筛选条件下没有匹配的业务能力",
+    "cap.emptyFilteredDesc": "尝试切换至「全部活跃」或「全部」范围，或清空搜索与模块筛选。",
+    "cap.clearFilters": "查看全部能力",
     "cap.refresh": "刷新",
 
-    // 5-Dimensional Quality KPI Strip
-    "cap.kpi.compressionTitle": "能力压缩与覆盖",
-    "cap.kpi.compressionSub": "由 {endpoints} 个接口自动聚类（覆盖率 {pct}%）",
-    "cap.kpi.stateTitle": "状态机覆盖",
-    "cap.kpi.stateSub": "{pct}% · 已识别 {total} 个含状态流转能力",
-    "cap.kpi.roleTitle": "角色权限矩阵",
-    "cap.kpi.roleSub": "已验证 {covered} / {total} 个角色权限单元",
-    "cap.kpi.negativeTitle": "异常路径覆盖",
-    "cap.kpi.negativeSub": "已测 {tested} / {total} 个异常边界槽位",
-    "cap.kpi.invariantTitle": "不变量断言通过率",
-    "cap.kpi.invariantSub": "已通过 {passed} / {total} 条业务不变量断言",
+    // Purpose + Legend Header
+    "cap.purposeLine":
+      "将 {endpoints} 个接口聚合成 {core} 个核心业务能力，按 5 道质量防线一眼定位「哪里没测、哪里测出了缺陷」。",
+    "cap.legend.passed": "验证通过",
+    "cap.legend.failed": "发现缺陷",
+    "cap.legend.pending": "已建待测",
+    "cap.legend.missing": "未覆盖",
 
-    // Filter & Module Bar
-    "cap.searchPlaceholder": "搜索能力名、资源、动作、角色或接口路径…",
-    "cap.filter.liveOnly": "仅看活跃能力",
-    "cap.filter.hasWrites": "仅含写接口",
+    // Clean 3-Card Summary Strip
+    "cap.summary.coreTitle": "核心业务能力",
+    "cap.summary.coreUnit": "个",
+    "cap.summary.coreSub": "由 {endpoints} 个接口聚合 · 含 {stateful} 个状态机",
+    "cap.summary.matrixTitle": "5 道防线实测态势",
+    "cap.summary.matrixPassed": "{count} 通过",
+    "cap.summary.matrixFailed": "{count} 缺陷",
+    "cap.summary.matrixPending": "{count} 待测",
+    "cap.summary.matrixSub": "覆盖正向、缺参、状态机、越权、幂等 5 类用例槽位",
+    "cap.summary.invariantTitle": "不变量断言通过率",
+    "cap.summary.invariantSub": "已通过 {passed} / {total} 条业务不变量断言",
+
+    // Filter Bar & Scope Switcher
+    "cap.searchPlaceholder": "搜索中文能力名、模块、路径或动作…",
+    "cap.scope.core": "核心能力",
+    "cap.scope.live": "全部活跃",
+    "cap.scope.all": "全部",
     "cap.filter.roleLabel": "角色筛选",
     "cap.filter.allRoles": "全部角色",
     "cap.filter.allModules": "全部模块",
-    "cap.filter.showing": "当前展示 {count} 项能力",
+    "cap.filter.showing": "共 {count} 项能力",
 
-    // Role labels
-    "cap.role.admin": "管理端 admin",
-    "cap.role.pharmacy": "药房端 pharmacy",
-    "cap.role.doctor": "医生端 doctor",
-    "cap.role.assistant": "医助端 assistant",
-    "cap.role.patient": "患者端 patient",
-    "cap.role.common": "通用 common",
+    // Localized Role Names
+    "cap.role.admin": "管理员",
+    "cap.role.pharmacy": "药店",
+    "cap.role.doctor": "医生",
+    "cap.role.assistant": "医助",
+    "cap.role.patient": "患者",
+    "cap.role.common": "通用",
 
-    // Capability Card
-    "cap.liveRatio": "{live} / {total} 活跃",
-    "cap.writesBadge": "{count} 写接口",
-    "cap.stateMachineBadge": "状态机",
-    "cap.rolesLabel": "涉及角色",
-    "cap.actionsLabel": "业务动作",
-    "cap.statesLabel": "观测状态值",
-    "cap.caseMatrixLabel": "5 用例有效性矩阵",
-    "cap.caseCoveragePct": "{pct}%",
+    // Matrix Table Columns
+    "cap.table.colCapability": "业务能力",
+    "cap.table.colRoles": "涉及角色",
+    "cap.table.colAction": "操作",
     "cap.slot.happy_path": "正向",
     "cap.slot.invalid_params": "缺参",
     "cap.slot.illegal_state": "状态机",
     "cap.slot.authz_role": "越权",
     "cap.slot.consistency_idempotency": "幂等",
-    "cap.slotStatus.covered": "已覆盖",
-    "cap.slotStatus.failed": "失败",
-    "cap.slotStatus.pending": "待验证",
-    "cap.slotStatus.missing": "缺失",
 
-    // Promote to 5-Case Scenario
-    "cap.promoteBtn": "生成 5 用例场景",
-    "cap.promoteUpdateBtn": "同步 5 用例场景",
+    // Matrix Cell Labels & Tooltips
+    "cap.cell.failed": "缺陷",
+    "cap.cell.pending": "待测",
+    "cap.slotStatus.covered": "验证通过",
+    "cap.slotStatus.failed": "发现缺陷",
+    "cap.slotStatus.pending": "已建待测",
+    "cap.slotStatus.missing": "未覆盖",
+
+    // Capability Row Subline & Badges
+    "cap.rowSubline": "{live}/{total} 接口 · {writes} 写",
+    "cap.rowStatePill": "状态: {vals}",
+
+    // Row Actions & Promote Toast
+    "cap.promoteBtn": "生成 5 用例",
+    "cap.syncBtnTitle": "同步更新 5 用例场景",
+    "cap.viewScenarioBtn": "查看场景",
     "cap.promoting": "生成中…",
-    "cap.promotedToast": "已为「{capability}」生成 5 用例业务场景：{scenario}",
-    "cap.openScenario": "查看业务场景 →",
-    "cap.linkedScenariosLabel": "已关联场景",
+    "cap.promotedToast": "已为「{capability}」生成 5 用例场景：{scenario}",
+    "cap.openScenario": "打开场景 →",
 
-    // Expanded Endpoints Table
+    // Expanded Row Detail
+    "cap.actionsLabel": "业务动作",
+    "cap.statesLabel": "观测状态机",
+    "cap.linkedScenariosLabel": "已关联场景",
     "cap.endpointsHeader": "聚合接口明细 ({count})",
     "cap.col.method": "方法",
     "cap.col.path": "接口路径",
@@ -81,40 +96,49 @@ registerMessages({
     "cap.noEndpoints": "该能力下暂无接口明细。",
   },
   en: {
-    "cap.loading": "Synthesizing Business Capability Map (Resource × Action × Role × State)...",
-    "cap.errorLoad": "Failed to load Business Capability Map.",
-    "cap.errorPromote": "Failed to promote capability to 5-case scenario.",
+    "cap.loading": "Synthesizing Business Capability Quality Matrix…",
+    "cap.errorLoad": "Failed to load Business Capability Matrix.",
+    "cap.errorPromote": "Failed to generate 5-case scenario.",
     "cap.emptyTitle": "No Business Capabilities Synthesized Yet",
     "cap.emptyDesc":
-      "Import HAR / cURL traffic via Discovery or Runs to cluster flat endpoints into Resource × Action × Role × State business capabilities.",
+      "Import HAR / cURL traffic via Discovery or Runs to cluster flat endpoints into core business capabilities across 5 QA defense lines.",
     "cap.emptyFilteredTitle": "No Capabilities Match Current Filters",
     "cap.emptyFilteredDesc":
-      "Try toggling off 'Live Only' or 'Has Writes', or clearing your search and module filters.",
-    "cap.clearFilters": "Reset Filters",
+      "Switch scope to 'All Live' or 'All', or clear your search and module filters.",
+    "cap.clearFilters": "Show All Capabilities",
     "cap.refresh": "Refresh",
 
-    // 5-Dimensional Quality KPI Strip
-    "cap.kpi.compressionTitle": "Capability Coverage",
-    "cap.kpi.compressionSub": "Clustered from {endpoints} endpoints ({pct}% live)",
-    "cap.kpi.stateTitle": "State Machine Coverage",
-    "cap.kpi.stateSub": "{pct}% · {total} stateful capabilities detected",
-    "cap.kpi.roleTitle": "Role AuthZ Matrix",
-    "cap.kpi.roleSub": "{covered} / {total} role permission cells covered",
-    "cap.kpi.negativeTitle": "Negative Path Coverage",
-    "cap.kpi.negativeSub": "{tested} / {total} negative rule slots tested",
-    "cap.kpi.invariantTitle": "Invariant Pass Rate",
-    "cap.kpi.invariantSub": "{passed} / {total} business invariants passed",
+    // Purpose + Legend Header
+    "cap.purposeLine":
+      "Clusters {endpoints} endpoints into {core} core business capabilities so you can spot coverage gaps and defects across 5 QA defenses in seconds.",
+    "cap.legend.passed": "Passed",
+    "cap.legend.failed": "Defect Found",
+    "cap.legend.pending": "Pending Verification",
+    "cap.legend.missing": "Uncovered",
 
-    // Filter & Module Bar
-    "cap.searchPlaceholder": "Search capability, resource, action, role, or path…",
-    "cap.filter.liveOnly": "Live Only",
-    "cap.filter.hasWrites": "Has Writes",
+    // Clean 3-Card Summary Strip
+    "cap.summary.coreTitle": "Core Capabilities",
+    "cap.summary.coreUnit": "",
+    "cap.summary.coreSub": "Clustered from {endpoints} endpoints · {stateful} stateful",
+    "cap.summary.matrixTitle": "5-Defense Verification Pulse",
+    "cap.summary.matrixPassed": "{count} Passed",
+    "cap.summary.matrixFailed": "{count} Failed",
+    "cap.summary.matrixPending": "{count} Todo",
+    "cap.summary.matrixSub": "Happy Path, Params, State Machine, AuthZ & Idempotency slots",
+    "cap.summary.invariantTitle": "Invariant Pass Rate",
+    "cap.summary.invariantSub": "{passed} / {total} business invariants passed",
+
+    // Filter Bar & Scope Switcher
+    "cap.searchPlaceholder": "Search capability name, module, path, or action…",
+    "cap.scope.core": "Core Only",
+    "cap.scope.live": "All Live",
+    "cap.scope.all": "All",
     "cap.filter.roleLabel": "Role",
     "cap.filter.allRoles": "All Roles",
     "cap.filter.allModules": "All Modules",
-    "cap.filter.showing": "Showing {count} capabilities",
+    "cap.filter.showing": "{count} capabilities",
 
-    // Role labels
+    // Localized Role Names
     "cap.role.admin": "Admin",
     "cap.role.pharmacy": "Pharmacy",
     "cap.role.doctor": "Doctor",
@@ -122,34 +146,40 @@ registerMessages({
     "cap.role.patient": "Patient",
     "cap.role.common": "Common",
 
-    // Capability Card
-    "cap.liveRatio": "{live} / {total} live",
-    "cap.writesBadge": "{count} writes",
-    "cap.stateMachineBadge": "Stateful",
-    "cap.rolesLabel": "Roles",
-    "cap.actionsLabel": "Actions",
-    "cap.statesLabel": "Observed States",
-    "cap.caseMatrixLabel": "5-Case Matrix",
-    "cap.caseCoveragePct": "{pct}%",
+    // Matrix Table Columns
+    "cap.table.colCapability": "Capability",
+    "cap.table.colRoles": "Roles",
+    "cap.table.colAction": "Action",
     "cap.slot.happy_path": "Happy",
     "cap.slot.invalid_params": "Params",
     "cap.slot.illegal_state": "State",
     "cap.slot.authz_role": "AuthZ",
     "cap.slot.consistency_idempotency": "Idemp",
-    "cap.slotStatus.covered": "Covered",
-    "cap.slotStatus.failed": "Failed",
+
+    // Matrix Cell Labels & Tooltips
+    "cap.cell.failed": "Bug",
+    "cap.cell.pending": "Todo",
+    "cap.slotStatus.covered": "Passed",
+    "cap.slotStatus.failed": "Defect Found",
     "cap.slotStatus.pending": "Pending",
-    "cap.slotStatus.missing": "Missing",
+    "cap.slotStatus.missing": "Uncovered",
 
-    // Promote to 5-Case Scenario
-    "cap.promoteBtn": "Promote to 5-Case Scenario",
-    "cap.promoteUpdateBtn": "Sync 5-Case Scenario",
-    "cap.promoting": "Promoting…",
-    "cap.promotedToast": "Promoted '{capability}' into 5-case scenario: {scenario}",
+    // Capability Row Subline & Badges
+    "cap.rowSubline": "{live}/{total} APIs · {writes} writes",
+    "cap.rowStatePill": "State: {vals}",
+
+    // Row Actions & Promote Toast
+    "cap.promoteBtn": "Generate 5 Cases",
+    "cap.syncBtnTitle": "Sync 5-Case Scenario",
+    "cap.viewScenarioBtn": "View Scenario",
+    "cap.promoting": "Generating…",
+    "cap.promotedToast": "Generated 5-case scenario for '{capability}': {scenario}",
     "cap.openScenario": "Open Scenario →",
-    "cap.linkedScenariosLabel": "Linked Scenarios",
 
-    // Expanded Endpoints Table
+    // Expanded Row Detail
+    "cap.actionsLabel": "Actions",
+    "cap.statesLabel": "Observed States",
+    "cap.linkedScenariosLabel": "Linked Scenarios",
     "cap.endpointsHeader": "Grouped Endpoints ({count})",
     "cap.col.method": "Method",
     "cap.col.path": "Endpoint Path",

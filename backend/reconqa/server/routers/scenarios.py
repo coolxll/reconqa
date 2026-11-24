@@ -29,7 +29,7 @@ from reconqa.models.schemas import (
     ScenarioUpdateRequest,
 )
 from reconqa.models.tables import Project, Run, ScenarioModel
-from reconqa.modules.hub.capability_map import build_capability_map
+from reconqa.modules.hub.capability_map import build_capability_map, endpoint_capability_key
 from reconqa.modules.hub.inventory import build_project_inventory
 from reconqa.server.routers.explore import find_project_explores
 from reconqa.utils.io import slugify
@@ -253,9 +253,41 @@ def _enrich_scenario(
     seen_run_ids: list[str] = []
     seen_run_set: set[str] = set()
 
+    is_cap_scenario = row.slug.startswith("cap_")
+    assertion_targets_norm: set[str] = set()
+    if is_cap_scenario:
+        for a in assertions:
+            raw_t = (a.target_endpoint or "").strip()
+            if not raw_t:
+                continue
+            parts = raw_t.split(None, 1)
+            if len(parts) == 2:
+                m_str = parts[0].upper().strip()
+                p_str = parts[1].split("?", 1)[0].strip().rstrip("/").lower() or "/"
+                assertion_targets_norm.add(f"{m_str} {p_str}")
+            else:
+                p_str = raw_t.split("?", 1)[0].strip().rstrip("/").lower() or "/"
+                assertion_targets_norm.add(p_str)
+
     for raw_ep in inventory.get("endpoints") or []:
         ep_scenarios = raw_ep.get("scenarios") or []
-        if row.slug in ep_scenarios:
+        matched = row.slug in ep_scenarios
+        if not matched and is_cap_scenario:
+            ep_method = str(raw_ep.get("method") or "GET").upper().strip()
+            ep_path = str(raw_ep.get("path") or "/")
+            ep_host = str(raw_ep.get("host") or "")
+            ep_path_norm = ep_path.split("?", 1)[0].strip().rstrip("/").lower() or "/"
+            ep_target_norm = f"{ep_method} {ep_path_norm}"
+            if raw_ep.get("discovery_source") == "har-live":
+                ep_cap_key = endpoint_capability_key(ep_path, ep_host)
+                if normalize_scenario_slug(f"cap_{slugify(ep_cap_key)}") == row.slug:
+                    matched = True
+            if not matched and (
+                ep_target_norm in assertion_targets_norm or ep_path_norm in assertion_targets_norm
+            ):
+                matched = True
+
+        if matched:
             matched_endpoints.append(InventoryEndpoint.model_validate(raw_ep))
             for rref in raw_ep.get("seen_in_runs") or []:
                 rid = str(rref.get("run_id") or "")
@@ -731,13 +763,25 @@ async def delete_project_scenario(
 # --- Business Capability Map & One-Click 5-Case Scenario Promotion ---
 
 
+_ROLE_LABELS_ZH: dict[str, str] = {
+    "admin": "管理员",
+    "pharmacy": "药店",
+    "doctor": "医生",
+    "assistant": "医助",
+    "patient": "患者",
+    "common": "通用",
+}
+
+
 @router.get("/projects/{project_id}/capabilities", response_model=ProjectCapabilityMapResponse)
 async def get_project_capabilities(
     project_id: str,
     module: str | None = Query(default=None),
     role: str | None = Query(default=None),
+    core_only: bool = Query(default=False),
     live_only: bool = Query(default=False),
     has_writes: bool = Query(default=False),
+    include_noise: bool = Query(default=False),
     q: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -758,9 +802,12 @@ async def get_project_capabilities(
         scenarios=enriched_scenarios,
         project_id=project.id,
         project_name=project.name,
+        include_noise=include_noise,
     )
 
     filtered_caps = cap_map["capabilities"]
+    if core_only:
+        filtered_caps = [c for c in filtered_caps if c["is_core"]]
     if live_only:
         filtered_caps = [c for c in filtered_caps if c["live_endpoints"] > 0]
     if has_writes:
@@ -780,6 +827,8 @@ async def get_project_capabilities(
             for c in filtered_caps
             if needle in c["key"].lower()
             or needle in c["display_name"].lower()
+            or needle in c["title_zh"].lower()
+            or needle in c["title_en"].lower()
             or any(needle in a.lower() for a in c["actions"])
             or any(needle in ep["path"].lower() for ep in c["endpoints"])
         ]
@@ -855,21 +904,26 @@ async def promote_capability_to_scenario(
     write_target = f"{write_ep['method']} {write_ep['path']}"
 
     roles_str = ", ".join(cap["roles"]) or "common"
+    roles_zh_str = "、".join(_ROLE_LABELS_ZH.get(r, r) for r in (cap["roles"] or ["common"]))
     actions_str = ", ".join(cap["actions"]) or "read"
-    statuses_lines = (
-        "\n".join(
-            f"- `{field}`: `{', '.join(vals)}`"
-            for field, vals in (cap["observed_statuses"] or {}).items()
-        )
-        if cap["observed_statuses"]
-        else "- (No status enum fields observed in HAR examples yet)"
-    )
     ep_sample_lines = "\n".join(
         f"- `{e['method']} {e['path']}` (`{e['role']}` · `{e['action']}` · `{e['discovery_source']}`)"
         for e in cap_eps[:8]
     )
 
-    description_md = f"""### Business Capability: `{cap['display_name']}`
+    scenario_priority = body.priority or cap["recommended_priority"]
+
+    if body.lang == "en":
+        statuses_lines = (
+            "\n".join(
+                f"- `{field}`: `{', '.join(vals)}`"
+                for field, vals in (cap["observed_statuses"] or {}).items()
+            )
+            if cap["observed_statuses"]
+            else "- (No status enum fields observed in HAR examples yet)"
+        )
+        cap_title = cap.get("title_en") or cap["display_name"]
+        description_md = f"""### Business Capability: {cap_title} (`{cap['key']}`)
 
 - **Actions**: `{actions_str}`
 - **Roles**: `{roles_str}`
@@ -887,58 +941,128 @@ async def promote_capability_to_scenario(
 3. **Business Invariants**: Verify state enum legality, non-negative totals, and role scoping.
 4. **Cross-Resource Consistency**: Confirm mutations reflect consistently on subsequent detail/list reads.
 """.strip()
-
-    preconditions_txt = f"Authenticated test credentials available for role(s): {roles_str}."
-    scenario_name = (body.name or "").strip() or f"{cap['module']} / {cap['resource']} 核心能力验证"
-    scenario_priority = body.priority or cap["recommended_priority"]
-
-    seeded_assertions = [
-        ScenarioAssertion(
-            title=f"[Happy Path] {cap['display_name']} returns valid business payload",
-            target_endpoint=primary_target,
-            jsonpath="$.data",
-            operator="not_empty",
-            note="Verify primary capability endpoint returns non-empty business data payload.",
-            status="pending",
-        ),
-        ScenarioAssertion(
-            title=f"[Invariant] {cap['display_name']} state & cross-resource consistency",
-            target_endpoint=write_target,
-            jsonpath="",
-            operator="custom",
-            note=(
-                f"Verify state transition & read-after-write consistency across actions ({actions_str})."
+        preconditions_txt = f"Authenticated test credentials available for role(s): {roles_str}."
+        scenario_name = (body.name or "").strip() or f"{cap_title} (Core Capability Verification)"
+        seeded_assertions = [
+            ScenarioAssertion(
+                title=f"[Happy Path] {cap_title} returns valid business payload",
+                target_endpoint=primary_target,
+                jsonpath="$.data",
+                operator="not_empty",
+                note="Verify primary capability endpoint returns non-empty business data payload.",
+                status="pending",
             ),
-            status="pending",
-        ),
-    ]
+            ScenarioAssertion(
+                title=f"[Invariant] {cap_title} state & cross-resource consistency",
+                target_endpoint=write_target,
+                jsonpath="",
+                operator="custom",
+                note=(
+                    f"Verify state transition & read-after-write consistency across actions ({actions_str})."
+                ),
+                status="pending",
+            ),
+        ]
+        seeded_negative_cases = [
+            ScenarioNegativeCase(
+                title=f"[Invalid Params] Reject missing/malformed inputs on {write_target}",
+                category="validation",
+                expected_behavior="Returns HTTP 400 or business validation error without 5xx.",
+                status="pending",
+            ),
+            ScenarioNegativeCase(
+                title=f"[Illegal State] Block invalid state transition on {cap_title}",
+                category="state_machine",
+                expected_behavior="Disallowed status transition is rejected cleanly without mutating state.",
+                status="pending",
+            ),
+            ScenarioNegativeCase(
+                title=f"[AuthZ / Role] Verify cross-role BFLA/IDOR isolation ({roles_str})",
+                category="auth",
+                expected_behavior="Anonymous and unauthorized roles receive 401/403 or business denial code.",
+                status="pending",
+            ),
+            ScenarioNegativeCase(
+                title=f"[Idempotency] Verify duplicate submission safety on {write_target}",
+                category="idempotency",
+                expected_behavior="Replaying identical mutation does not create duplicate records or double charges.",
+                status="pending",
+            ),
+        ]
+    else:
+        statuses_lines_zh = (
+            "\n".join(
+                f"- `{field}`: `{', '.join(vals)}`"
+                for field, vals in (cap["observed_statuses"] or {}).items()
+            )
+            if cap["observed_statuses"]
+            else "- （当前 HAR 样本尚未观测到显式状态枚举字段）"
+        )
+        cap_title_zh = cap.get("title_zh") or cap["display_name"]
+        description_md = f"""### 业务能力：{cap_title_zh}（`{cap['key']}`）
 
-    seeded_negative_cases = [
-        ScenarioNegativeCase(
-            title=f"[Invalid Params] Reject missing/malformed inputs on {write_target}",
-            category="validation",
-            expected_behavior="Returns HTTP 400 or business validation error without 5xx.",
-            status="pending",
-        ),
-        ScenarioNegativeCase(
-            title=f"[Illegal State] Block invalid state transition on {cap['display_name']}",
-            category="state_machine",
-            expected_behavior="Disallowed status transition is rejected cleanly without mutating state.",
-            status="pending",
-        ),
-        ScenarioNegativeCase(
-            title=f"[AuthZ / Role] Verify cross-role BFLA/IDOR isolation ({roles_str})",
-            category="auth",
-            expected_behavior="Anonymous and unauthorized roles receive 401/403 or business denial code.",
-            status="pending",
-        ),
-        ScenarioNegativeCase(
-            title=f"[Idempotency] Verify duplicate submission safety on {write_target}",
-            category="idempotency",
-            expected_behavior="Replaying identical mutation does not create duplicate records or double charges.",
-            status="pending",
-        ),
-    ]
+- **涉及动作**：`{actions_str}`
+- **涉及角色**：{roles_zh_str}（`{roles_str}`）
+- **接口规模**：活跃 `{cap['live_endpoints']}` / 总计 `{cap['total_endpoints']}`（含 `{cap['write_endpoints']}` 个写接口）
+
+#### 观测到的状态机枚举
+{statuses_lines_zh}
+
+#### 代表性接口
+{ep_sample_lines}
+
+#### 4 类验证 Oracle 检查清单
+1. **契约结构（Schema）**：校验响应字段结构、类型与业务数据非空。
+2. **HAR 基线对照**：对比线上/测试环境 HTTP 状态码与业务成功码，确保无非预期回归。
+3. **业务不变量**：验证状态机合法枚举、金额/数量非负与角色可见范围。
+4. **跨资源一致性**：写操作完成后回查详情与列表接口，确认状态与数据一致落库。
+""".strip()
+        preconditions_txt = f"已就绪以下业务角色的测试账号凭证：{roles_zh_str}（{roles_str}）。"
+        scenario_name = (body.name or "").strip() or f"{cap_title_zh}（核心能力验收）"
+        seeded_assertions = [
+            ScenarioAssertion(
+                title=f"[正向流程] {cap_title_zh}主接口返回有效业务数据",
+                target_endpoint=primary_target,
+                jsonpath="$.data",
+                operator="not_empty",
+                note="验证主业务能力接口返回非空且结构合法的业务响应。",
+                status="pending",
+            ),
+            ScenarioAssertion(
+                title=f"[业务不变量] {cap_title_zh}状态流转与跨资源一致性校验",
+                target_endpoint=write_target,
+                jsonpath="",
+                operator="custom",
+                note=f"验证跨动作（{actions_str}）的状态迁移合法性与写后读一致性。",
+                status="pending",
+            ),
+        ]
+        seeded_negative_cases = [
+            ScenarioNegativeCase(
+                title=f"[缺参/非法参] {write_target} 拒绝缺失或非法参数输入",
+                category="validation",
+                expected_behavior="返回 HTTP 400 或明确业务参数校验错误，不出现 5xx。",
+                status="pending",
+            ),
+            ScenarioNegativeCase(
+                title=f"[非法状态迁移] {cap_title_zh}拦截非法状态跃迁",
+                category="state_machine",
+                expected_behavior="针对不合法前置状态的写操作被安全拒绝，且不脏改原始状态。",
+                status="pending",
+            ),
+            ScenarioNegativeCase(
+                title=f"[越权/错角色] 验证跨角色 BFLA/IDOR 隔离（{roles_zh_str}）",
+                category="auth",
+                expected_behavior="匿名或无权角色请求返回 401/403 或明确业务拒权错误码。",
+                status="pending",
+            ),
+            ScenarioNegativeCase(
+                title=f"[一致性/幂等] 验证 {write_target} 重复提交幂等安全",
+                category="idempotency",
+                expected_behavior="重复重放相同写请求不会产生重复单据、重复扣款或状态错乱。",
+                status="pending",
+            ),
+        ]
 
     tags = list(dict.fromkeys([cap["module"], cap["resource"], *cap["roles"]]))
     now = datetime.now(UTC)
