@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from reconqa.modules.hub.coverage_diff import _group_prefix
-from reconqa.modules.hub.har_parser import normalize_path
+from reconqa.modules.hub.har_parser import is_telemetry_endpoint, normalize_path
 from reconqa.utils.io import read_json, read_yaml
 
 _HTTP_METHODS = {"get", "post", "put", "delete", "patch", "head", "options"}
@@ -160,9 +160,12 @@ def classify_explore_endpoint(
     *,
     host: str = "",
     source: str = "",
+    include_telemetry: bool = False,
 ) -> str:
     """Classify an explore endpoint as 'api', 'spa_route', or 'noise'."""
     if is_non_api_noise_path(path):
+        return "noise"
+    if not include_telemetry and is_telemetry_endpoint(path, host):
         return "noise"
     norm_src = (source or "").strip().lower().replace("-", "_")
     if norm_src in _CRAWLER_SOURCES:
@@ -391,6 +394,7 @@ def build_project_inventory(
     explore_results: list[dict[str, Any]],
     project_slug: str = "",
     scenario_meta: dict[str, dict[str, Any]] | None = None,
+    include_telemetry: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build cumulative Project Master API Inventory and merged OpenAPI 3.0.3 spec."""
     bucket: dict[tuple[str, str], dict[str, Any]] = {}
@@ -505,7 +509,15 @@ def build_project_inventory(
             ep_host = (urlparse(ep_url).netloc if ep_url else "") or default_host
             ep_source = str(ep.get("source") or "js-static")
 
-            if classify_explore_endpoint(ep_path, host=ep_host, source=ep_source) != "api":
+            if (
+                classify_explore_endpoint(
+                    ep_path,
+                    host=ep_host,
+                    source=ep_source,
+                    include_telemetry=include_telemetry,
+                )
+                != "api"
+            ):
                 continue
 
             clean_ep_path = _clean_filter_path(ep_path).lower()
@@ -562,13 +574,17 @@ def build_project_inventory(
                 if str(m_key).lower() not in _HTTP_METHODS or not isinstance(op, dict):
                     continue
                 req_schema, req_example = _extract_json_media(op.get("requestBody"))
+                op_host = _extract_op_host(op, run_host)
+                if not include_telemetry and is_telemetry_endpoint(
+                    str(raw_path), op_host, req_example
+                ):
+                    continue
                 status_codes, resp_schema, resp_example = _extract_first_2xx_response(
                     op.get("responses")
                 )
                 op_scenarios = [str(s) for s in (op.get("x-scenarios") or []) if str(s).strip()]
                 op_tags = [str(t) for t in (op.get("tags") or []) if str(t).strip()]
                 op_params = [p for p in (op.get("parameters") or []) if isinstance(p, dict)]
-                op_host = _extract_op_host(op, run_host)
                 op_origin = str(op.get("x-origin") or "").strip().rstrip("/")
                 if op_origin and op_origin not in servers_seen:
                     servers_seen.append(op_origin)

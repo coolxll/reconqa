@@ -17,6 +17,7 @@ from reconqa.modules.hub.correlation import analyze_correlations
 from reconqa.modules.hub.coverage_diff import compute_coverage_diff
 from reconqa.modules.hub.har_parser import (
     _is_static_asset,
+    is_telemetry_endpoint,
     normalize_path,
     parse_har_dir,
     parse_har_file,
@@ -660,3 +661,113 @@ def test_openapi_merger_infers_requires_auth_from_unauthenticated_responses(tmp_
         assert op["x-requires-auth"] is True, f"Expected x-requires-auth=True on {ep_path}"
         assert op["x-biz-success"] == {"field": "code", "value": 0}
         assert op["x-biz-success"]["value"] != bad_code
+
+
+def test_is_telemetry_endpoint_rules_and_har_parser_opt_out(tmp_path: Path) -> None:
+    """Verify telemetry/tracking filtering rules, zero false positives on business APIs, and include_telemetry=True."""
+    # Positive telemetry matches (Rules 1-4)
+    for path, host, payload in (
+        ("/api/shop/track/auth/newReport", "pc-api.example.test", None),
+        ("/api/shop/track/auth/report", "pc-api.example.test", None),
+        ("/api/shop/track/getConfig", "pc-api.example.test", None),
+        ("/api/shop/track/report", "pc-api.example.test", None),
+        ("/api/v1/metrics/collect", "api.example.com", None),
+        ("/rum/monitor", "app.example.com", None),
+        ("/v1/anything", "bdapi.example.test", None),
+        ("/ingest", "web-telemetry.example.com", None),
+        ("/api/v1/event", "api.example.com", {"ev_type": "pv", "eventList": [{"id": 1}]}),
+    ):
+        assert is_telemetry_endpoint(path, host, payload) is True, (path, host, payload)
+
+    # Business APIs MUST NOT be falsely filtered
+    for path, host, payload in (
+        ("/api/v1/order/track", "pc-api.example.com", None),
+        ("/api/logistics/tracking/detail", "pc-api.example.com", None),
+        ("/api/shipment/track/list", "api.example.com", None),
+        ("/api/v1/finance/report", "api.example.com", None),
+        ("/api/v1/orders/export", "api.example.com", None),
+        ("/api/deviceW2", "pc-api.example.test", None),
+        ("/api/v1/metrics", "api.example.com", None),
+        ("/api/v1/event", "api.example.com", {"title": "Flash Sale"}),
+    ):
+        assert is_telemetry_endpoint(path, host, payload) is False, (path, host, payload)
+
+    def _entry(method: str, url: str, req_obj: dict | None = None) -> dict:
+        req: dict = {
+            "method": method,
+            "url": url,
+            "httpVersion": "HTTP/2",
+            "headers": [],
+            "queryString": [],
+            "cookies": [],
+        }
+        if req_obj is not None:
+            req["postData"] = {
+                "mimeType": "application/json",
+                "text": json.dumps(req_obj),
+            }
+        body = json.dumps({"code": 0, "data": {}})
+        return {
+            "startedDateTime": "2026-11-24T05:00:00.000Z",
+            "time": 12.0,
+            "request": req,
+            "response": {
+                "status": 200,
+                "statusText": "OK",
+                "httpVersion": "HTTP/2",
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "cookies": [],
+                "content": {"size": len(body), "mimeType": "application/json", "text": body},
+            },
+            "timings": {"send": 1, "wait": 8, "receive": 3},
+        }
+
+    har_payload = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                _entry("POST", "https://pc-api.example.test/api/shop/track/auth/newReport"),
+                _entry("POST", "https://pc-api.example.test/api/shop/track/auth/report"),
+                _entry("GET", "https://pc-api.example.test/api/shop/track/getConfig"),
+                _entry("POST", "https://pc-api.example.test/api/shop/track/report"),
+                _entry("POST", "https://bdapi.example.test/v1/push"),
+                _entry("POST", "https://app.example.test/rum/monitor"),
+                _entry(
+                    "POST",
+                    "https://pc-api.example.test/api/v1/log",
+                    {"logList": [{"msg": "perf"}]},
+                ),
+                # Business endpoints that MUST remain
+                _entry("GET", "https://pc-api.example.test/api/v1/order/track"),
+                _entry("GET", "https://pc-api.example.test/api/logistics/tracking/detail"),
+                _entry("GET", "https://pc-api.example.test/api/v1/finance/report"),
+                _entry("POST", "https://pc-api.example.test/api/deviceW2", {"device": "pc"}),
+            ],
+        }
+    }
+    har_file = tmp_path / "telemetry_mix.har"
+    har_file.write_text(json.dumps(har_payload), encoding="utf-8")
+
+    # Default (include_telemetry=False): only business APIs remain
+    default_entries = parse_har_file(har_file)
+    default_paths = {e.normalized_path for e in default_entries}
+    assert default_paths == {
+        "/api/v1/order/track",
+        "/api/logistics/tracking/detail",
+        "/api/v1/finance/report",
+        "/api/deviceW2",
+    }
+
+    # Opt-out (include_telemetry=True): all 11 entries preserved
+    all_entries = parse_har_dir(har_file, include_telemetry=True)
+    all_paths = {e.normalized_path for e in all_entries}
+    assert len(all_entries) == 11
+    assert {
+        "/api/shop/track/auth/newReport",
+        "/api/shop/track/auth/report",
+        "/api/shop/track/getConfig",
+        "/api/shop/track/report",
+        "/v1/push",
+        "/rum/monitor",
+        "/api/v1/log",
+    }.issubset(all_paths)

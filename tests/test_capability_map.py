@@ -670,3 +670,152 @@ def test_inventory_filters_explore_spa_crawler_and_noise_but_keeps_apis_and_har_
         "/api/shop/health",
         "/.well-known/openid-configuration",
     } == kept_paths
+
+
+def test_inventory_filters_telemetry_endpoints_with_opt_out_and_keeps_business_apis(
+    tmp_path: Path,
+) -> None:
+    """Verify inventory & classify_explore_endpoint filter telemetry by default and support include_telemetry=True."""
+    from reconqa.modules.hub.inventory import classify_explore_endpoint
+
+    assert (
+        classify_explore_endpoint(
+            "/api/shop/track/report", host="pc-api.example.test", source="js_static"
+        )
+        == "noise"
+    )
+    assert (
+        classify_explore_endpoint(
+            "/api/v1/order/track", host="pc-api.example.test", source="js_static"
+        )
+        == "api"
+    )
+
+    run_ws = tmp_path / "run_telemetry"
+    (run_ws / "hub").mkdir(parents=True, exist_ok=True)
+    (run_ws / "hub" / "openapi.json").write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.3",
+                "servers": [{"url": "https://pc-api.example.test"}],
+                "paths": {
+                    "/api/shop/track/auth/newReport": {
+                        "post": {
+                            "x-discovery-source": "har-live",
+                            "x-host": "pc-api.example.test",
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                    "/api/shop/track/auth/report": {
+                        "post": {
+                            "x-discovery-source": "har-live",
+                            "x-host": "pc-api.example.test",
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                    "/api/shop/track/getConfig": {
+                        "get": {
+                            "x-discovery-source": "har-live",
+                            "x-host": "pc-api.example.test",
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                    "/v1/ingest": {
+                        "post": {
+                            "x-discovery-source": "har-live",
+                            "x-host": "bdapi.example.test",
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                    "/api/v1/order/track": {
+                        "get": {
+                            "x-discovery-source": "har-live",
+                            "x-host": "pc-api.example.test",
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                    "/api/deviceW2": {
+                        "post": {
+                            "x-discovery-source": "har-live",
+                            "x-host": "pc-api.example.test",
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    explore_results = [
+        {
+            "seed": {"base_url": "https://pc-api.example.test", "root_domain": "example.test"},
+            "spa_routes": [],
+            "discovered_endpoints": [
+                {
+                    "method": "POST",
+                    "path": "/api/shop/track/report",
+                    "url": "https://pc-api.example.test/api/shop/track/report",
+                    "source": "js_static",
+                },
+                {
+                    "method": "POST",
+                    "path": "/rum/monitor",
+                    "url": "https://api.example.test/rum/monitor",
+                    "source": "katana",
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/logistics/tracking/detail",
+                    "url": "https://pc-api.example.test/api/logistics/tracking/detail",
+                    "source": "js_static",
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/v1/finance/report",
+                    "url": "https://pc-api.example.test/api/v1/finance/report",
+                    "source": "js_static",
+                },
+            ],
+        }
+    ]
+    runs = [
+        SimpleNamespace(id="run-tel-1", workspace_dir=str(run_ws), config_snapshot={"run_name": "Telemetry Run"}),
+    ]
+
+    # Default: telemetry filtered out across both Explore and historical Run OpenAPI
+    inv_default, _ = build_project_inventory(
+        project_id="proj-tel",
+        project_name="Telemetry Filter",
+        runs=runs,
+        explore_results=explore_results,
+    )
+    default_paths = {ep["path"] for ep in inv_default["endpoints"]}
+    assert default_paths == {
+        "/api/v1/order/track",
+        "/api/logistics/tracking/detail",
+        "/api/v1/finance/report",
+        "/api/deviceW2",
+    }
+
+    # Opt-out: include_telemetry=True preserves all telemetry endpoints
+    inv_all, _ = build_project_inventory(
+        project_id="proj-tel",
+        project_name="Telemetry Filter",
+        runs=runs,
+        explore_results=explore_results,
+        include_telemetry=True,
+    )
+    all_paths = {ep["path"] for ep in inv_all["endpoints"]}
+    assert {
+        "/api/shop/track/auth/newReport",
+        "/api/shop/track/auth/report",
+        "/api/shop/track/getConfig",
+        "/api/shop/track/report",
+        "/v1/ingest",
+        "/rum/monitor",
+        "/api/v1/order/track",
+        "/api/logistics/tracking/detail",
+        "/api/v1/finance/report",
+        "/api/deviceW2",
+    } == all_paths

@@ -134,6 +134,13 @@ _NOISE_MODULES = {
     "public",
     "health",
     "actuator",
+    "track",
+    "telemetry",
+    "rum",
+    "analytics",
+    "beacon",
+    "monitor",
+    "metrics",
 }
 
 _RESOURCE_TITLES: dict[str, tuple[str, str]] = {

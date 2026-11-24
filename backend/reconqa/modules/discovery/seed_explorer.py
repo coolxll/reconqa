@@ -21,6 +21,7 @@ import httpx
 from reconqa.config import settings
 from reconqa.modules.discovery.runner import run_discovery
 from reconqa.modules.discovery.spa_parser import extract_spa_routes
+from reconqa.modules.hub.har_parser import is_telemetry_endpoint
 from reconqa.modules.hub.inventory import classify_explore_endpoint, is_non_api_noise_path
 from reconqa.modules.recorder.js_extractor import extract_js_endpoints
 from reconqa.modules.recorder.text_importer import import_traffic_text
@@ -1471,14 +1472,17 @@ def explore_from_seed(
                 if not isinstance(ep, dict) or not ep.get("path"):
                     continue
                 ep_path_str = str(ep["path"])
-                if is_non_api_noise_path(ep_path_str):
-                    continue
                 ep_full_url = str(ep.get("url") or "") or None
                 ep_origin = base_url
                 if ep_full_url:
                     pu = urlparse(ep_full_url)
                     if pu.scheme and pu.netloc:
                         ep_origin = f"{pu.scheme}://{pu.netloc}"
+                ep_host_str = (urlparse(ep_origin).netloc if ep_origin else "") or ""
+                if is_non_api_noise_path(ep_path_str) or is_telemetry_endpoint(
+                    ep_path_str, ep_host_str
+                ):
+                    continue
                 _add_endpoint(
                     endpoints_bucket,
                     method=str(ep.get("method") or "GET"),

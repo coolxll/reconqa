@@ -146,6 +146,144 @@ def has_session_cookies(cookie_names: Iterable[str]) -> bool:
     """Return True if at least one cookie name looks like an auth/session cookie."""
     return any(not is_non_auth_cookie_name(name) for name in cookie_names)
 
+
+TELEMETRY_HOST_LABELS = frozenset(
+    {
+        "bdapi",
+        "rum",
+        "telemetry",
+        "analytics",
+        "beacon",
+        "buried",
+        "spm",
+        "log",
+        "logs",
+        "track",
+        "tracking",
+        "metrics",
+        "monitor",
+        "stat",
+        "stats",
+        "collect",
+        "retcode",
+        "arms-retcode",
+    }
+)
+
+TELEMETRY_HOST_SUFFIXES = (
+    "-rum",
+    "-track",
+    "-telemetry",
+    "-analytics",
+    "-beacon",
+    "-log",
+    "-logs",
+    "-metrics",
+)
+
+TELEMETRY_PATH_SEGMENTS = frozenset(
+    {
+        "telemetry",
+        "rum",
+        "beacon",
+        "analytics",
+        "buried",
+        "maidian",
+        "spm",
+        "sensors",
+        "matomo",
+        "piwik",
+        "retcode",
+        "sentry",
+        "datadog",
+    }
+)
+
+TELEMETRY_PAIR_PRIMARY = frozenset({"track", "tracking", "metric", "metrics", "monitor"})
+
+TELEMETRY_PAIR_ACTIONS = frozenset(
+    {
+        "report",
+        "newreport",
+        "upload",
+        "batch",
+        "collect",
+        "push",
+        "send",
+        "dot",
+        "point",
+        "config",
+        "getconfig",
+        "heartbeat",
+        "ping",
+        "log",
+        "logs",
+        "metric",
+        "metrics",
+        "event",
+        "events",
+    }
+)
+
+TELEMETRY_PAYLOAD_PATH_SEGMENTS = frozenset(
+    {
+        "track",
+        "tracking",
+        "report",
+        "newreport",
+        "log",
+        "logs",
+        "event",
+        "events",
+        "metric",
+        "metrics",
+    }
+)
+
+TELEMETRY_PAYLOAD_KEYS = frozenset({"logList", "metricList", "ev_type", "eventList", "bcn"})
+
+
+def is_telemetry_endpoint(path: str, host: str = "", request_json: Any = None) -> bool:
+    """Return True if an endpoint looks like client telemetry, RUM, analytics, or buried tracking."""
+    # Rule 1: Telemetry / bigdata subdomain hosts
+    raw_host = str(host or "").strip().lower()
+    if raw_host:
+        if "://" in raw_host:
+            raw_host = (urlsplit(raw_host).netloc or "").lower()
+        clean_host = raw_host.split("/", 1)[0].split(":", 1)[0]
+        first_label = clean_host.split(".", 1)[0] if clean_host else ""
+        if first_label in TELEMETRY_HOST_LABELS or first_label.endswith(TELEMETRY_HOST_SUFFIXES):
+            return True
+
+    clean_path = str(path or "").split("?", 1)[0].split("#", 1)[0].strip()
+    segments = [seg.lower() for seg in clean_path.split("/") if seg]
+    if not segments:
+        return False
+    seg_set = set(segments)
+
+    # Rule 2: Unambiguous telemetry path segments
+    if seg_set & TELEMETRY_PATH_SEGMENTS:
+        return True
+
+    # Rule 3: track/tracking/metric(s)/monitor paired with a distinct telemetry action segment
+    if seg_set & TELEMETRY_PAIR_PRIMARY:
+        for idx, seg in enumerate(segments):
+            if seg not in TELEMETRY_PAIR_PRIMARY:
+                continue
+            for other_idx, other_seg in enumerate(segments):
+                if other_idx != idx and other_seg in TELEMETRY_PAIR_ACTIONS:
+                    return True
+
+    # Rule 4: Telemetry JSON payload signature
+    if (
+        isinstance(request_json, dict)
+        and (seg_set & TELEMETRY_PAYLOAD_PATH_SEGMENTS)
+        and (set(request_json.keys()) & TELEMETRY_PAYLOAD_KEYS)
+    ):
+        return True
+
+    return False
+
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -554,6 +692,7 @@ def parse_har_file(
     *,
     ignore_path_prefixes: list[str] | None = None,
     include_static: bool = False,
+    include_telemetry: bool = False,
 ) -> list[HarEntry]:
     """Parse a single HAR 1.2 file into cleaned, normalized HarEntry records."""
     har_path = Path(path)
@@ -644,6 +783,8 @@ def parse_har_file(
         if req_body_raw is not None:
             req_body_raw = str(req_body_raw)
         req_json = _try_parse_json(req_body_raw, req_mime)
+        if not include_telemetry and is_telemetry_endpoint(raw_path, host, req_json):
+            continue
         req_form: dict[str, str] = {}
         if post_data.get("params"):
             for p_item in post_data["params"]:
@@ -719,6 +860,7 @@ def parse_har_dir(
     *,
     ignore_path_prefixes: list[str] | None = None,
     include_static: bool = False,
+    include_telemetry: bool = False,
 ) -> list[HarEntry]:
     """Parse all *.har files in a directory (or a single HAR file) in chronological order."""
     target = Path(har_dir)
@@ -730,6 +872,7 @@ def parse_har_dir(
             target_domain=target_domain,
             ignore_path_prefixes=ignore_path_prefixes,
             include_static=include_static,
+            include_telemetry=include_telemetry,
         )
 
     har_files = sorted(p for p in target.glob("*.har") if p.is_file())
@@ -741,6 +884,7 @@ def parse_har_dir(
             target_domain=target_domain,
             ignore_path_prefixes=ignore_path_prefixes,
             include_static=include_static,
+            include_telemetry=include_telemetry,
         )
         for entry_idx, entry in enumerate(file_entries):
             combined.append((entry.timestamp_ms, file_idx, entry_idx, entry))
