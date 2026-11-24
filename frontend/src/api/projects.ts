@@ -1,6 +1,7 @@
 import { API_BASE, apiFetch, apiUpload } from "./client";
 import type {
   AcceptancePromptAgent,
+  AcceptancePromptMode,
   AcceptancePromptResponse,
   AuthProfile,
   AuthProfileCreate,
@@ -349,11 +350,24 @@ export function executeRunExternalTool(
 
 export function getAcceptancePrompt(
   projectId: string,
-  options?: { lang?: "zh" | "en"; agent?: AcceptancePromptAgent }
+  options?: {
+    lang?: "zh" | "en";
+    agent?: AcceptancePromptAgent;
+    mode?: AcceptancePromptMode;
+    targetIds?: string[];
+    mcpUrl?: string;
+  }
 ): Promise<AcceptancePromptResponse> {
   const params = new URLSearchParams();
   if (options?.lang) params.set("lang", options.lang);
   if (options?.agent) params.set("agent", options.agent);
+  if (options?.mode) params.set("mode", options.mode);
+  if (options?.mcpUrl) params.set("mcp_url", options.mcpUrl);
+  if (options?.targetIds && options.targetIds.length > 0) {
+    for (const tid of options.targetIds) {
+      if (tid) params.append("target_ids", tid);
+    }
+  }
   const qs = params.toString();
   const base = `/projects/${encodeURIComponent(projectId)}/acceptance-prompt`;
   return apiFetch<AcceptancePromptResponse>(qs ? `${base}?${qs}` : base);

@@ -41,6 +41,9 @@ router = APIRouter(tags=["explore"])
 
 _EXPLORE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{3,128}$")
 _SYNTHETIC_RESP_TEXT = json.dumps({"code": 0, "msg": "ok", "data": {}})
+_MAX_EXPLORE_JOBS = 40
+_EXPLORE_JOBS: dict[str, dict[str, Any]] = {}
+_EXPLORE_JOB_TASKS: set[asyncio.Task[Any]] = set()
 
 
 class ExploreRequest(BaseModel):
@@ -54,6 +57,61 @@ class ExploreRequest(BaseModel):
     depth: int = 2
     merge: bool = True
     project_id: str | None = None
+
+
+class ExploreJobRequest(ExploreRequest):
+    target_ids: list[str] | None = None
+    explore_all_targets: bool = False
+
+
+class ExploreJobOut(BaseModel):
+    job_id: str
+    project_id: str | None = None
+    status: Literal["running", "completed", "failed"] = "running"
+    progress_pct: int = 0
+    stage: str = "init"
+    targets_total: int = 1
+    targets_done: int = 0
+    current_target: str = ""
+    endpoints_found: int = 0
+    explore_id: str | None = None
+    started_at: str
+    finished_at: str | None = None
+    error: str | None = None
+    result: dict[str, Any] | None = None
+
+
+def _prune_explore_jobs() -> None:
+    if len(_EXPLORE_JOBS) <= _MAX_EXPLORE_JOBS:
+        return
+    ordered = sorted(
+        _EXPLORE_JOBS.values(),
+        key=lambda j: (1 if j.get("status") == "running" else 0, str(j.get("started_at") or "")),
+    )
+    excess = len(_EXPLORE_JOBS) - _MAX_EXPLORE_JOBS
+    for job in ordered[:excess]:
+        _EXPLORE_JOBS.pop(job["job_id"], None)
+
+
+def _serialize_explore_job(job: dict[str, Any], *, include_result: bool = False) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "job_id": job["job_id"],
+        "project_id": job.get("project_id"),
+        "status": job.get("status", "running"),
+        "progress_pct": int(job.get("progress_pct", 0)),
+        "stage": str(job.get("stage") or "init"),
+        "targets_total": int(job.get("targets_total", 1)),
+        "targets_done": int(job.get("targets_done", 0)),
+        "current_target": str(job.get("current_target") or ""),
+        "endpoints_found": int(job.get("endpoints_found", 0)),
+        "explore_id": job.get("explore_id"),
+        "started_at": str(job.get("started_at") or ""),
+        "finished_at": job.get("finished_at"),
+        "error": job.get("error"),
+    }
+    if include_result:
+        out["result"] = job.get("result")
+    return out
 
 
 class ExploreAllTargetsRequest(BaseModel):
@@ -384,15 +442,33 @@ async def _run_batch_explore_urls(
     depth: int,
     merge: bool,
     project_id: str | None,
+    job_state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[tuple[str, int]]]:
     """Explore multiple portal URLs with bounded concurrency (2) and merge into root-domain inventory."""
     sem = asyncio.Semaphore(2)
     per_url_out: list[tuple[str, Path | None, dict[str, Any] | None, str | None]] = []
+    per_target_pct = [0] * len(urls)
+
+    def _update_batch_progress(idx: int, stage: str, pct: int, detail: str) -> None:
+        if job_state is None:
+            return
+        per_target_pct[idx] = max(per_target_pct[idx], max(0, min(100, int(pct))))
+        overall = 5 + int((sum(per_target_pct) / max(1, len(urls))) * 0.85)
+        job_state["progress_pct"] = max(int(job_state.get("progress_pct", 0)), min(92, overall))
+        job_state["stage"] = stage
+        if detail:
+            job_state["current_target"] = detail
 
     async def _explore_one(idx: int, u: str) -> tuple[str, Path | None, dict[str, Any] | None, str | None]:
         async with sem:
             sid = uuid.uuid4().hex[:12]
             tdir = ensure_dir(_explores_root() / f"_tmp_{sid}")
+            if job_state is not None:
+                job_state["current_target"] = u
+
+            def _cb(stage: str, pct: int, detail: str) -> None:
+                _update_batch_progress(idx, stage, pct, detail or u)
+
             try:
                 res = await asyncio.to_thread(
                     explore_from_seed,
@@ -404,12 +480,22 @@ async def _run_batch_explore_urls(
                     discover_portals=discover_portals and idx == 0,
                     depth=depth,
                     explore_id=sid,
+                    on_progress=_cb if job_state is not None else None,
                 )
                 if project_id:
                     res["project_id"] = project_id
+                if job_state is not None:
+                    job_state["targets_done"] = int(job_state.get("targets_done", 0)) + 1
+                    job_state["endpoints_found"] = int(job_state.get("endpoints_found", 0)) + len(
+                        res.get("discovered_endpoints") or []
+                    )
+                    _update_batch_progress(idx, "finalize", 100, u)
                 return u, tdir, res, None
             except Exception as exc:
                 shutil.rmtree(tdir, ignore_errors=True)
+                if job_state is not None:
+                    job_state["targets_done"] = int(job_state.get("targets_done", 0)) + 1
+                    _update_batch_progress(idx, "finalize", 100, u)
                 return u, None, None, str(exc)
 
     results = await asyncio.gather(*(_explore_one(i, u) for i, u in enumerate(urls)))
@@ -423,6 +509,10 @@ async def _run_batch_explore_urls(
             status_code=400,
             detail="; ".join(failed_warnings) or "All target URLs failed to explore.",
         )
+
+    if job_state is not None:
+        job_state["stage"] = "merge"
+        job_state["progress_pct"] = max(int(job_state.get("progress_pct", 0)), 94)
 
     # Determine canonical explore_id from first successful root domain
     first_url, _, first_res = succeeded[0]
@@ -475,6 +565,83 @@ async def _run_batch_explore_urls(
     return merged_result, counts_by_url
 
 
+async def _run_single_explore_seed(
+    *,
+    seed_curl: str | None,
+    target_url: str | None,
+    mode: str,
+    probe_openapi_docs: bool,
+    crawl_js: bool,
+    discover_portals: bool,
+    depth: int,
+    merge: bool,
+    project_id: str | None,
+    job_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    scan_id = uuid.uuid4().hex[:12]
+    tmp_dir = ensure_dir(_explores_root() / f"_tmp_{scan_id}")
+
+    def _cb(stage: str, pct: int, detail: str) -> None:
+        if job_state is None:
+            return
+        job_state["stage"] = stage
+        job_state["progress_pct"] = max(int(job_state.get("progress_pct", 0)), min(92, int(pct)))
+        if detail:
+            job_state["current_target"] = detail
+
+    try:
+        incoming = await asyncio.to_thread(
+            explore_from_seed,
+            tmp_dir,
+            seed_curl=seed_curl,
+            target_url=target_url,
+            mode=mode,
+            probe_openapi_docs=probe_openapi_docs,
+            crawl_js=crawl_js,
+            discover_portals=discover_portals,
+            depth=depth,
+            explore_id=scan_id,
+            on_progress=_cb if job_state is not None else None,
+        )
+    except ValueError as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if job_state is not None:
+        job_state["stage"] = "merge"
+        job_state["progress_pct"] = max(int(job_state.get("progress_pct", 0)), 95)
+        job_state["targets_done"] = 1
+        job_state["endpoints_found"] = len(incoming.get("discovered_endpoints") or [])
+
+    if project_id:
+        incoming["project_id"] = project_id
+
+    resolved_domain = (
+        str((incoming.get("seed") or {}).get("root_domain") or "").strip().lower()
+        or extract_seed_root_domain(seed_curl, target_url)
+    )
+    final_id = _domain_explore_id(resolved_domain) if (merge and resolved_domain) else scan_id
+    dest_dir = ensure_dir(_explores_root() / final_id)
+    existing_path = dest_dir / "explore_result.json"
+
+    ts_tag = datetime.now(UTC).strftime("%Y%m%d%H%M%S") + "_" + scan_id[:6]
+    _copy_explore_supporting_files(tmp_dir, dest_dir, ts_tag)
+
+    if merge and existing_path.is_file():
+        existing = read_json(existing_path)
+        final_result = merge_explore_results(existing, incoming, explore_id=final_id)
+    else:
+        final_result = dict(incoming)
+        final_result["explore_id"] = final_id
+
+    merged_hosts = _collect_merged_hosts(final_result)
+    final_result["merged_hosts"] = merged_hosts
+    final_result["seed_hosts"] = list(merged_hosts)
+    write_json(existing_path, final_result)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return final_result
+
+
 @router.post("/explore", status_code=status.HTTP_201_CREATED)
 @router.post("/explore/seed", status_code=status.HTTP_201_CREATED)
 async def run_explore(body: ExploreRequest) -> dict[str, Any]:
@@ -505,52 +672,208 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
         return merged_result
 
     single_url = parsed_urls[0] if parsed_urls else body.target_url
-    scan_id = uuid.uuid4().hex[:12]
-    tmp_dir = ensure_dir(_explores_root() / f"_tmp_{scan_id}")
-    try:
-        incoming = await asyncio.to_thread(
-            explore_from_seed,
-            tmp_dir,
-            seed_curl=body.seed_curl,
-            target_url=single_url,
-            mode=body.mode,
-            probe_openapi_docs=body.probe_openapi_docs,
-            crawl_js=body.crawl_js,
-            discover_portals=body.discover_portals,
-            depth=body.depth,
-            explore_id=scan_id,
-        )
-    except ValueError as exc:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    if body.project_id:
-        incoming["project_id"] = body.project_id
-
-    resolved_domain = (
-        str((incoming.get("seed") or {}).get("root_domain") or "").strip().lower()
-        or extract_seed_root_domain(body.seed_curl, single_url)
+    return await _run_single_explore_seed(
+        seed_curl=body.seed_curl,
+        target_url=single_url,
+        mode=body.mode,
+        probe_openapi_docs=body.probe_openapi_docs,
+        crawl_js=body.crawl_js,
+        discover_portals=body.discover_portals,
+        depth=body.depth,
+        merge=body.merge,
+        project_id=body.project_id,
     )
-    final_id = _domain_explore_id(resolved_domain) if (body.merge and resolved_domain) else scan_id
-    dest_dir = ensure_dir(_explores_root() / final_id)
-    existing_path = dest_dir / "explore_result.json"
 
-    ts_tag = datetime.now(UTC).strftime("%Y%m%d%H%M%S") + "_" + scan_id[:6]
-    _copy_explore_supporting_files(tmp_dir, dest_dir, ts_tag)
 
-    if body.merge and existing_path.is_file():
-        existing = read_json(existing_path)
-        final_result = merge_explore_results(existing, incoming, explore_id=final_id)
+@router.post("/explore/jobs", status_code=status.HTTP_202_ACCEPTED)
+async def start_explore_job(
+    body: ExploreJobRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Launch an async Explore scan job with real-time stage & percentage progress tracking."""
+    has_curl = bool(body.seed_curl and body.seed_curl.strip())
+    parsed_urls = _parse_batch_target_urls(body.target_url, body.target_urls)
+    target_meta_rows: list[tuple[str, str, str]] = []  # (target_id, portal_label, url)
+
+    if body.explore_all_targets:
+        if not body.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="project_id is required when explore_all_targets is true.",
+            )
+        project = await db.get(Project, body.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"Project '{body.project_id}' not found")
+        t_res = await db.execute(select(Target).where(Target.project_id == body.project_id))
+        all_targets = list(t_res.scalars().all())
+        if not all_targets:
+            raise HTTPException(
+                status_code=400,
+                detail="No targets configured for this project. Add at least one portal Target first.",
+            )
+        if body.target_ids:
+            by_id = {t.id: t for t in all_targets}
+            selected_targets = [by_id[tid] for tid in body.target_ids if tid in by_id]
+            if not selected_targets:
+                raise HTTPException(
+                    status_code=400,
+                    detail="None of the requested target_ids belong to this project.",
+                )
+        else:
+            selected_targets = all_targets
+
+        for tgt in selected_targets:
+            u = (tgt.base_url or "").strip()
+            if not u and tgt.root_domain:
+                u = f"https://{tgt.root_domain.strip()}"
+            if u:
+                label = str((tgt.scope_rules or {}).get("portal_label") or "")
+                target_meta_rows.append((tgt.id, label, u))
+        if not target_meta_rows:
+            raise HTTPException(status_code=400, detail="Selected targets have no valid URLs.")
+        targets_total = len(target_meta_rows)
+        initial_target = target_meta_rows[0][2]
     else:
-        final_result = dict(incoming)
-        final_result["explore_id"] = final_id
+        if not has_curl and not parsed_urls:
+            raise HTTPException(
+                status_code=400,
+                detail="Either seed_curl, target_url, target_urls, or explore_all_targets must be provided.",
+            )
+        targets_total = 1 if has_curl else len(parsed_urls)
+        initial_target = (
+            parsed_urls[0]
+            if parsed_urls
+            else (extract_seed_root_domain(body.seed_curl, None) or "seed_curl")
+        )
 
-    merged_hosts = _collect_merged_hosts(final_result)
-    final_result["merged_hosts"] = merged_hosts
-    final_result["seed_hosts"] = list(merged_hosts)
-    write_json(existing_path, final_result)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    return final_result
+    job_id = f"exp_{uuid.uuid4().hex[:10]}"
+    now_iso = datetime.now(UTC).isoformat()
+    job_state: dict[str, Any] = {
+        "job_id": job_id,
+        "project_id": body.project_id,
+        "status": "running",
+        "progress_pct": 5,
+        "stage": "init",
+        "targets_total": targets_total,
+        "targets_done": 0,
+        "current_target": initial_target,
+        "endpoints_found": 0,
+        "explore_id": None,
+        "started_at": now_iso,
+        "finished_at": None,
+        "error": None,
+        "result": None,
+    }
+    _EXPLORE_JOBS[job_id] = job_state
+    _prune_explore_jobs()
+
+    async def _runner() -> None:
+        try:
+            if body.merge:
+                await asyncio.to_thread(_consolidate_legacy_explores)
+
+            if body.explore_all_targets:
+                urls = [u for _, _, u in target_meta_rows]
+                merged_result, counts_by_url = await _run_batch_explore_urls(
+                    urls,
+                    mode=body.mode,
+                    probe_openapi_docs=body.probe_openapi_docs,
+                    crawl_js=body.crawl_js,
+                    discover_portals=body.discover_portals,
+                    depth=body.depth,
+                    merge=body.merge,
+                    project_id=body.project_id,
+                    job_state=job_state,
+                )
+                count_map = dict(counts_by_url)
+                merged_result["explored_targets"] = [
+                    {
+                        "id": tid,
+                        "portal_label": label,
+                        "base_url": u,
+                        "endpoints_found": int(count_map.get(u, 0)),
+                    }
+                    for tid, label, u in target_meta_rows
+                ]
+                dest_path = _explores_root() / str(merged_result["explore_id"]) / "explore_result.json"
+                if dest_path.parent.is_dir():
+                    write_json(dest_path, merged_result)
+                final_result = merged_result
+            elif not has_curl and len(parsed_urls) >= 2:
+                final_result, _ = await _run_batch_explore_urls(
+                    parsed_urls,
+                    mode=body.mode,
+                    probe_openapi_docs=body.probe_openapi_docs,
+                    crawl_js=body.crawl_js,
+                    discover_portals=body.discover_portals,
+                    depth=body.depth,
+                    merge=body.merge,
+                    project_id=body.project_id,
+                    job_state=job_state,
+                )
+            else:
+                single_url = parsed_urls[0] if parsed_urls else body.target_url
+                final_result = await _run_single_explore_seed(
+                    seed_curl=body.seed_curl,
+                    target_url=single_url,
+                    mode=body.mode,
+                    probe_openapi_docs=body.probe_openapi_docs,
+                    crawl_js=body.crawl_js,
+                    discover_portals=body.discover_portals,
+                    depth=body.depth,
+                    merge=body.merge,
+                    project_id=body.project_id,
+                    job_state=job_state,
+                )
+
+            job_state["status"] = "completed"
+            job_state["stage"] = "completed"
+            job_state["progress_pct"] = 100
+            job_state["targets_done"] = targets_total
+            job_state["endpoints_found"] = len(final_result.get("discovered_endpoints") or [])
+            job_state["explore_id"] = str(final_result.get("explore_id") or "")
+            job_state["result"] = final_result
+            job_state["finished_at"] = datetime.now(UTC).isoformat()
+        except HTTPException as exc:
+            job_state["status"] = "failed"
+            job_state["stage"] = "failed"
+            job_state["error"] = str(exc.detail)
+            job_state["finished_at"] = datetime.now(UTC).isoformat()
+        except Exception as exc:
+            job_state["status"] = "failed"
+            job_state["stage"] = "failed"
+            job_state["error"] = str(exc)
+            job_state["finished_at"] = datetime.now(UTC).isoformat()
+
+    task = asyncio.create_task(_runner())
+    _EXPLORE_JOB_TASKS.add(task)
+    task.add_done_callback(_EXPLORE_JOB_TASKS.discard)
+
+    return _serialize_explore_job(job_state, include_result=False)
+
+
+@router.get("/explore/jobs")
+async def list_explore_jobs(
+    project_id: str | None = Query(default=None),
+    active_only: bool = Query(default=False),
+) -> list[dict[str, Any]]:
+    """List recent async Explore jobs sorted newest first (without heavy result payload)."""
+    jobs = list(_EXPLORE_JOBS.values())
+    if project_id:
+        jobs = [j for j in jobs if j.get("project_id") == project_id]
+    if active_only:
+        jobs = [j for j in jobs if j.get("status") == "running"]
+    jobs.sort(key=lambda j: str(j.get("started_at") or ""), reverse=True)
+    return [_serialize_explore_job(j, include_result=False) for j in jobs]
+
+
+@router.get("/explore/jobs/{job_id}")
+async def get_explore_job(job_id: str) -> dict[str, Any]:
+    """Get status & progress of an async Explore job (includes result once completed)."""
+    job = _EXPLORE_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Explore job '{job_id}' not found")
+    return _serialize_explore_job(job, include_result=(job.get("status") == "completed"))
 
 
 @router.post("/projects/{project_id}/explore-all", status_code=status.HTTP_201_CREATED)

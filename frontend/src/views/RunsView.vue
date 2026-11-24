@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ArrowRight,
+  Bot,
   Check,
   Code2,
   Compass,
@@ -43,6 +44,7 @@ import {
 } from '@/api/runs'
 import StatusBadge from '@/components/layout/StatusBadge.vue'
 import EmptyState from '@/components/layout/EmptyState.vue'
+import AcceptancePromptModal from '@/components/workspace/AcceptancePromptModal.vue'
 import { useWorkspace } from '@/stores/workspace'
 import '@/i18n/locales/runs'
 import { useI18n } from '@/i18n'
@@ -87,6 +89,15 @@ const routeProjectId = computed(() =>
   typeof route.params.projectId === 'string' ? route.params.projectId : '',
 )
 const scopedProjectId = computed(() => routeProjectId.value || '')
+const harPromptOpen = ref(false)
+const promptProjectId = computed(
+  () =>
+    scopedProjectId.value ||
+    (selectedProjectFilter.value !== 'all' ? selectedProjectFilter.value : '') ||
+    activeProjectId.value ||
+    projects.value[0]?.id ||
+    '',
+)
 
 const loading = ref(true)
 const errorMessage = ref('')
@@ -644,6 +655,16 @@ onMounted(async () => {
         >
           <RefreshCw class="h-4 w-4" :class="loading ? 'animate-spin' : ''" />
           <span>{{ t('runs.refresh') }}</span>
+        </button>
+        <button
+          v-if="promptProjectId"
+          type="button"
+          data-testid="runs-agent-har-prompt-btn"
+          class="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3.5 py-2 text-sm font-semibold text-indigo-700 shadow-sm transition hover:border-indigo-300 hover:bg-indigo-100"
+          @click="harPromptOpen = true"
+        >
+          <Bot class="h-4 w-4 text-indigo-600" />
+          <span>{{ t('acceptPrompt.harExploreBtn') }}</span>
         </button>
         <button
           type="button"
@@ -1393,5 +1414,13 @@ onMounted(async () => {
         </div>
       </div>
     </Teleport>
+
+    <!-- Agent HAR Exploration Prompt Modal -->
+    <AcceptancePromptModal
+      :open="harPromptOpen"
+      :project-id="promptProjectId"
+      initial-mode="har_explore"
+      @close="harPromptOpen = false"
+    />
   </div>
 </template>

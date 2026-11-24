@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -1165,11 +1166,19 @@ def explore_from_seed(
     depth: int = 2,
     timeout: int = 30,
     explore_id: str | None = None,
+    on_progress: Callable[[str, int, str], None] | None = None,
 ) -> dict[str, Any]:
     """Explore APIs, OpenAPI docs, JS/SPA routes, sibling API hosts, and assets from a seed cURL or URL."""
     out_dir = ensure_dir(Path(out_dir).resolve())
     exp_id = explore_id or out_dir.name
     created_at = datetime.now(UTC).isoformat()
+
+    def _emit_progress(stage: str, pct: int, detail: str) -> None:
+        if on_progress is not None:
+            try:
+                on_progress(stage, pct, detail)
+            except Exception:
+                pass
 
     warnings: list[str] = []
     endpoints_bucket: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1289,7 +1298,10 @@ def explore_from_seed(
     if seed_url and seed_url not in collected_urls:
         collected_urls.append(seed_url)
 
+    _emit_progress("init", 10, base_url)
+
     # --- Step B: OpenAPI / Swagger / SpringBoot Auto-Probe on Primary Origin ---
+    _emit_progress("probe_openapi", 25, base_url)
     if probe_openapi_docs:
         _probe_openapi_on_origin(
             base_url,
@@ -1301,6 +1313,7 @@ def explore_from_seed(
         )
 
     # --- Step C: HTML + Same-Origin JS Bundle + Webpack/Vite Chunk Extraction ---
+    _emit_progress("crawl_js", 50, base_url)
     if crawl_js:
         html_dir = ensure_dir(out_dir / "html_pages")
         js_dir = ensure_dir(out_dir / "js_bundles" / "explore")
@@ -1483,6 +1496,7 @@ def explore_from_seed(
         micro_frontends = list(spa_res.get("micro_frontends") or [])
 
     # --- Step D: Optional External ProjectDiscovery Tools ---
+    _emit_progress("discover_portals", 75, base_url)
     disc_dir = ensure_dir(out_dir / "discovery")
     if loopback:
         warnings.append(
@@ -1561,6 +1575,7 @@ def explore_from_seed(
         except Exception as exc:
             warnings.append(f"Sibling portal discovery skipped: {exc}")
 
+    _emit_progress("finalize", 92, base_url)
     subdomains = sorted(subdomains_set)
     discovered_endpoints = sorted(
         endpoints_bucket.values(),

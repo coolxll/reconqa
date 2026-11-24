@@ -4,21 +4,34 @@ import {
   AlertTriangle,
   Bot,
   Check,
+  Compass,
   Copy,
+  Globe,
   Loader2,
   RefreshCw,
   Sparkles,
   X,
 } from "lucide-vue-next";
-import { getAcceptancePrompt } from "@/api/projects";
-import type { AcceptancePromptAgent, AcceptancePromptResponse } from "@/api/types";
+import { getAcceptancePrompt, listTargets } from "@/api/projects";
+import type {
+  AcceptancePromptAgent,
+  AcceptancePromptMode,
+  AcceptancePromptResponse,
+  Target,
+} from "@/api/types";
 import { useI18n } from "@/i18n";
 import { copyToClipboard } from "@/utils/clipboard";
 
-const props = defineProps<{
-  open: boolean;
-  projectId: string;
-}>();
+const props = withDefaults(
+  defineProps<{
+    open: boolean;
+    projectId: string;
+    initialMode?: AcceptancePromptMode;
+  }>(),
+  {
+    initialMode: "full",
+  }
+);
 
 const emit = defineEmits<{
   close: [];
@@ -28,6 +41,7 @@ const { locale, t } = useI18n();
 
 const AGENTS: AcceptancePromptAgent[] = ["generic", "antigravity", "claude", "codex", "openclaw"];
 
+const promptMode = ref<AcceptancePromptMode>(props.initialMode || "full");
 const promptLang = ref<"zh" | "en">(locale.value === "en" ? "en" : "zh");
 const agentPreset = ref<AcceptancePromptAgent>("antigravity");
 const loading = ref(false);
@@ -35,19 +49,82 @@ const errorMsg = ref<string | null>(null);
 const data = ref<AcceptancePromptResponse | null>(null);
 const copied = ref(false);
 
+// Portal targets cache (for har_explore scope pills)
+const targets = ref<Target[]>([]);
+const targetsLoadedForProject = ref("");
+const selectedTargetIds = ref<Set<string>>(new Set());
+
+let fetchSeq = 0;
+
+function targetDisplayLabel(tItem: Target): string {
+  const label =
+    tItem.scope_rules && typeof tItem.scope_rules.portal_label === "string"
+      ? tItem.scope_rules.portal_label.trim()
+      : "";
+  if (label) return label;
+  try {
+    return new URL(tItem.base_url).hostname;
+  } catch {
+    return tItem.root_domain || tItem.base_url;
+  }
+}
+
+async function ensureTargetsLoaded(): Promise<void> {
+  const pid = props.projectId;
+  if (!pid || targetsLoadedForProject.value === pid) return;
+  try {
+    const list = await listTargets(pid);
+    if (props.projectId !== pid) return;
+    targets.value = list;
+    targetsLoadedForProject.value = pid;
+    selectedTargetIds.value = new Set(list.map((item) => item.id));
+  } catch {
+    targets.value = [];
+  }
+}
+
+function toggleTarget(id: string): void {
+  const next = new Set(selectedTargetIds.value);
+  if (next.has(id)) {
+    next.delete(id);
+  } else {
+    next.add(id);
+  }
+  selectedTargetIds.value = next;
+  void fetchPrompt();
+}
+
+function selectAllTargets(): void {
+  selectedTargetIds.value = new Set(targets.value.map((item) => item.id));
+  void fetchPrompt();
+}
+
 async function fetchPrompt(): Promise<void> {
-  if (!props.open || !props.projectId) return;
+  const pid = props.projectId;
+  if (!props.open || !pid) return;
+  const reqId = ++fetchSeq;
   loading.value = true;
   errorMsg.value = null;
   try {
-    data.value = await getAcceptancePrompt(props.projectId, {
+    const targetIdsParam =
+      promptMode.value === "har_explore" && selectedTargetIds.value.size > 0
+        ? Array.from(selectedTargetIds.value)
+        : undefined;
+    const res = await getAcceptancePrompt(pid, {
       lang: promptLang.value,
       agent: agentPreset.value,
+      mode: promptMode.value,
+      targetIds: targetIdsParam,
     });
+    if (reqId !== fetchSeq || props.projectId !== pid) return;
+    data.value = res;
   } catch (err) {
+    if (reqId !== fetchSeq) return;
     errorMsg.value = err instanceof Error ? err.message : t("acceptPrompt.error");
   } finally {
-    loading.value = false;
+    if (reqId === fetchSeq) {
+      loading.value = false;
+    }
   }
 }
 
@@ -64,19 +141,49 @@ async function copyPrompt(): Promise<void> {
 
 watch(
   () => props.open,
-  (isOpen) => {
+  async (isOpen) => {
     if (isOpen) {
+      promptMode.value = props.initialMode || "full";
       promptLang.value = locale.value === "en" ? "en" : "zh";
+      copied.value = false;
+      if (promptMode.value === "har_explore") {
+        await ensureTargetsLoaded();
+      }
       void fetchPrompt();
+    } else {
+      targetsLoadedForProject.value = "";
     }
   }
 );
 
-watch([promptLang, agentPreset, () => props.projectId], () => {
+watch(promptMode, async (mode) => {
+  if (!props.open) return;
+  if (mode === "har_explore") {
+    await ensureTargetsLoaded();
+  }
+  void fetchPrompt();
+});
+
+watch([promptLang, agentPreset], () => {
   if (props.open) {
     void fetchPrompt();
   }
 });
+
+watch(
+  () => props.projectId,
+  async () => {
+    targetsLoadedForProject.value = "";
+    targets.value = [];
+    selectedTargetIds.value = new Set();
+    if (props.open) {
+      if (promptMode.value === "har_explore") {
+        await ensureTargetsLoaded();
+      }
+      void fetchPrompt();
+    }
+  }
+);
 </script>
 
 <template>
@@ -112,27 +219,40 @@ watch([promptLang, agentPreset, () => props.projectId], () => {
 
         <!-- Controls & Live Context Badges -->
         <div class="space-y-3 border-b border-slate-200 bg-slate-50/80 px-6 py-3.5">
+          <!-- 2-Tab Mode Switcher -->
           <div class="flex flex-wrap items-center justify-between gap-3">
-            <!-- Agent Preset Pills -->
             <div class="flex flex-wrap items-center gap-2">
               <span class="text-xs font-semibold text-slate-600">
-                {{ t("acceptPrompt.agentLabel") }}:
+                {{ t("acceptPrompt.modeLabel") }}:
               </span>
-              <div class="inline-flex flex-wrap items-center gap-1 rounded-lg bg-slate-200/70 p-0.5">
+              <div class="inline-flex rounded-lg border border-slate-200 bg-slate-200/70 p-0.5 text-xs font-semibold">
                 <button
-                  v-for="ag in AGENTS"
-                  :key="ag"
                   type="button"
-                  :data-testid="`prompt-agent-${ag}`"
-                  class="rounded-md px-2.5 py-1 text-xs font-medium transition"
+                  data-testid="prompt-mode-har_explore"
+                  class="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 transition"
                   :class="
-                    agentPreset === ag
+                    promptMode === 'har_explore'
                       ? 'bg-white text-indigo-700 shadow-sm'
                       : 'text-slate-600 hover:text-slate-900'
                   "
-                  @click="agentPreset = ag"
+                  @click="promptMode = 'har_explore'"
                 >
-                  {{ t(`acceptPrompt.agent.${ag}`) }}
+                  <Compass class="h-3.5 w-3.5" />
+                  <span>{{ t("acceptPrompt.mode.har_explore") }}</span>
+                </button>
+                <button
+                  type="button"
+                  data-testid="prompt-mode-full"
+                  class="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 transition"
+                  :class="
+                    promptMode === 'full'
+                      ? 'bg-white text-indigo-700 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  "
+                  @click="promptMode = 'full'"
+                >
+                  <Sparkles class="h-3.5 w-3.5" />
+                  <span>{{ t("acceptPrompt.mode.full") }}</span>
                 </button>
               </div>
             </div>
@@ -168,6 +288,74 @@ watch([promptLang, agentPreset, () => props.projectId], () => {
                 <RefreshCw class="h-3.5 w-3.5" :class="loading ? 'animate-spin' : ''" />
               </button>
             </div>
+          </div>
+
+          <!-- Agent Preset Pills -->
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-xs font-semibold text-slate-600">
+              {{ t("acceptPrompt.agentLabel") }}:
+            </span>
+            <div class="inline-flex flex-wrap items-center gap-1 rounded-lg bg-slate-200/70 p-0.5">
+              <button
+                v-for="ag in AGENTS"
+                :key="ag"
+                type="button"
+                :data-testid="`prompt-agent-${ag}`"
+                class="rounded-md px-2.5 py-1 text-xs font-medium transition"
+                :class="
+                  agentPreset === ag
+                    ? 'bg-white text-indigo-700 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                "
+                @click="agentPreset = ag"
+              >
+                {{ t(`acceptPrompt.agent.${ag}`) }}
+              </button>
+            </div>
+          </div>
+
+          <!-- Portal Target Scope Pills (when har_explore mode is active) -->
+          <div
+            v-if="promptMode === 'har_explore' && targets.length > 0"
+            data-testid="prompt-target-selector"
+            class="flex flex-wrap items-center gap-1.5 rounded-lg border border-indigo-100 bg-indigo-50/50 px-3 py-2 text-xs"
+          >
+            <span class="inline-flex items-center gap-1 font-semibold text-indigo-800">
+              <Globe class="h-3.5 w-3.5" />
+              <span>{{ t("acceptPrompt.portalsScopeLabel") }}:</span>
+            </span>
+
+            <button
+              v-for="tItem in targets"
+              :key="tItem.id"
+              type="button"
+              data-testid="prompt-target-pill"
+              class="inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition"
+              :class="
+                selectedTargetIds.has(tItem.id)
+                  ? 'border-indigo-600 bg-indigo-600 text-white'
+                  : 'border-slate-300 bg-white text-slate-600 hover:border-indigo-300 hover:text-indigo-700'
+              "
+              @click="toggleTarget(tItem.id)"
+            >
+              <Check v-if="selectedTargetIds.has(tItem.id)" class="h-3 w-3 shrink-0" />
+              <span>{{ targetDisplayLabel(tItem) }}</span>
+            </button>
+
+            <button
+              v-if="selectedTargetIds.size < targets.length"
+              type="button"
+              class="ml-1 text-[11px] font-semibold text-indigo-600 hover:underline"
+              @click="selectAllTargets"
+            >
+              {{ t("acceptPrompt.portalsSelectAll") }}
+            </button>
+            <span
+              v-if="selectedTargetIds.size === 0"
+              class="ml-1 text-[11px] text-slate-500"
+            >
+              ({{ t("acceptPrompt.portalsAllHint") }})
+            </span>
           </div>
 
           <!-- Context Summary Badges -->

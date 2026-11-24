@@ -38,6 +38,7 @@ from reconqa.modules.codegen_java.schemathesis_run import (
     _parse_junit_report,
     _parse_stdout_fallback,
 )
+from reconqa.modules.hub.capability_map import build_capability_map
 from reconqa.modules.hub.har_parser import normalize_path
 from reconqa.modules.performance.k6_generator import generate_k6_script
 from reconqa.modules.security.nuclei_runner import run_nuclei_scan
@@ -974,19 +975,27 @@ async def generate_acceptance_prompt(
     project_id: str,
     lang: Literal["zh", "en"] = Query(default="zh"),
     agent: str = Query(default="generic"),
+    mode: Literal["full", "har_explore"] = Query(default="full"),
+    target_ids: list[str] | None = Query(default=None),
     mcp_url: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> AcceptancePromptResponse:
-    """Generate a live, secret-free Markdown AI Acceptance Prompt recipe for external AI Agents."""
+    """Generate a live, secret-free Markdown AI Acceptance or HAR Exploration Prompt recipe."""
     project = await _get_project_or_404(db, project_id)
     norm_agent = (agent or "generic").strip().lower()
     if norm_agent not in _AGENT_LABELS:
         norm_agent = "generic"
     agent_label_zh, agent_label_en = _AGENT_LABELS[norm_agent]
 
-    targets = list(
+    all_targets = list(
         (await db.execute(select(Target).where(Target.project_id == project_id))).scalars().all()
     )
+    wanted_target_ids = {tid.strip() for tid in (target_ids or []) if tid and tid.strip()}
+    if wanted_target_ids:
+        filtered_targets = [t for t in all_targets if t.id in wanted_target_ids]
+        targets = filtered_targets if filtered_targets else all_targets
+    else:
+        targets = all_targets
     credentials = list(
         (await db.execute(select(AuthProfile).where(AuthProfile.project_id == project_id)))
         .scalars()
@@ -1034,9 +1043,16 @@ async def generate_acceptance_prompt(
         if s.effectiveness_level in {"L0", "L1", "L2"} and s.status != "archived"
     ]
 
+    def _format_target_line(t: Target) -> str:
+        rules = t.scope_rules if isinstance(t.scope_rules, dict) else {}
+        portal_label = str(rules.get("portal_label") or "").strip()
+        if portal_label:
+            return f"- **{portal_label}** — `{t.base_url}` (domain: `{t.root_domain}`)"
+        return f"- `{t.base_url}` (domain: `{t.root_domain}`)"
+
     # Build ZERO-SECRET lines (never print extra_headers_ref values or storage_state contents!)
     target_lines = (
-        "\n".join(f"- `{t.base_url}` (domain: `{t.root_domain}`)" for t in targets)
+        "\n".join(_format_target_line(t) for t in targets)
         if targets
         else ("- （暂无已配置目标，请先在项目设置或 Explore 阶段补充）" if lang == "zh" else "- (No targets configured yet)")
     )
@@ -1081,6 +1097,141 @@ async def generate_acceptance_prompt(
     )
 
     mcp_hint = f"\n- **ReconQA MCP URL**: `{mcp_url.strip()}`" if mcp_url and mcp_url.strip() else ""
+
+    if mode == "har_explore":
+        static_caps: list[dict[str, Any]] = []
+        try:
+            cap_map = build_capability_map(inventory, enriched_scenarios, project.id, project.name)
+            static_caps = [
+                c
+                for c in (cap_map.get("capabilities") or [])
+                if int(c.get("live_endpoints") or 0) == 0 and int(c.get("total_endpoints") or 0) > 0
+            ]
+            static_caps.sort(
+                key=lambda c: (
+                    -int(c.get("priority_score") or 0),
+                    -int(c.get("total_endpoints") or 0),
+                    str(c.get("key") or ""),
+                )
+            )
+            static_caps = static_caps[:8]
+        except Exception:
+            static_caps = []
+
+        if static_caps:
+            static_cap_lines = "\n".join(
+                f"- `[{c.get('recommended_priority', 'P2')}]` `{c.get('key')}` — {c.get('total_endpoints', 0)} 个静态端点（写操作 {c.get('write_endpoints', 0)}，角色: {', '.join(c.get('roles') or ['common'])}）"
+                if lang == "zh"
+                else f"- `[{c.get('recommended_priority', 'P2')}]` `{c.get('key')}` — {c.get('total_endpoints', 0)} static endpoints (writes={c.get('write_endpoints', 0)}, roles={', '.join(c.get('roles') or ['common'])})"
+                for c in static_caps
+            )
+        else:
+            static_cap_lines = prefix_lines
+
+        if lang == "zh":
+            prompt_markdown = f"""# ReconQA Playwright HAR 探索与自动回传指令（{agent_label_zh}）
+
+你正在为项目 **{project.name}**（`project_id`: `{project.id}`）执行聚焦的 **Playwright HAR 探索录制与自动入库闭环**，目标是把静态发现的盲区页面转化为真实 `har-live` 流量资产。{mcp_hint}
+
+## 当前项目上下文（实时聚合，已脱敏）
+- **项目 ID**: `{project.id}` | **最新已完成 Run**: `{latest_run_id}`
+- **API 资产库覆盖率**: `{har_live_count} / {total_endpoints}`（`{coverage_pct}%` 实测覆盖）
+
+### 本次探索目标门户（Targets）
+{target_lines}
+
+### 已保存测试凭据（仅元数据，绝不包含明文 Token/Cookie）
+{cred_lines}
+
+### 待补齐覆盖的 API 前缀
+{prefix_lines}
+
+### 仅静态发现、尚未捕获实测 HAR 的高价值业务能力
+{static_cap_lines}
+
+---
+
+## 聚焦 3 步 HAR 探索与上传闭环
+
+### 步骤 1：盘点未覆盖接口与静态能力盲区
+1. 调用 `reconqa_get_project_inventory(project_id="{project.id}", source="js-static", limit=80)` 查看尚未捕获实测流量的接口。
+2. 调用 `reconqa_get_capability_map(project_id="{project.id}", live_only=False)` 锁定高优先级（`P0/P1`）且仍缺少 `har-live` 流量的业务能力。
+
+### 步骤 2：使用外部 Playwright 按门户/模块分片录制 `.har`
+1. 针对上方选定的门户，使用 Playwright 创建独立的浏览器上下文并开启 HAR 录制：
+   `record_har_path="<portal>_<module>.har"`（按门户 + 业务模块拆分多个小 `.har` 文件，例如 `admin_orders.har`、`portal_users.har`，**切勿把所有页面录成一个超大 HAR**）。
+2. 系统化漫游未覆盖菜单、列表筛选、分页、详情页与核心只读业务流，确保捕获真实 API 请求与响应结构；遇到登录、验证码或二次认证时立即暂停并请人工协助。
+
+### 步骤 3：自动上传合并并回报覆盖率增量
+1. 调用 `reconqa_upload_har_files(project_id="{project.id}", har_paths=["<portal>_<module>.har", ...], wait=True)` 批量上传录制好的 `.har` 文件并触发快速 `merge` 合并分析。
+2. 如捕获到新的有效会话，可调用 `reconqa_extract_credential(project_id="{project.id}")` 自动更新脱敏鉴权凭据（绝不回显明文）。
+3. 再次查询 `reconqa_get_project_inventory(project_id="{project.id}")`，汇报本次探索带来的**覆盖率增量**（前后 `har_live_count` 与 `coverage_pct`）以及新点亮的业务接口清单。
+
+## 必须遵守的安全规范
+- **严禁绕过验证码 / CAPTCHA / 2FA / 反爬校验**：遇到人工校验门禁必须暂停并交由人工处理。
+- **严禁在生产环境执行破坏性写操作**：默认坚持只读浏览（禁止点击删除、支付、提交审核、重置密码等变更按钮），除非用户明确授权在测试环境执行。
+- **严禁泄露凭据与敏感信息**：切勿在日志、回复或文档中打印、粘贴或回显任何明文 Token、Cookie、密码或 API Key。
+"""
+        else:
+            prompt_markdown = f"""# ReconQA Playwright HAR Exploration & Auto-Upload Recipe ({agent_label_en})
+
+You are running a focused **Playwright HAR Exploration & Auto-Upload Loop** for project **{project.name}** (`project_id`: `{project.id}`) to turn static-only blind spots into live-verified `har-live` API traffic. {mcp_hint}
+
+## Live Project Context (Secret-Free Snapshot)
+- **Project ID**: `{project.id}` | **Latest Completed Run**: `{latest_run_id}`
+- **Master API Inventory Coverage**: `{har_live_count} / {total_endpoints}` (`{coverage_pct}%` live-verified)
+
+### Selected Portal Targets
+{target_lines}
+
+### Saved Auth Credentials (Metadata Only — Zero Raw Secrets)
+{cred_lines}
+
+### Top Uncovered API Prefixes
+{prefix_lines}
+
+### Top Static-Only Business Capabilities (Zero Live HAR Yet)
+{static_cap_lines}
+
+---
+
+## Focused 3-Step HAR Exploration Loop
+
+### Step 1: Inspect Uncovered Endpoints & Static-Only Capabilities
+1. Call `reconqa_get_project_inventory(project_id="{project.id}", source="js-static", limit=80)` to list uncovered API paths.
+2. Call `reconqa_get_capability_map(project_id="{project.id}", live_only=False)` to prioritize `P0/P1` capabilities that still lack `har-live` traffic.
+
+### Step 2: Drive External Playwright for Modular `.har` Recording
+1. Across the selected portals above, launch Playwright contexts with `record_har_path="<portal>_<module>.har"` to record clean, modular per-portal/per-module `.har` files (e.g. `admin_orders.har`, `portal_users.har` — **avoid recording one giant monolithic HAR**).
+2. Roam uncovered navigation menus, filters, pagination, and read-only detail flows to capture authentic request/response payloads; pause and ask the human immediately on login, CAPTCHA, or MFA gates.
+
+### Step 3: Upload, Analyze & Report Coverage Delta
+1. Call `reconqa_upload_har_files(project_id="{project.id}", har_paths=["<portal>_<module>.har", ...], wait=True)` to upload the recorded `.har` files and trigger fast `merge` hub analysis.
+2. Optionally call `reconqa_extract_credential(project_id="{project.id}")` to refresh masked server-side auth credentials from the captured HAR (never echoes raw tokens).
+3. Re-query `reconqa_get_project_inventory(project_id="{project.id}")` and report the **coverage delta** (`har_live_count`, `coverage_pct`) and newly live-verified endpoints.
+
+## Mandatory Safety Rules
+- **Never bypass CAPTCHAs, MFA/2FA, or anti-bot challenges**: pause immediately and hand off to a human operator.
+- **No destructive production writes**: stick to read-only exploration (never click Delete, Submit, Pay, Approve, or Reset Password) unless explicitly authorized on a non-production staging target.
+- **Zero credential leakage**: never print, log, paste, or echo raw Bearer tokens, cookies, passwords, or API keys.
+"""
+
+        return AcceptancePromptResponse(
+            project_id=project.id,
+            project_name=project.name,
+            mode=mode,
+            lang=lang,
+            agent=norm_agent,
+            prompt_markdown=prompt_markdown.strip(),
+            context_summary=AcceptancePromptContextSummary(
+                targets_count=len(targets),
+                credentials_count=len(credentials),
+                kb_docs_count=len(kb_docs),
+                coverage_pct=coverage_pct,
+                p0_p1_effective_pct=sc_list.p0_p1_effective_pct,
+                scenarios_needing_attention=len(needing_attention),
+            ),
+        )
 
     if lang == "zh":
         prompt_markdown = f"""# ReconQA 自主外部系统验收指令（{agent_label_zh}）
@@ -1196,6 +1347,7 @@ Finish by calling `reconqa_list_scenarios(project_id="{project.id}")` and presen
     return AcceptancePromptResponse(
         project_id=project.id,
         project_name=project.name,
+        mode="full",
         lang=lang,
         agent=norm_agent,
         prompt_markdown=prompt_markdown.strip(),

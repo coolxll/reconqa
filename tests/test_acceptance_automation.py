@@ -412,3 +412,182 @@ async def test_acceptance_prompt_zh_en_and_zero_secret_leakage(
             assert "4-Stage Autonomous Acceptance Loop" in md_en
             assert "reconqa_extract_credential" in md_en
             assert secret_token not in md_en  # ZERO secret leakage!
+            assert zh_body["mode"] == "full"
+            assert en_body["mode"] == "full"
+
+
+@pytest.mark.asyncio
+async def test_acceptance_prompt_har_explore_mode_and_target_filtering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify mode=har_explore (zh & en), target_ids filtering, static-only capabilities, and zero secret leak."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "accept_har_explore.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+    monkeypatch.setattr(Settings, "resolve_bin", lambda self, name: None)
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+
+    from reconqa.server.app import create_app
+
+    fastapi_app = create_app()
+    async with fastapi_app.router.lifespan_context(fastapi_app):
+        transport = httpx.ASGITransport(app=fastapi_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            proj = (await client.post("/api/v1/projects", json={"name": "Commerce Suite"})).json()
+            pid = proj["id"]
+
+            t_admin = (
+                await client.post(
+                    f"/api/v1/projects/{pid}/targets",
+                    json={
+                        "root_domain": "shop.example.test",
+                        "base_url": "https://admin.shop.example.test",
+                        "scope_rules": {"portal_label": "Admin Console"},
+                    },
+                )
+            ).json()
+            t_buyer = (
+                await client.post(
+                    f"/api/v1/projects/{pid}/targets",
+                    json={
+                        "root_domain": "shop.example.test",
+                        "base_url": "https://portal.shop.example.test",
+                        "scope_rules": {"portal_label": "Buyer Portal"},
+                    },
+                )
+            ).json()
+
+            secret_token = "SYNTH-HAR-EXPLORE-SECRET-TOKEN-12345"
+            await client.post(
+                f"/api/v1/projects/{pid}/auth-profiles",
+                json={
+                    "name": "Admin Session",
+                    "role_tag": "account_a",
+                    "extra_headers_ref": {"Authorization": f"Bearer {secret_token}"},
+                },
+            )
+
+            # Seed a completed run with 1 live endpoint + 2 static-only endpoints
+            run_data = (
+                await client.post(
+                    f"/api/v1/projects/{pid}/runs?auto_start=false",
+                    json={"name": "Initial Explore Run", "target_url": "https://admin.shop.example.test"},
+                )
+            ).json()
+            rid = run_data["id"]
+            hub_dir = Path(run_data["workspace_dir"]) / "hub"
+            hub_dir.mkdir(parents=True, exist_ok=True)
+            (hub_dir / "openapi.json").write_text(
+                json.dumps(
+                    {
+                        "openapi": "3.0.3",
+                        "servers": [{"url": "https://admin.shop.example.test"}],
+                        "paths": {
+                            "/orders/list": {
+                                "get": {
+                                    "x-discovery-source": "har-live",
+                                    "x-scenarios": ["01_orders"],
+                                    "responses": {"200": {"description": "OK"}},
+                                }
+                            },
+                            "/billing/refund/apply": {
+                                "post": {
+                                    "x-discovery-source": "js-static",
+                                    "responses": {"200": {"description": "OK"}},
+                                }
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sf = db_mod.get_session_factory()
+            async with sf() as session:
+                run_obj = await session.get(Run, rid)
+                assert run_obj is not None
+                run_obj.status = "completed"
+                await session.commit()
+
+            # 1. zh har_explore filtered strictly to Admin Console target_id
+            res_zh = await client.get(
+                f"/api/v1/projects/{pid}/acceptance-prompt",
+                params=[
+                    ("lang", "zh"),
+                    ("agent", "antigravity"),
+                    ("mode", "har_explore"),
+                    ("target_ids", t_admin["id"]),
+                ],
+            )
+            assert res_zh.status_code == 200, res_zh.text
+            zh_body = res_zh.json()
+            assert zh_body["mode"] == "har_explore"
+            assert zh_body["lang"] == "zh"
+            assert zh_body["context_summary"]["targets_count"] == 1
+            md_zh = zh_body["prompt_markdown"]
+            assert "Admin Console" in md_zh
+            assert "https://admin.shop.example.test" in md_zh
+            assert "Buyer Portal" not in md_zh
+            assert "https://portal.shop.example.test" not in md_zh
+            assert "record_har_path" in md_zh
+            assert "reconqa_get_project_inventory" in md_zh
+            assert "reconqa_get_capability_map" in md_zh
+            assert "reconqa_upload_har_files" in md_zh
+            assert "reconqa_extract_credential" in md_zh
+            assert "billing/refund" in md_zh
+            assert "CAPTCHA" in md_zh
+            assert "Admin Session" in md_zh
+            assert secret_token not in md_zh
+
+            # 2. en har_explore with both target_ids + mcp_url
+            res_en = await client.get(
+                f"/api/v1/projects/{pid}/acceptance-prompt",
+                params=[
+                    ("lang", "en"),
+                    ("agent", "claude"),
+                    ("mode", "har_explore"),
+                    ("target_ids", t_admin["id"]),
+                    ("target_ids", t_buyer["id"]),
+                    ("mcp_url", "http://127.0.0.1:8001/mcp"),
+                ],
+            )
+            assert res_en.status_code == 200, res_en.text
+            en_body = res_en.json()
+            assert en_body["mode"] == "har_explore"
+            assert en_body["context_summary"]["targets_count"] == 2
+            md_en = en_body["prompt_markdown"]
+            assert "Playwright HAR Exploration" in md_en
+            assert "Admin Console" in md_en
+            assert "Buyer Portal" in md_en
+            assert "http://127.0.0.1:8001/mcp" in md_en
+            assert "record_har_path" in md_en
+            assert "reconqa_upload_har_files" in md_en
+            assert "billing/refund" in md_en
+            assert "CAPTCHA" in md_en
+            assert secret_token not in md_en
+
+            # 3. Unknown target_ids falls back cleanly to all project targets
+            res_fallback = await client.get(
+                f"/api/v1/projects/{pid}/acceptance-prompt",
+                params=[
+                    ("lang", "en"),
+                    ("mode", "har_explore"),
+                    ("target_ids", "nonexistent-target-id"),
+                ],
+            )
+            assert res_fallback.status_code == 200
+            fb_body = res_fallback.json()
+            assert fb_body["context_summary"]["targets_count"] == 2
+            assert "Admin Console" in fb_body["prompt_markdown"]
+            assert "Buyer Portal" in fb_body["prompt_markdown"]
+
+            # 4. mode=full default backward compatibility
+            res_full = await client.get(
+                f"/api/v1/projects/{pid}/acceptance-prompt",
+                params={"lang": "en"},
+            )
+            assert res_full.status_code == 200
+            assert res_full.json()["mode"] == "full"
+            assert "4-Stage Autonomous Acceptance Loop" in res_full.json()["prompt_markdown"]

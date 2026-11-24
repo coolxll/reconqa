@@ -848,6 +848,7 @@ export interface ExecuteExternalToolResponse {
 }
 
 export type AcceptancePromptAgent = "generic" | "antigravity" | "claude" | "codex" | "openclaw";
+export type AcceptancePromptMode = "full" | "har_explore";
 
 export interface AcceptancePromptContextSummary {
   targets_count: number;
@@ -863,6 +864,7 @@ export interface AcceptancePromptResponse {
   project_name: string;
   lang: string;
   agent: string;
+  mode?: AcceptancePromptMode;
   prompt_markdown: string;
   context_summary: AcceptancePromptContextSummary;
 }

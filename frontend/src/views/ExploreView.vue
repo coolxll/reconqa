@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   AlertTriangle,
   ArrowRight,
+  Bot,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Clock,
   Compass,
   FileCode2,
   GitMerge,
@@ -21,15 +24,18 @@ import {
   Sparkles,
   Terminal,
   Trash2,
+  X,
 } from "lucide-vue-next";
 import {
   deleteExplore,
-  exploreAllProjectTargets,
   getExplore,
+  getExploreJob,
+  listExploreJobs,
   listExplores,
   promoteExploreToRun,
-  runExplore,
+  startExploreJob,
   type DiscoveredEndpoint,
+  type ExploreJob,
   type ExploreListItem,
   type ExploreMode,
   type ExploreResult,
@@ -39,6 +45,7 @@ import type { DiscoveredPortal, Project, Target } from "@/api/types";
 import { useWorkspace } from "@/stores/workspace";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import MetricCard from "@/components/layout/MetricCard.vue";
+import AcceptancePromptModal from "@/components/workspace/AcceptancePromptModal.vue";
 import DiscoveredPortalsPanel from "@/components/workspace/DiscoveredPortalsPanel.vue";
 import { useI18n } from "@/i18n";
 import "@/i18n/locales/explore";
@@ -83,6 +90,45 @@ const historyItems = ref<ExploreListItem[]>([]);
 const selectedHistoryId = ref("");
 const result = ref<ExploreResult | null>(null);
 
+// Async Explore Job Progress state
+const PROGRESS_STAGES = [
+  "init",
+  "probe_openapi",
+  "crawl_js",
+  "discover_portals",
+  "finalize",
+] as const;
+
+const activeJob = ref<ExploreJob | null>(null);
+const elapsedSeconds = ref(0);
+let pollTimer: number | null = null;
+let elapsedTimer: number | null = null;
+let completionHideTimer: number | null = null;
+let pollSeq = 0;
+
+const activeJobPct = computed(() => {
+  const job = activeJob.value;
+  if (!job) return 0;
+  if (job.status === "completed") return 100;
+  return Math.max(0, Math.min(100, Math.round(Number(job.progress_pct ?? 0))));
+});
+
+const activeStageIndex = computed(() => {
+  const job = activeJob.value;
+  if (!job) return -1;
+  if (job.status === "completed" || job.stage === "completed") {
+    return PROGRESS_STAGES.length;
+  }
+  const normalized = job.stage === "merge" ? "finalize" : job.stage;
+  const idx = PROGRESS_STAGES.indexOf(normalized as (typeof PROGRESS_STAGES)[number]);
+  if (idx >= 0) return idx;
+  if (job.progress_pct >= 88) return 4;
+  if (job.progress_pct >= 68) return 3;
+  if (job.progress_pct >= 42) return 2;
+  if (job.progress_pct >= 20) return 1;
+  return 0;
+});
+
 // Project Multi-Portal Targets state
 const projectTargets = ref<Target[]>([]);
 const selectedPortalIds = ref<Set<string>>(new Set());
@@ -90,6 +136,7 @@ const discoveringPortals = ref(false);
 const discoveredPortals = ref<DiscoveredPortal[] | null>(null);
 const discoveredRootDomain = ref("");
 const portalNotice = ref<string | null>(null);
+const harPromptOpen = ref(false);
 
 // Result explorer state
 const activeResultTab = ref<"endpoints" | "spa" | "assets" | "warnings">("endpoints");
@@ -521,7 +568,149 @@ async function handleDeleteExplore(): Promise<void> {
   }
 }
 
+function stopJobPolling(): void {
+  if (pollTimer !== null) {
+    window.clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  if (elapsedTimer !== null) {
+    window.clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+}
+
+function clearCompletionHideTimer(): void {
+  if (completionHideTimer !== null) {
+    window.clearTimeout(completionHideTimer);
+    completionHideTimer = null;
+  }
+}
+
+function syncElapsedSeconds(job: ExploreJob | null): void {
+  if (!job?.started_at) {
+    elapsedSeconds.value = 0;
+    return;
+  }
+  const startMs = Date.parse(job.started_at);
+  if (Number.isNaN(startMs)) {
+    elapsedSeconds.value = 0;
+    return;
+  }
+  const endMs =
+    job.finished_at && !Number.isNaN(Date.parse(job.finished_at))
+      ? Date.parse(job.finished_at)
+      : Date.now();
+  elapsedSeconds.value = Math.max(0, Math.floor((endMs - startMs) / 1000));
+}
+
+function dismissProgressCard(): void {
+  clearCompletionHideTimer();
+  if (activeJob.value?.status !== "running") {
+    activeJob.value = null;
+  }
+}
+
+async function finalizeCompletedJob(job: ExploreJob, pidSnapshot: string | null): Promise<void> {
+  if ((projectId.value || null) !== pidSnapshot) return;
+  let finalResult = job.result ?? null;
+  if (!finalResult && job.explore_id) {
+    try {
+      finalResult = await getExplore(job.explore_id);
+    } catch {
+      // Ignore fallback fetch error; history refresh will still surface it
+    }
+  }
+  if ((projectId.value || null) !== pidSnapshot) return;
+  if (finalResult) {
+    applyResult(finalResult);
+  }
+  const updatedList = await listExplores(pidSnapshot).catch(() => historyItems.value);
+  if ((projectId.value || null) !== pidSnapshot) return;
+  historyItems.value = updatedList;
+
+  clearCompletionHideTimer();
+  completionHideTimer = window.setTimeout(() => {
+    if (activeJob.value?.job_id === job.job_id && activeJob.value.status === "completed") {
+      activeJob.value = null;
+    }
+  }, 6000);
+}
+
+function attachAndPollJob(job: ExploreJob, isPortalsJob = false): void {
+  stopJobPolling();
+  clearCompletionHideTimer();
+  const currentPollSeq = ++pollSeq;
+  const pidSnapshot = projectId.value || null;
+
+  activeJob.value = job;
+  syncElapsedSeconds(job);
+
+  if (job.status === "completed") {
+    running.value = false;
+    runningPortals.value = false;
+    void finalizeCompletedJob(job, pidSnapshot);
+    return;
+  }
+  if (job.status === "failed") {
+    running.value = false;
+    runningPortals.value = false;
+    error.value = job.error || t("explore.errorRun");
+    return;
+  }
+
+  running.value = !isPortalsJob;
+  runningPortals.value = isPortalsJob;
+
+  elapsedTimer = window.setInterval(() => {
+    if (activeJob.value?.status === "running") {
+      syncElapsedSeconds(activeJob.value);
+    }
+  }, 1000);
+
+  let inFlight = false;
+  pollTimer = window.setInterval(async () => {
+    if (inFlight || currentPollSeq !== pollSeq) return;
+    inFlight = true;
+    try {
+      const updated = await getExploreJob(job.job_id);
+      if (currentPollSeq !== pollSeq || (projectId.value || null) !== pidSnapshot) return;
+      activeJob.value = updated;
+      syncElapsedSeconds(updated);
+      if (updated.status === "completed") {
+        stopJobPolling();
+        running.value = false;
+        runningPortals.value = false;
+        await finalizeCompletedJob(updated, pidSnapshot);
+      } else if (updated.status === "failed") {
+        stopJobPolling();
+        running.value = false;
+        runningPortals.value = false;
+        error.value = updated.error || t("explore.errorRun");
+      }
+    } catch {
+      // Transient poll error; keep polling next tick
+    } finally {
+      inFlight = false;
+    }
+  }, 800);
+}
+
+async function checkAndResumeActiveJob(): Promise<void> {
+  const pidSnapshot = projectId.value || null;
+  try {
+    const jobs = await listExploreJobs(pidSnapshot, true);
+    if ((projectId.value || null) !== pidSnapshot) return;
+    const runningJob = jobs.find((j) => j.status === "running");
+    if (runningJob && activeJob.value?.job_id !== runningJob.job_id) {
+      attachAndPollJob(runningJob, runningJob.targets_total > 1);
+    }
+  } catch {
+    // Ignore resume probe failure
+  }
+}
+
 async function handleRunExplore(): Promise<void> {
+  if (running.value || runningPortals.value) return;
   error.value = null;
   const curlText = inputMode.value === "curl" ? seedCurl.value.trim() : "";
   const urlLines =
@@ -539,7 +728,7 @@ async function handleRunExplore(): Promise<void> {
 
   running.value = true;
   try {
-    const res = await runExplore({
+    const job = await startExploreJob({
       project_id: projectId.value || null,
       seed_curl: curlText || null,
       target_url: urlLines.length === 1 ? urlLines[0] : null,
@@ -549,15 +738,10 @@ async function handleRunExplore(): Promise<void> {
       crawl_js: crawlJs.value,
       depth: depth.value,
     });
-    applyResult(res);
-    const updatedList = await listExplores(projectId.value || null).catch(
-      () => historyItems.value
-    );
-    historyItems.value = updatedList;
+    attachAndPollJob(job, false);
   } catch (err) {
-    error.value = err instanceof Error ? err.message : t("explore.errorRun");
-  } finally {
     running.value = false;
+    error.value = err instanceof Error ? err.message : t("explore.errorRun");
   }
 }
 
@@ -568,20 +752,19 @@ async function handleExploreSelectedPortals(): Promise<void> {
   error.value = null;
   runningPortals.value = true;
   try {
-    const res = await exploreAllProjectTargets(projectId.value, {
+    const job = await startExploreJob({
+      project_id: projectId.value,
+      explore_all_targets: true,
       target_ids: Array.from(selectedPortalIds.value),
       mode: discoveryMode.value,
       probe_openapi_docs: probeOpenApiDocs.value,
       crawl_js: crawlJs.value,
       depth: depth.value,
     });
-    applyResult(res);
-    const updatedList = await listExplores(projectId.value).catch(() => historyItems.value);
-    historyItems.value = updatedList;
+    attachAndPollJob(job, true);
   } catch (err) {
-    error.value = err instanceof Error ? err.message : t("explore.errorRun");
-  } finally {
     runningPortals.value = false;
+    error.value = err instanceof Error ? err.message : t("explore.errorRun");
   }
 }
 
@@ -629,15 +812,29 @@ async function handlePromoteToRun(): Promise<void> {
 }
 
 watch(projectId, () => {
+  stopJobPolling();
+  clearCompletionHideTimer();
+  pollSeq += 1;
+  activeJob.value = null;
+  running.value = false;
+  runningPortals.value = false;
   discoveredPortals.value = null;
   discoveredRootDomain.value = "";
   portalNotice.value = null;
   void fetchHistoryAndProjects(true);
+  void checkAndResumeActiveJob();
 });
 
 onMounted(async () => {
   await ensureLoaded();
   void fetchHistoryAndProjects();
+  void checkAndResumeActiveJob();
+});
+
+onBeforeUnmount(() => {
+  stopJobPolling();
+  clearCompletionHideTimer();
+  pollSeq += 1;
 });
 </script>
 
@@ -657,11 +854,23 @@ onMounted(async () => {
         </p>
       </div>
 
-      <div
-        v-if="historyItems.length > 0"
-        data-testid="explore-history-bar"
-        class="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm"
-      >
+      <div class="flex flex-wrap items-center gap-2.5">
+        <button
+          v-if="projectId"
+          type="button"
+          data-testid="explore-agent-har-prompt-btn"
+          class="inline-flex items-center gap-1.5 rounded-xl border border-indigo-200 bg-indigo-50 px-3.5 py-2 text-xs font-semibold text-indigo-700 shadow-sm transition hover:border-indigo-300 hover:bg-indigo-100"
+          @click="harPromptOpen = true"
+        >
+          <Bot class="h-4 w-4 text-indigo-600" />
+          <span>{{ t("acceptPrompt.harExploreBtn") }}</span>
+        </button>
+
+        <div
+          v-if="historyItems.length > 0"
+          data-testid="explore-history-bar"
+          class="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm"
+        >
         <div class="flex items-center gap-1.5 text-xs font-medium text-slate-600">
           <History class="h-3.5 w-3.5 text-slate-400" />
           <span>{{ t("explore.historyLabel") }}:</span>
@@ -737,6 +946,7 @@ onMounted(async () => {
           <RefreshCw class="h-3.5 w-3.5" :class="loadingHistory ? 'animate-spin' : ''" />
           <span>{{ t("explore.refreshHistory") }}</span>
         </button>
+        </div>
       </div>
     </div>
 
@@ -1072,7 +1282,7 @@ onMounted(async () => {
             type="button"
             data-testid="explore-submit-btn"
             class="btn-primary px-5 py-2 text-sm"
-            :disabled="running"
+            :disabled="running || runningPortals"
             @click="handleRunExplore"
           >
             <Loader2 v-if="running" class="h-4 w-4 animate-spin" />
@@ -1091,9 +1301,165 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- Real-Time Async Explore Progress Card & 5-Stage Stepper -->
+    <div
+      v-if="activeJob"
+      data-testid="explore-progress-card"
+      class="overflow-hidden rounded-xl border shadow-sm transition"
+      :class="
+        activeJob.status === 'failed'
+          ? 'border-rose-200 bg-rose-50/40'
+          : activeJob.status === 'completed'
+            ? 'border-emerald-200 bg-emerald-50/40'
+            : 'border-indigo-200 bg-white'
+      "
+    >
+      <div class="space-y-4 px-5 py-4">
+        <!-- Header Row: Status, Percentage, Elapsed, Endpoints Badge -->
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-center gap-2.5">
+            <Loader2
+              v-if="activeJob.status === 'running'"
+              class="h-4 w-4 shrink-0 animate-spin text-indigo-600"
+            />
+            <CheckCircle2
+              v-else-if="activeJob.status === 'completed'"
+              class="h-4 w-4 shrink-0 text-emerald-600"
+            />
+            <AlertTriangle v-else class="h-4 w-4 shrink-0 text-rose-600" />
+            <span class="text-sm font-semibold text-slate-900">
+              {{
+                activeJob.status === "completed"
+                  ? t("explore.progress.titleCompleted")
+                  : activeJob.status === "failed"
+                    ? t("explore.progress.titleFailed")
+                    : t("explore.progress.titleRunning")
+              }}
+            </span>
+            <span
+              v-if="activeJob.endpoints_found > 0"
+              class="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-emerald-700"
+            >
+              {{ t("explore.progress.endpointsBadge", { count: activeJob.endpoints_found }) }}
+            </span>
+          </div>
+
+          <div class="flex items-center gap-3 text-xs">
+            <span class="inline-flex items-center gap-1 font-mono text-slate-500">
+              <Clock class="h-3.5 w-3.5" />
+              <span>{{ t("explore.progress.elapsed", { sec: elapsedSeconds }) }}</span>
+            </span>
+            <span
+              class="font-mono text-base font-bold"
+              :class="
+                activeJob.status === 'failed'
+                  ? 'text-rose-700'
+                  : activeJob.status === 'completed'
+                    ? 'text-emerald-700'
+                    : 'text-indigo-700'
+              "
+            >
+              {{ activeJobPct }}%
+            </span>
+            <button
+              v-if="activeJob.status !== 'running'"
+              type="button"
+              class="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-slate-500 hover:bg-slate-200/60 hover:text-slate-800"
+              :title="t('explore.progress.dismiss')"
+              @click="dismissProgressCard"
+            >
+              <X class="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+
+        <!-- Smooth Progress Bar -->
+        <div class="h-2 w-full overflow-hidden rounded-full bg-slate-100">
+          <div
+            data-testid="explore-progress-bar"
+            class="h-full rounded-full transition-all duration-500 ease-out"
+            :class="
+              activeJob.status === 'failed'
+                ? 'bg-rose-500'
+                : activeJob.status === 'completed'
+                  ? 'bg-emerald-500'
+                  : 'bg-indigo-600'
+            "
+            :style="{ width: `${activeJobPct}%` }"
+          />
+        </div>
+
+        <!-- 5-Step Horizontal Stage Stepper -->
+        <div class="grid grid-cols-2 gap-2 sm:grid-cols-5">
+          <div
+            v-for="(stageKey, idx) in PROGRESS_STAGES"
+            :key="stageKey"
+            class="flex items-center gap-2 rounded-lg border px-2.5 py-2 text-xs transition"
+            :class="
+              idx < activeStageIndex
+                ? 'border-emerald-200 bg-emerald-50/70 text-emerald-800'
+                : idx === activeStageIndex && activeJob.status === 'running'
+                  ? 'border-indigo-300 bg-indigo-50 text-indigo-800 shadow-2xs'
+                  : idx === activeStageIndex && activeJob.status === 'failed'
+                    ? 'border-rose-300 bg-rose-50 text-rose-800'
+                    : 'border-slate-200 bg-slate-50/70 text-slate-400'
+            "
+          >
+            <CheckCircle2
+              v-if="idx < activeStageIndex"
+              class="h-3.5 w-3.5 shrink-0 text-emerald-600"
+            />
+            <Loader2
+              v-else-if="idx === activeStageIndex && activeJob.status === 'running'"
+              class="h-3.5 w-3.5 shrink-0 animate-spin text-indigo-600"
+            />
+            <AlertTriangle
+              v-else-if="idx === activeStageIndex && activeJob.status === 'failed'"
+              class="h-3.5 w-3.5 shrink-0 text-rose-600"
+            />
+            <span
+              v-else
+              class="inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border border-slate-300 font-mono text-[9px] font-semibold text-slate-400"
+            >
+              {{ idx + 1 }}
+            </span>
+            <span class="truncate font-medium">
+              {{ t(`explore.progress.stage.${stageKey}`) }}
+            </span>
+          </div>
+        </div>
+
+        <!-- Live Target & Portal Counter Strip -->
+        <div
+          v-if="activeJob.current_target || activeJob.targets_total > 0"
+          class="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-600"
+        >
+          <div v-if="activeJob.current_target" class="flex min-w-0 items-center gap-1.5">
+            <span class="shrink-0 font-medium text-slate-500">
+              {{ t("explore.progress.scanning") }}
+            </span>
+            <span class="truncate font-mono text-slate-800">
+              {{ activeJob.current_target }}
+            </span>
+          </div>
+          <span
+            v-if="activeJob.targets_total > 0"
+            class="shrink-0 rounded-full bg-slate-100 px-2.5 py-0.5 font-mono text-[11px] font-semibold text-slate-700"
+          >
+            {{
+              t("explore.progress.portalsCounter", {
+                done: Math.min(activeJob.targets_done, activeJob.targets_total),
+                total: activeJob.targets_total,
+              })
+            }}
+          </span>
+        </div>
+      </div>
+    </div>
+
     <!-- Empty State before any Explore -->
     <EmptyState
-      v-if="!result && !running"
+      v-if="!result && !running && !runningPortals && !activeJob"
       :title="t('explore.emptyTitle')"
       :description="t('explore.emptyDesc')"
     >
@@ -1649,5 +2015,13 @@ onMounted(async () => {
         </div>
       </div>
     </template>
+
+    <!-- Agent HAR Exploration Prompt Modal -->
+    <AcceptancePromptModal
+      :open="harPromptOpen"
+      :project-id="projectId"
+      initial-mode="har_explore"
+      @close="harPromptOpen = false"
+    />
   </div>
 </template>

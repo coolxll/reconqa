@@ -726,3 +726,158 @@ async def test_discover_sibling_portals_and_batch_targets_idempotency(
         if db_mod._engine is not None:
             await db_mod._engine.dispose()
 
+
+@pytest.mark.asyncio
+async def test_async_explore_job_progress_and_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify #226: on_progress callback, POST /explore/jobs -> 202 -> poll GET /explore/jobs/{id} & list."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "explore_jobs_test.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+
+    from reconqa.config import Settings
+    from reconqa.models import db as db_mod
+    from reconqa.modules.discovery.seed_explorer import explore_from_seed
+    from reconqa.server.routers import explore as explore_router
+
+    monkeypatch.setattr(Settings, "resolve_bin", lambda self, name: None)
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+    explore_router._EXPLORE_JOBS.clear()
+
+    from reconqa.server.app import create_app
+
+    with _MockExploreServer() as mock_srv:
+        # 1. Verify on_progress milestones directly on explore_from_seed
+        stages_seen: list[tuple[str, int]] = []
+        direct_res = explore_from_seed(
+            tmp_path / "direct_progress",
+            target_url=mock_srv.base_url,
+            mode="passive",
+            probe_openapi_docs=True,
+            crawl_js=True,
+            discover_portals=False,
+            on_progress=lambda st, pct, detail: stages_seen.append((st, pct)),
+        )
+        assert direct_res["summary"]["endpoints_count"] >= 3
+        assert [s for s, _ in stages_seen] == [
+            "init",
+            "probe_openapi",
+            "crawl_js",
+            "discover_portals",
+            "finalize",
+        ]
+        assert [p for _, p in stages_seen] == [10, 25, 50, 75, 92]
+
+        # 2. Verify async job REST lifecycle: POST /explore/jobs -> GET /explore/jobs/{job_id} & GET /explore/jobs
+        fastapi_app = create_app()
+        try:
+            async with fastapi_app.router.lifespan_context(fastapi_app):
+                transport = httpx.ASGITransport(app=fastapi_app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://testserver"
+                ) as client:
+                    pid = (
+                        await client.post("/api/v1/projects", json={"name": "Async Explore Project"})
+                    ).json()["id"]
+
+                    # Invalid empty body returns 400 synchronously
+                    r_bad = await client.post("/api/v1/explore/jobs", json={"project_id": pid})
+                    assert r_bad.status_code == 400
+
+                    # Unknown job_id returns 404
+                    r_404 = await client.get("/api/v1/explore/jobs/exp_doesnotexist")
+                    assert r_404.status_code == 404
+
+                    # Launch valid async explore job
+                    r_start = await client.post(
+                        "/api/v1/explore/jobs",
+                        json={
+                            "project_id": pid,
+                            "target_url": mock_srv.base_url,
+                            "mode": "passive",
+                            "probe_openapi_docs": True,
+                            "crawl_js": True,
+                            "discover_portals": False,
+                        },
+                    )
+                    assert r_start.status_code == 202, r_start.text
+                    start_job = r_start.json()
+                    job_id = start_job["job_id"]
+                    assert job_id.startswith("exp_")
+                    assert start_job["project_id"] == pid
+                    assert start_job["targets_total"] == 1
+                    assert "result" not in start_job
+
+                    # Poll until completed
+                    final_job: dict[str, Any] = {}
+                    for _ in range(100):
+                        r_poll = await client.get(f"/api/v1/explore/jobs/{job_id}")
+                        assert r_poll.status_code == 200, r_poll.text
+                        final_job = r_poll.json()
+                        if final_job["status"] in ("completed", "failed"):
+                            break
+                        await asyncio.sleep(0.05)
+
+                    assert final_job["status"] == "completed", final_job
+                    assert final_job["progress_pct"] == 100
+                    assert final_job["targets_done"] == 1
+                    assert final_job["endpoints_found"] >= 3
+                    assert final_job["explore_id"]
+                    assert final_job["finished_at"] is not None
+                    assert isinstance(final_job.get("result"), dict)
+                    paths = {e["path"] for e in final_job["result"]["discovered_endpoints"]}
+                    assert "/api/v1/coupons/redeem" in paths
+                    assert "/api/v1/billing/refund" in paths
+
+                    # GET /explore/jobs?project_id=... lists job without heavy result blob
+                    r_list = await client.get("/api/v1/explore/jobs", params={"project_id": pid})
+                    assert r_list.status_code == 200, r_list.text
+                    listed = r_list.json()
+                    assert len(listed) >= 1
+                    assert listed[0]["job_id"] == job_id
+                    assert "result" not in listed[0]
+
+                    # active_only=true excludes completed jobs
+                    r_active = await client.get(
+                        "/api/v1/explore/jobs",
+                        params={"project_id": pid, "active_only": "true"},
+                    )
+                    assert r_active.status_code == 200
+                    assert all(j["job_id"] != job_id for j in r_active.json())
+
+                    # Also verify explore_all_targets=true works cleanly via /explore/jobs
+                    await client.post(
+                        f"/api/v1/projects/{pid}/targets",
+                        json={
+                            "root_domain": "127.0.0.1",
+                            "base_url": mock_srv.base_url,
+                            "scope_rules": {"portal_label": "Demo Portal"},
+                        },
+                    )
+                    r_all_start = await client.post(
+                        "/api/v1/explore/jobs",
+                        json={
+                            "project_id": pid,
+                            "explore_all_targets": True,
+                            "discover_portals": False,
+                        },
+                    )
+                    assert r_all_start.status_code == 202, r_all_start.text
+                    all_job_id = r_all_start.json()["job_id"]
+                    all_final: dict[str, Any] = {}
+                    for _ in range(100):
+                        all_final = (await client.get(f"/api/v1/explore/jobs/{all_job_id}")).json()
+                        if all_final["status"] in ("completed", "failed"):
+                            break
+                        await asyncio.sleep(0.05)
+                    assert all_final["status"] == "completed", all_final
+                    assert all_final["progress_pct"] == 100
+                    assert len(all_final["result"].get("explored_targets") or []) == 1
+        finally:
+            if db_mod._engine is not None:
+                await db_mod._engine.dispose()
+

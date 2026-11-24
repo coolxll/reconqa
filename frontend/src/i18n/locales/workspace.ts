@@ -263,8 +263,15 @@ registerMessages({
 
     // AI Acceptance Prompt Modal & Overview CTA
     "acceptPrompt.btn": "AI 自动验收指令",
+    "acceptPrompt.harExploreBtn": "让 Agent 录制 HAR",
     "acceptPrompt.title": "AI 自动验收指令生成器",
     "acceptPrompt.subtitle": "基于当前项目目标域、凭据、知识库 PRD 与场景有效性缺口实时生成可直接粘贴给 Coding Agent 的端到端验收 Prompt。",
+    "acceptPrompt.modeLabel": "指令模式",
+    "acceptPrompt.mode.har_explore": "Playwright HAR 探索录制",
+    "acceptPrompt.mode.full": "全量 4 阶段验收闭环",
+    "acceptPrompt.portalsScopeLabel": "目标门户范围",
+    "acceptPrompt.portalsAllHint": "全部门户",
+    "acceptPrompt.portalsSelectAll": "全选",
     "acceptPrompt.langLabel": "指令语言",
     "acceptPrompt.agentLabel": "目标 Agent 预设",
     "acceptPrompt.agent.generic": "通用 Agent",
@@ -587,9 +594,16 @@ registerMessages({
 
     // AI Acceptance Prompt Modal & Overview CTA
     "acceptPrompt.btn": "AI Acceptance Prompt",
+    "acceptPrompt.harExploreBtn": "Agent HAR Explore",
     "acceptPrompt.title": "AI Autonomous Acceptance Prompt",
     "acceptPrompt.subtitle":
       "Generates a ready-to-paste end-to-end acceptance prompt tailored to this project's targets, credentials, KB PRDs, and scenario effectiveness gaps.",
+    "acceptPrompt.modeLabel": "Prompt Mode",
+    "acceptPrompt.mode.har_explore": "Playwright HAR Exploration",
+    "acceptPrompt.mode.full": "Full 4-Stage Acceptance Loop",
+    "acceptPrompt.portalsScopeLabel": "Portal Scope",
+    "acceptPrompt.portalsAllHint": "All Portals",
+    "acceptPrompt.portalsSelectAll": "Select All",
     "acceptPrompt.langLabel": "Language",
     "acceptPrompt.agentLabel": "Target Agent Preset",
     "acceptPrompt.agent.generic": "Generic",

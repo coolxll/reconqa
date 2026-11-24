@@ -116,6 +116,37 @@ export interface ExploreListItem {
   [key: string]: unknown;
 }
 
+export interface ExploreJobRequest extends ExploreRequest {
+  explore_all_targets?: boolean;
+  target_ids?: string[] | null;
+}
+
+export interface ExploreJob {
+  job_id: string;
+  project_id: string | null;
+  status: "running" | "completed" | "failed";
+  progress_pct: number;
+  stage:
+    | "init"
+    | "probe_openapi"
+    | "crawl_js"
+    | "discover_portals"
+    | "merge"
+    | "finalize"
+    | "completed"
+    | "failed"
+    | string;
+  targets_total: number;
+  targets_done: number;
+  current_target: string;
+  endpoints_found: number;
+  explore_id: string | null;
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+  result?: ExploreResult | null;
+}
+
 export interface PromoteToRunRequest {
   project_id?: string | null;
   project_name?: string | null;
@@ -176,4 +207,31 @@ export function promoteExploreToRun(
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export function startExploreJob(payload: ExploreJobRequest): Promise<ExploreJob> {
+  return apiFetch<ExploreJob>("/explore/jobs", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function listExploreJobs(
+  projectId?: string | null,
+  activeOnly?: boolean
+): Promise<ExploreJob[]> {
+  const params = new URLSearchParams();
+  if (projectId) params.set("project_id", projectId);
+  if (activeOnly) params.set("active_only", "true");
+  const qs = params.toString();
+  const raw = await apiFetch<ExploreJob[] | { items?: ExploreJob[] }>(
+    qs ? `/explore/jobs?${qs}` : "/explore/jobs"
+  );
+  if (Array.isArray(raw)) return raw;
+  if (raw && Array.isArray(raw.items)) return raw.items;
+  return [];
+}
+
+export function getExploreJob(jobId: string): Promise<ExploreJob> {
+  return apiFetch<ExploreJob>(`/explore/jobs/${encodeURIComponent(jobId)}`);
 }

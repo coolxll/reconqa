@@ -553,6 +553,7 @@ class AcceptancePromptContextSummary(BaseModel):
 class AcceptancePromptResponse(BaseModel):
     project_id: str
     project_name: str
+    mode: str = "full"
     lang: Literal["zh", "en"] = "zh"
     agent: str = "generic"
     prompt_markdown: str
