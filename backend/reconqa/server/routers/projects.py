@@ -31,6 +31,7 @@ from reconqa.models.schemas import (
     ProjectCreate,
     ProjectInventoryResponse,
     ProjectOut,
+    ProjectUpdate,
     ReplayMatrixEntry,
     ReplayMatrixRequest,
     ReplayMatrixResponse,
@@ -118,6 +119,25 @@ async def list_projects(db: AsyncSession = Depends(get_db)) -> list[Project]:
 @router.get("/projects/{project_id}", response_model=ProjectOut)
 async def get_project(project_id: str, db: AsyncSession = Depends(get_db)) -> Project:
     return await _get_project_or_404(db, project_id)
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectOut)
+async def update_project(
+    project_id: str,
+    body: ProjectUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> Project:
+    project = await _get_project_or_404(db, project_id)
+    if body.name is not None:
+        trimmed = body.name.strip()
+        if not trimmed:
+            raise HTTPException(status_code=422, detail="Project name must not be blank")
+        project.name = trimmed
+    if body.description is not None:
+        project.description = body.description
+    await db.commit()
+    await db.refresh(project)
+    return project
 
 
 @router.delete("/projects/{project_id}")

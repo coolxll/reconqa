@@ -514,6 +514,30 @@ async def test_custom_business_roles_and_replay_matrix_bfla_detection(
                 )
                 assert m_anon.status_code == 200
                 assert m_anon.json()["potential_bfla_warning"] is True
+
+                # 4. PATCH /projects/{id} rename & description update + blank name rejection + 404
+                r_patch = await client.patch(
+                    f"/api/v1/projects/{pid}",
+                    json={
+                        "name": "  Unified Health Suite  ",
+                        "description": "Updated multi-portal description",
+                    },
+                )
+                assert r_patch.status_code == 200, r_patch.text
+                assert r_patch.json()["name"] == "Unified Health Suite"
+                assert r_patch.json()["description"] == "Updated multi-portal description"
+
+                r_blank = await client.patch(
+                    f"/api/v1/projects/{pid}",
+                    json={"name": "   "},
+                )
+                assert r_blank.status_code in (400, 422)
+
+                r_missing = await client.patch(
+                    "/api/v1/projects/nonexistent-project-id",
+                    json={"name": "Ghost"},
+                )
+                assert r_missing.status_code == 404
     finally:
         srv.shutdown()
         await asyncio.sleep(0)

@@ -4,8 +4,9 @@ import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
   listProjects,
+  updateProject as apiUpdateProject,
 } from "@/api/projects";
-import type { Project, ProjectCreate } from "@/api/types";
+import type { Project, ProjectCreate, ProjectUpdate } from "@/api/types";
 
 export type WorkspaceSection =
   | "overview"
@@ -151,6 +152,12 @@ async function createProject(
   return created;
 }
 
+async function updateProject(id: string, payload: ProjectUpdate): Promise<Project> {
+  const updated = await apiUpdateProject(id, payload);
+  upsertProject(updated);
+  return updated;
+}
+
 async function deleteProject(id: string, router?: Router): Promise<void> {
   await apiDeleteProject(id);
   projects.value = projects.value.filter((p) => p.id !== id);
@@ -185,6 +192,7 @@ export function useWorkspace() {
     setActiveProject,
     selectProject,
     createProject,
+    updateProject,
     deleteProject,
     upsertProject,
     workspacePath,

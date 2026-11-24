@@ -16,6 +16,11 @@ export interface ProjectCreate {
   description?: string;
 }
 
+export interface ProjectUpdate {
+  name?: string;
+  description?: string;
+}
+
 export interface Target {
   id: string;
   project_id: string;

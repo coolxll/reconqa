@@ -15,6 +15,7 @@ import type {
   Project,
   ProjectCreate,
   ProjectInventoryResponse,
+  ProjectUpdate,
   ReplayMatrixRequest,
   ReplayMatrixResponse,
   ReplayRequest,
@@ -34,6 +35,13 @@ export function getProject(projectId: string): Promise<Project> {
 export function createProject(payload: ProjectCreate): Promise<Project> {
   return apiFetch<Project>("/projects", {
     method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateProject(projectId: string, payload: ProjectUpdate): Promise<Project> {
+  return apiFetch<Project>(`/projects/${encodeURIComponent(projectId)}`, {
+    method: "PATCH",
     body: JSON.stringify(payload),
   });
 }

@@ -9,6 +9,7 @@ import {
   Loader2,
   PlayCircle,
   Plus,
+  Save,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -40,7 +41,7 @@ interface HeaderRefRow {
 const route = useRoute();
 const router = useRouter();
 const { locale, t } = useI18n();
-const { activeProject, activeProjectId, deleteProject, workspacePath } = useWorkspace();
+const { activeProject, activeProjectId, updateProject, deleteProject, workspacePath } = useWorkspace();
 
 const projectId = computed(() =>
   typeof route.params.projectId === "string" && route.params.projectId
@@ -88,9 +89,46 @@ const headerRefRows = ref<HeaderRefRow[]>([
 const uploadingProfileId = ref<string | null>(null);
 const extractingFromHar = ref(false);
 
+// General metadata edit form
+const editProjectName = ref("");
+const editProjectDesc = ref("");
+const savingProject = ref(false);
+
 // Delete project confirm
 const confirmingDeleteProject = ref(false);
 const deletingProject = ref(false);
+
+watch(
+  activeProject,
+  (proj) => {
+    editProjectName.value = proj?.name ?? "";
+    editProjectDesc.value = proj?.description ?? "";
+  },
+  { immediate: true }
+);
+
+async function handleSaveProjectMeta(): Promise<void> {
+  if (!projectId.value || savingProject.value) return;
+  const trimmedName = editProjectName.value.trim();
+  if (!trimmedName) {
+    notifyError(new Error(t("settings.errEmptyName")), t("settings.errEmptyName"));
+    return;
+  }
+  savingProject.value = true;
+  try {
+    const updated = await updateProject(projectId.value, {
+      name: trimmedName,
+      description: editProjectDesc.value.trim(),
+    });
+    editProjectName.value = updated.name;
+    editProjectDesc.value = updated.description ?? "";
+    notifySuccess(t("settings.toastUpdated", { name: updated.name }));
+  } catch (err) {
+    notifyError(err, t("settings.errUpdate"));
+  } finally {
+    savingProject.value = false;
+  }
+}
 
 const hasAccountA = computed(() => authProfiles.value.some((p) => p.role_tag === "account_a"));
 const hasAccountB = computed(() => authProfiles.value.some((p) => p.role_tag === "account_b"));
@@ -759,13 +797,53 @@ onMounted(() => {
 
     <!-- TAB 3: General & Danger Zone -->
     <div v-else class="space-y-5">
-      <div class="card p-5">
-        <h3 class="text-sm font-semibold text-slate-900">{{ t("settings.generalTitle") }}</h3>
-        <dl class="mt-4 grid grid-cols-1 gap-4 text-xs sm:grid-cols-2">
-          <div>
-            <dt class="font-medium text-slate-500">{{ t("settings.nameLabel") }}</dt>
-            <dd class="mt-1 text-sm font-semibold text-slate-900">{{ activeProject?.name || "—" }}</dd>
+      <form class="card space-y-4 p-5" @submit.prevent="handleSaveProjectMeta">
+        <div class="flex items-center justify-between gap-3">
+          <h3 class="text-sm font-semibold text-slate-900">{{ t("settings.generalTitle") }}</h3>
+          <button
+            type="submit"
+            data-testid="project-save-btn"
+            class="btn-primary !py-1.5 !text-xs"
+            :disabled="savingProject || !editProjectName.trim()"
+          >
+            <Loader2 v-if="savingProject" class="h-3.5 w-3.5 animate-spin" />
+            <Save v-else class="h-3.5 w-3.5" />
+            <span>{{ savingProject ? t("settings.savingBtn") : t("settings.saveBtn") }}</span>
+          </button>
+        </div>
+
+        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div class="sm:col-span-2">
+            <label class="mb-1 block text-xs font-medium text-slate-700">
+              {{ t("settings.nameLabel") }} *
+            </label>
+            <input
+              v-model="editProjectName"
+              data-testid="project-name-input"
+              type="text"
+              required
+              maxlength="120"
+              :placeholder="t('projects.modal.namePlaceholder')"
+              class="input-field text-sm font-medium"
+            />
           </div>
+
+          <div class="sm:col-span-2">
+            <label class="mb-1 block text-xs font-medium text-slate-700">
+              {{ t("settings.descLabel") }}
+            </label>
+            <textarea
+              v-model="editProjectDesc"
+              data-testid="project-desc-input"
+              rows="3"
+              maxlength="2000"
+              :placeholder="t('projects.modal.descPlaceholder')"
+              class="input-field text-xs leading-relaxed"
+            />
+          </div>
+        </div>
+
+        <dl class="grid grid-cols-1 gap-4 border-t border-slate-100 pt-4 text-xs sm:grid-cols-3">
           <div>
             <dt class="font-medium text-slate-500">{{ t("settings.slugLabel") }}</dt>
             <dd class="mt-1 font-mono text-slate-800">{{ activeProject?.slug || "—" }}</dd>
@@ -778,14 +856,8 @@ onMounted(() => {
             <dt class="font-medium text-slate-500">{{ t("settings.createdLabel") }}</dt>
             <dd class="mt-1 text-slate-700">{{ formatDate(activeProject?.created_at) }}</dd>
           </div>
-          <div class="sm:col-span-2">
-            <dt class="font-medium text-slate-500">{{ t("settings.descLabel") }}</dt>
-            <dd class="mt-1 text-slate-700">
-              {{ activeProject?.description || t("projects.noDesc") }}
-            </dd>
-          </div>
         </dl>
-      </div>
+      </form>
 
       <div class="rounded-xl border border-rose-200 bg-rose-50/50 p-5">
         <h3 class="text-sm font-semibold text-rose-800">{{ t("settings.dangerTitle") }}</h3>

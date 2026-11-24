@@ -17,6 +17,21 @@ class ProjectCreate(BaseModel):
     description: str = ""
 
 
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _clean_project_name(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        trimmed = str(value).strip()
+        if not trimmed:
+            raise ValueError("Project name must not be blank")
+        return trimmed
+
+
 class ProjectOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
