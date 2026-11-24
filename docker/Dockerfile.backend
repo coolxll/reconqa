@@ -1,0 +1,45 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    RECONQA_BIN_DIR=/opt/reconqa/bin \
+    RECONQA_DATA_DIR=/data/workspaces \
+    RECONQA_DATABASE_URL=sqlite+aiosqlite:////data/workspaces/reconqa.db \
+    PATH="/opt/reconqa/bin:${PATH}"
+
+WORKDIR /app
+
+# System dependencies for curl, zip, Playwright Chromium runtime, and k6
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install k6 binary
+ARG TARGETARCH=amd64
+ARG K6_VERSION=0.55.0
+RUN curl -fsSL "https://github.com/grafana/k6/releases/download/v${K6_VERSION}/k6-v${K6_VERSION}-linux-${TARGETARCH}.tar.gz" \
+    | tar -xz -C /tmp \
+    && install -m 0755 "/tmp/k6-v${K6_VERSION}-linux-${TARGETARCH}/k6" /usr/local/bin/k6 \
+    && rm -rf "/tmp/k6-v${K6_VERSION}-linux-${TARGETARCH}"
+
+# Copy project metadata and source
+COPY pyproject.toml README.md LICENSE ./
+COPY backend ./backend
+COPY scripts/install-tools.sh ./scripts/install-tools.sh
+
+# Install ReconQA with recorder + fuzz extras
+RUN pip install --no-cache-dir ".[recorder,fuzz]" \
+    && playwright install --with-deps chromium
+
+# Install ProjectDiscovery binaries into /opt/reconqa/bin
+RUN chmod +x ./scripts/install-tools.sh \
+    && ./scripts/install-tools.sh /opt/reconqa/bin
+
+RUN mkdir -p /data/workspaces
+
+EXPOSE 8000 8080
+
+CMD ["uvicorn", "reconqa.server.app:app", "--host", "0.0.0.0", "--port", "8000"]

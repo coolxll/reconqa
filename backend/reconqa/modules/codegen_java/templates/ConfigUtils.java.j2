@@ -1,0 +1,77 @@
+package {{ package_name }}.util;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.Properties;
+
+/**
+ * Configuration loader with precedence:
+ * 1. Environment variables (RECONQA_*)
+ * 2. JVM system properties
+ * 3. classpath config.properties
+ * 4. Built-in default value
+ */
+public final class ConfigUtils {
+
+    private static final Logger log = LoggerFactory.getLogger(ConfigUtils.class);
+    private static final Properties PROPERTIES = new Properties();
+
+    static {
+        try (InputStream is = ConfigUtils.class.getClassLoader().getResourceAsStream("config.properties")) {
+            if (is != null) {
+                PROPERTIES.load(new InputStreamReader(is, StandardCharsets.UTF_8));
+            } else {
+                log.warn("config.properties not found on classpath; relying on environment variables and defaults");
+            }
+        } catch (IOException e) {
+            log.warn("Failed to load config.properties: {}", e.getMessage());
+        }
+    }
+
+    private ConfigUtils() {
+    }
+
+    public static String get(String envKey, String propKey, String defaultValue) {
+        String envVal = System.getenv(envKey);
+        if (envVal != null && !envVal.trim().isEmpty()) {
+            return envVal.trim();
+        }
+        String sysVal = System.getProperty(propKey);
+        if (sysVal != null && !sysVal.trim().isEmpty()) {
+            return sysVal.trim();
+        }
+        String propVal = PROPERTIES.getProperty(propKey);
+        if (propVal != null && !propVal.trim().isEmpty()) {
+            return propVal.trim();
+        }
+        return defaultValue;
+    }
+
+    public static String getBaseUri() {
+        return get("RECONQA_BASE_URI", "base.uri", "https://api.example.com");
+    }
+
+    public static String getAuthToken() {
+        return get("RECONQA_AUTH_TOKEN", "auth.token", "");
+    }
+
+    public static String getAuthCookie() {
+        return get("RECONQA_AUTH_COOKIE", "auth.cookie", "");
+    }
+
+    public static double getLatencyMultiplier() {
+        String raw = get("RECONQA_LATENCY_MULTIPLIER", "latency.multiplier", "{{ latency_multiplier }}");
+        try {
+            double parsed = Double.parseDouble(raw);
+            return parsed > 0 ? parsed : {{ latency_multiplier }};
+        } catch (NumberFormatException e) {
+            log.warn("Invalid latency multiplier '{}', using default {{ latency_multiplier }}", raw);
+            return {{ latency_multiplier }};
+        }
+    }
+}

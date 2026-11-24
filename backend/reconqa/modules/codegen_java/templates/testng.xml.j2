@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
+<suite name="ReconQA API Automation Suite" verbose="1">
+    <listeners>
+        <listener class-name="{{ package_name }}.listener.TestExecutionListener"/>
+    </listeners>
+
+    <test name="L1_Smoke">
+{% if has_l1_cases %}
+        <classes>
+            <class name="{{ package_name }}.smoke.L1SmokeContractTest"/>
+        </classes>
+{% else %}
+        <!-- No L1 smoke contract endpoints discovered -->
+{% endif %}
+    </test>
+
+    <test name="L2_Chain">
+{% if l2_chain_classes %}
+        <classes>
+{% for cls in l2_chain_classes %}
+            <class name="{{ package_name }}.chains.{{ cls }}"/>
+{% endfor %}
+        </classes>
+{% else %}
+        <!-- No L2 correlated chains discovered -->
+{% endif %}
+    </test>
+
+    <test name="L3_Security">
+{% if has_l3_cases %}
+        <classes>
+            <class name="{{ package_name }}.security.L3AuthBoundaryTest"/>
+        </classes>
+{% else %}
+        <!-- No authenticated endpoints discovered for L3 boundary tests -->
+{% endif %}
+    </test>
+</suite>

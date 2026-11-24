@@ -1,0 +1,168 @@
+package {{ package_name }}.util;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * Utilities for reading externalized JSON templates and parameter files from classpath
+ * and applying dynamic placeholder or field-level replacements.
+ */
+public final class JsonUtils {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    private JsonUtils() {
+    }
+
+    public static String readJsonFile(String resourcePath) {
+        if (resourcePath == null || resourcePath.trim().isEmpty()) {
+            throw new IllegalArgumentException("Resource path must not be blank");
+        }
+        String normalized = resourcePath.trim();
+        if (normalized.startsWith("/")) {
+            normalized = normalized.substring(1);
+        }
+        try (InputStream is = JsonUtils.class.getClassLoader().getResourceAsStream(normalized)) {
+            if (is == null) {
+                throw new IllegalArgumentException("Classpath resource not found: " + normalized);
+            }
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                return reader.lines().collect(Collectors.joining("\n"));
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read JSON resource: " + normalized, e);
+        }
+    }
+
+    public static Map<String, Object> readAsMap(String resourcePath) {
+        if (resourcePath == null || resourcePath.trim().isEmpty()) {
+            return new LinkedHashMap<>();
+        }
+        String content = readJsonFile(resourcePath);
+        if (content.trim().isEmpty()) {
+            return new LinkedHashMap<>();
+        }
+        try {
+            return MAPPER.readValue(content, new TypeReference<LinkedHashMap<String, Object>>() {
+            });
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to parse JSON map from: " + resourcePath, e);
+        }
+    }
+
+    public static Map<String, String> readAsStringMap(String resourcePath) {
+        Map<String, Object> raw = readAsMap(resourcePath);
+        Map<String, String> result = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : raw.entrySet()) {
+            if (entry.getValue() != null) {
+                result.put(entry.getKey(), String.valueOf(entry.getValue()));
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Reads a JSON template file from classpath and replaces ${varName} (and {{varName}})
+     * placeholders with JSON-escaped values from the provided map.
+     */
+    public static String readAndReplaceJsonFile(String resourcePath, Map<String, ?> replacements) {
+        String content = readJsonFile(resourcePath);
+        if (replacements == null || replacements.isEmpty()) {
+            return content;
+        }
+        String result = content;
+        for (Map.Entry<String, ?> entry : replacements.entrySet()) {
+            if (entry.getValue() == null) {
+                continue;
+            }
+            String escaped = escapeForJsonString(String.valueOf(entry.getValue()));
+            result = result.replace("${" + entry.getKey() + "}", escaped);
+            result = result.replace("{{" + entry.getKey() + "}}", escaped);
+        }
+        return result;
+    }
+
+    /**
+     * Reads a JSON file into a Jackson ObjectNode and overrides the specified fields
+     * (supports top-level keys and dot-separated nested object paths).
+     */
+    public static String readAndReplaceJsonParam(String resourcePath, Map<String, Object> replacements) {
+        String content = readJsonFile(resourcePath);
+        try {
+            JsonNode root = MAPPER.readTree(content);
+            if (root instanceof ObjectNode && replacements != null && !replacements.isEmpty()) {
+                ObjectNode rootObj = (ObjectNode) root;
+                for (Map.Entry<String, Object> entry : replacements.entrySet()) {
+                    setNestedField(rootObj, entry.getKey(), MAPPER.valueToTree(entry.getValue()));
+                }
+            }
+            return MAPPER.writeValueAsString(root);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to update JSON parameters in: " + resourcePath, e);
+        }
+    }
+
+    private static void setNestedField(ObjectNode root, String path, JsonNode value) {
+        String[] parts = path.split("\\.");
+        ObjectNode current = root;
+        for (int i = 0; i < parts.length - 1; i++) {
+            JsonNode child = current.get(parts[i]);
+            if (child instanceof ObjectNode) {
+                current = (ObjectNode) child;
+            } else {
+                ObjectNode created = MAPPER.createObjectNode();
+                current.set(parts[i], created);
+                current = created;
+            }
+        }
+        current.set(parts[parts.length - 1], value);
+    }
+
+    private static String escapeForJsonString(String raw) {
+        StringBuilder sb = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            switch (c) {
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\b':
+                    sb.append("\\b");
+                    break;
+                case '\f':
+                    sb.append("\\f");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+            }
+        }
+        return sb.toString();
+    }
+}

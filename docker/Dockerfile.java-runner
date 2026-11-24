@@ -1,0 +1,21 @@
+FROM maven:3.9-eclipse-temurin-21
+
+ARG ALLURE_VERSION=2.32.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Allure CLI
+RUN curl -fsSL "https://github.com/allure-framework/allure2/releases/download/${ALLURE_VERSION}/allure-${ALLURE_VERSION}.tgz" \
+    -o /tmp/allure.tgz \
+    && tar -xzf /tmp/allure.tgz -C /opt \
+    && ln -s "/opt/allure-${ALLURE_VERSION}/bin/allure" /usr/local/bin/allure \
+    && rm -f /tmp/allure.tgz
+
+WORKDIR /work
+
+# Default command runs Maven TestNG suite and generates Allure HTML report if results exist
+CMD ["sh", "-c", "mvn test && (test -d target/allure-results && allure generate target/allure-results --clean -o target/allure-report || true)"]

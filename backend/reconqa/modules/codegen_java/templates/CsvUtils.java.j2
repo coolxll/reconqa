@@ -1,0 +1,69 @@
+package {{ package_name }}.util;
+
+import com.opencsv.CSVReader;
+import com.opencsv.exceptions.CsvException;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * OpenCSV reader that transforms classpath CSV datasets into TestNG DataProvider Object[][].
+ */
+public final class CsvUtils {
+
+    private CsvUtils() {
+    }
+
+    public static Object[][] readCsvData(String resourcePath) {
+        if (resourcePath == null || resourcePath.trim().isEmpty()) {
+            return new Object[0][0];
+        }
+        String normalized = resourcePath.trim();
+        if (normalized.startsWith("/")) {
+            normalized = normalized.substring(1);
+        }
+        try (InputStream is = CsvUtils.class.getClassLoader().getResourceAsStream(normalized)) {
+            if (is == null) {
+                throw new IllegalArgumentException("CSV resource not found on classpath: " + normalized);
+            }
+            try (CSVReader reader = new CSVReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                List<String[]> allRows = reader.readAll();
+                if (allRows == null || allRows.size() <= 1) {
+                    return new Object[0][0];
+                }
+                int expectedColumns = allRows.get(0).length;
+                List<Object[]> dataRows = new ArrayList<>();
+                for (int i = 1; i < allRows.size(); i++) {
+                    String[] row = allRows.get(i);
+                    if (row == null || isBlankRow(row)) {
+                        continue;
+                    }
+                    Object[] normalizedRow = new Object[expectedColumns];
+                    Arrays.fill(normalizedRow, "");
+                    int copyLen = Math.min(row.length, expectedColumns);
+                    for (int j = 0; j < copyLen; j++) {
+                        normalizedRow[j] = row[j] == null ? "" : row[j].trim();
+                    }
+                    dataRows.add(normalizedRow);
+                }
+                return dataRows.toArray(new Object[0][]);
+            }
+        } catch (IOException | CsvException e) {
+            throw new RuntimeException("Failed to read CSV resource: " + normalized, e);
+        }
+    }
+
+    private static boolean isBlankRow(String[] row) {
+        for (String cell : row) {
+            if (cell != null && !cell.trim().isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+}

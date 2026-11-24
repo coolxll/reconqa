@@ -1,0 +1,205 @@
+package {{ package_name }}.base;
+
+import {{ package_name }}.util.ConfigUtils;
+import {{ package_name }}.util.ReportUtils;
+import io.qameta.allure.Step;
+import io.qameta.allure.restassured.AllureRestAssured;
+import io.restassured.RestAssured;
+import io.restassured.builder.RequestSpecBuilder;
+import io.restassured.builder.ResponseSpecBuilder;
+import io.restassured.filter.cookie.CookieFilter;
+import io.restassured.filter.log.LogDetail;
+import io.restassured.http.ContentType;
+import io.restassured.http.Method;
+import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
+import io.restassured.specification.ResponseSpecification;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.testng.Assert;
+import org.testng.annotations.BeforeClass;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+/**
+ * Shared RestAssured + TestNG + Allure base test class.
+ * Initializes CookieFilter, tracing/custom headers, RequestSpecification, and ResponseSpecification
+ * once per test class so chained L2 steps preserve session cookies without duplicating Allure filters.
+ */
+public abstract class ApiBaseTest {
+
+    protected final Logger log = LoggerFactory.getLogger(getClass());
+
+    private static final Set<String> AUTH_HEADER_NAMES = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
+            "authorization",
+            "cookie",
+            "x-auth-token",
+            "x-api-key",
+            "proxy-authorization"
+    )));
+
+    protected CookieFilter cookieFilter;
+    protected AllureRestAssured allureFilter;
+    protected Map<String, String> defaultHeaders;
+    protected RequestSpecification requestSpec;
+    protected ResponseSpecification responseSpec;
+
+    @BeforeClass(alwaysRun = true)
+    public void setUpApiClient() {
+        cookieFilter = new CookieFilter();
+        allureFilter = new AllureRestAssured();
+        defaultHeaders = new LinkedHashMap<>();
+
+        // Distributed tracing headers
+        String traceId = UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        String spanId = UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        defaultHeaders.put("x-b3-traceid", traceId);
+        defaultHeaders.put("x-b3-spanid", spanId);
+{% for header_name, header_val in default_custom_headers.items() %}
+        defaultHeaders.put("{{ header_name | java_str }}", "{{ header_val | java_str }}");
+{% endfor %}
+
+        String authToken = ConfigUtils.getAuthToken();
+        if (authToken != null && !authToken.trim().isEmpty()) {
+            String headerVal = authToken.contains(" ") ? authToken : "Bearer " + authToken;
+            defaultHeaders.put("Authorization", headerVal);
+        }
+
+        String authCookie = ConfigUtils.getAuthCookie();
+        if (authCookie != null && !authCookie.trim().isEmpty()) {
+            defaultHeaders.put("Cookie", authCookie);
+        }
+
+        requestSpec = new RequestSpecBuilder()
+                .setBaseUri(ConfigUtils.getBaseUri())
+                .setContentType(ContentType.JSON)
+                .setAccept(ContentType.JSON)
+                .addHeaders(defaultHeaders)
+                .addFilter(cookieFilter)
+                .addFilter(allureFilter)
+                .build();
+
+        responseSpec = new ResponseSpecBuilder()
+                .log(LogDetail.STATUS)
+                .build();
+    }
+
+    @Step("调用 {path} 接口，方法: {method}")
+    protected Response sendRequest(
+            Method method,
+            String path,
+            Map<String, String> headers,
+            Map<String, Object> params,
+            String requestBody
+    ) {
+        RequestSpecification spec = RestAssured.given().spec(requestSpec);
+        if (headers != null && !headers.isEmpty()) {
+            spec.headers(headers);
+        }
+        if (params != null && !params.isEmpty()) {
+            spec.queryParams(params);
+        }
+        if (requestBody != null && !requestBody.trim().isEmpty()) {
+            spec.body(requestBody);
+        }
+        Response response = spec.request(method, path);
+        response.then().spec(responseSpec);
+        return response;
+    }
+
+    @Step("无鉴权调用 {path} 接口，方法: {method}")
+    protected Response sendUnauthenticatedRequest(
+            Method method,
+            String path,
+            Map<String, String> headers,
+            Map<String, Object> params,
+            String requestBody
+    ) {
+        Map<String, String> unauthHeaders = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : defaultHeaders.entrySet()) {
+            if (!isAuthHeader(entry.getKey())) {
+                unauthHeaders.put(entry.getKey(), entry.getValue());
+            }
+        }
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                if (!isAuthHeader(entry.getKey())) {
+                    unauthHeaders.put(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+
+        RequestSpecification unauthSpec = new RequestSpecBuilder()
+                .setBaseUri(ConfigUtils.getBaseUri())
+                .setContentType(ContentType.JSON)
+                .setAccept(ContentType.JSON)
+                .addHeaders(unauthHeaders)
+                .addFilter(allureFilter)
+                .build();
+
+        RequestSpecification spec = RestAssured.given().spec(unauthSpec);
+        if (params != null && !params.isEmpty()) {
+            spec.queryParams(params);
+        }
+        if (requestBody != null && !requestBody.trim().isEmpty()) {
+            spec.body(requestBody);
+        }
+        Response response = spec.request(method, path);
+        response.then().spec(responseSpec);
+        return response;
+    }
+
+    @Step("验证 {responseName} 的通用响应")
+    protected void performStandardValidations(
+            Response response,
+            String responseName,
+            int expectedStatus,
+            String bizCodeField,
+            String bizCodeValue
+    ) {
+        ReportUtils.saveResponseAsAttachment(responseName, response);
+        Assert.assertEquals(
+                response.getStatusCode(),
+                expectedStatus,
+                responseName + " HTTP status mismatch. Body: " + ReportUtils.getUtf8Body(response)
+        );
+        if (bizCodeField != null && !bizCodeField.trim().isEmpty()
+                && bizCodeValue != null && !bizCodeValue.trim().isEmpty()) {
+            Object actualCode = response.jsonPath().get(bizCodeField.trim());
+            Assert.assertNotNull(
+                    actualCode,
+                    responseName + " missing business code field '" + bizCodeField + "'. Body: " + ReportUtils.getUtf8Body(response)
+            );
+            Assert.assertEquals(
+                    String.valueOf(actualCode),
+                    bizCodeValue.trim(),
+                    responseName + " business code field '" + bizCodeField + "' mismatch. Body: " + ReportUtils.getUtf8Body(response)
+            );
+        }
+    }
+
+    protected String resolvePlaceholders(String template, Map<String, String> context) {
+        if (template == null || context == null || context.isEmpty()) {
+            return template;
+        }
+        String resolved = template;
+        for (Map.Entry<String, String> entry : context.entrySet()) {
+            if (entry.getValue() != null) {
+                resolved = resolved.replace("${" + entry.getKey() + "}", entry.getValue());
+                resolved = resolved.replace("{{" + entry.getKey() + "}}", entry.getValue());
+            }
+        }
+        return resolved;
+    }
+
+    private static boolean isAuthHeader(String headerName) {
+        return headerName != null && AUTH_HEADER_NAMES.contains(headerName.toLowerCase(Locale.ROOT));
+    }
+}

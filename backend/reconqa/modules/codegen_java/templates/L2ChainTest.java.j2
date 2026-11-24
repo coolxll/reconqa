@@ -1,0 +1,122 @@
+package {{ package_name }}.chains;
+
+import {{ package_name }}.base.ApiBaseTest;
+import {{ package_name }}.util.JsonUtils;
+import {{ package_name }}.util.ReportUtils;
+import io.qameta.allure.Epic;
+import io.qameta.allure.Feature;
+import io.qameta.allure.Step;
+import io.qameta.allure.Story;
+import io.restassured.http.Method;
+import io.restassured.response.Response;
+import org.testng.Assert;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.Test;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * L2 Stateful Correlated Chain Test for scenario '{{ chain.scenario | java_str }}'.
+ */
+@Epic("ReconQA API Automation")
+@Feature("L2 Correlated Chain Tests")
+@Story("{{ chain.name | java_str }}")
+public class {{ chain.class_name }} extends ApiBaseTest {
+
+    private final Map<String, String> context = new ConcurrentHashMap<>();
+    private final Map<String, String> createdResources = new LinkedHashMap<>();
+{% for step in chain.steps %}
+
+    @Test(priority = {{ loop.index }}{% if step.depends_on %}, dependsOnMethods = {"{{ step.depends_on }}"}{% endif %}, description = "{{ step.description | java_str }}")
+    @Step("Step {{ loop.index }}: {{ step.method }} {{ step.path_template | java_str }}")
+    public void {{ step.method_name }}() {
+        String path = resolvePlaceholders("{{ step.path_template | java_str }}", context);
+
+        Map<String, String> headers = new LinkedHashMap<>();
+{% for hk, hv in step.headers.items() %}
+        headers.put("{{ hk | java_str }}", resolvePlaceholders("{{ hv | java_str }}", context));
+{% endfor %}
+
+        Map<String, Object> queryParams = new LinkedHashMap<>();
+{% for qk, qv in step.query_params.items() %}
+        queryParams.put("{{ qk | java_str }}", resolvePlaceholders("{{ qv | java_str }}", context));
+{% endfor %}
+
+{% if step.payload_path %}
+        String requestBody = JsonUtils.readAndReplaceJsonFile("{{ step.payload_path | java_str }}", context);
+{% else %}
+        String requestBody = null;
+{% endif %}
+
+        Response response = sendRequest(Method.{{ step.method }}, path, headers, queryParams, requestBody);
+        performStandardValidations(
+                response,
+                "{{ step.label | java_str }}",
+                {{ step.expected_status }},
+                "{{ step.biz_code_field | java_str }}",
+                "{{ step.biz_code_value | java_str }}"
+        );
+{% for ext in step.extracts %}
+
+        String {{ ext.java_var }} = response.jsonPath().getString("{{ ext.gpath | java_str }}");
+        Assert.assertNotNull({{ ext.java_var }}, "Failed to extract '{{ ext.var_name | java_str }}' via GPath '{{ ext.gpath | java_str }}'");
+        Assert.assertFalse({{ ext.java_var }}.trim().isEmpty(), "Extracted '{{ ext.var_name | java_str }}' is empty");
+        context.put("{{ ext.var_name | java_str }}", {{ ext.java_var }});
+{% if ext.track_resource %}
+        createdResources.put("{{ ext.var_name | java_str }}", {{ ext.java_var }});
+{% endif %}
+{% endfor %}
+    }
+{% endfor %}
+
+    @AfterClass(alwaysRun = true)
+    @Step("Teardown resources created by {{ chain.class_name }}")
+    public void tearDownCreatedResources() {
+{% if chain.cleanup_step %}
+{% set cs = chain.cleanup_step %}
+        boolean ready = true;
+{% for req_var in cs.required_vars %}
+        if (!context.containsKey("{{ req_var | java_str }}")) {
+            log.warn("Skipping cleanup for {{ chain.class_name }}: missing context variable '{{ req_var | java_str }}'");
+            ready = false;
+        }
+{% endfor %}
+        if (!ready) {
+            return;
+        }
+        String cleanupPath = resolvePlaceholders("{{ cs.path_template | java_str }}", context);
+
+        Map<String, String> cleanupHeaders = new LinkedHashMap<>();
+{% for hk, hv in cs.headers.items() %}
+        cleanupHeaders.put("{{ hk | java_str }}", resolvePlaceholders("{{ hv | java_str }}", context));
+{% endfor %}
+
+        Map<String, Object> cleanupQuery = new LinkedHashMap<>();
+{% for qk, qv in cs.query_params.items() %}
+        cleanupQuery.put("{{ qk | java_str }}", resolvePlaceholders("{{ qv | java_str }}", context));
+{% endfor %}
+
+{% if cs.payload_path %}
+        String cleanupBody = JsonUtils.readAndReplaceJsonFile("{{ cs.payload_path | java_str }}", context);
+{% else %}
+        String cleanupBody = null;
+{% endif %}
+
+        Response cleanupResponse = sendRequest(Method.{{ cs.method }}, cleanupPath, cleanupHeaders, cleanupQuery, cleanupBody);
+        ReportUtils.saveResponseAsAttachment("Cleanup {{ cs.method }} " + cleanupPath, cleanupResponse);
+        int status = cleanupResponse.getStatusCode();
+        Assert.assertTrue(
+                status == {{ cs.expected_status }} || (status >= 200 && status < 300),
+                "Cleanup {{ cs.method }} " + cleanupPath + " failed with HTTP " + status + ": " + ReportUtils.getUtf8Body(cleanupResponse)
+        );
+        log.info("Cleanup succeeded for {{ chain.class_name }}: {{ cs.method }} {} -> HTTP {}", cleanupPath, status);
+{% else %}
+        // TODO: bind cleanup endpoint for resources created during this chain
+        if (!createdResources.isEmpty()) {
+            log.info("Recorded createdResources for {{ chain.class_name }} (no cleanup endpoint captured in HAR): {}", createdResources);
+        }
+{% endif %}
+    }
+}

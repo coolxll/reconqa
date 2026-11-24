@@ -1,0 +1,356 @@
+"""Abstract TaskRunner protocol and default in-process asyncio.Queue worker."""
+
+from __future__ import annotations
+
+import asyncio
+from collections import defaultdict
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
+
+from sqlalchemy import delete, select
+
+from reconqa.models.db import get_session_factory
+from reconqa.models.tables import Artifact, AuthProfile, Finding, Job, Run, Target
+from reconqa.pipeline import DEFAULT_MODULES, run_pipeline
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+@runtime_checkable
+class TaskRunner(Protocol):
+    """Pluggable task runner interface (Phase 1: in-process; future: Redis/ARQ)."""
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    async def enqueue(self, run_id: str) -> None: ...
+
+    def subscribe_events(self, run_id: str) -> AsyncIterator[dict[str, Any]]: ...
+
+
+class InProcessTaskRunner:
+    """Default asyncio.Queue-backed worker with SQLAlchemy persistence and SSE fan-out."""
+
+    def __init__(self, max_history_per_run: int = 200) -> None:
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._worker_task: asyncio.Task[None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = defaultdict(set)
+        self._history: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self._max_history = max_history_per_run
+        self._running = False
+
+    async def start(self) -> None:
+        if self._running and self._worker_task is not None and not self._worker_task.done():
+            return
+        self._loop = asyncio.get_running_loop()
+        self._running = True
+        self._worker_task = asyncio.create_task(self._worker_loop(), name="reconqa-task-worker")
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
+
+    async def enqueue(self, run_id: str) -> None:
+        if not self._running:
+            await self.start()
+        self._publish(
+            run_id,
+            {
+                "event": "run_queued",
+                "run_id": run_id,
+                "timestamp": _utcnow().isoformat(),
+            },
+        )
+        await self._queue.put(run_id)
+
+    def get_history(self, run_id: str) -> list[dict[str, Any]]:
+        return list(self._history.get(run_id, []))
+
+    def _publish(self, run_id: str, payload: dict[str, Any]) -> None:
+        hist = self._history[run_id]
+        hist.append(payload)
+        if len(hist) > self._max_history:
+            del hist[: len(hist) - self._max_history]
+        for sub_q in list(self._subscribers.get(run_id, set())):
+            try:
+                sub_q.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+
+    def _publish_threadsafe(self, run_id: str, payload: dict[str, Any]) -> None:
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._publish, run_id, payload)
+        else:
+            self._publish(run_id, payload)
+
+    async def subscribe_events(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
+        sub_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
+        self._subscribers[run_id].add(sub_q)
+        try:
+            while True:
+                event = await sub_q.get()
+                yield event
+                if event.get("event") in {"run_completed", "run_failed"}:
+                    break
+        finally:
+            self._subscribers[run_id].discard(sub_q)
+            if not self._subscribers[run_id]:
+                self._subscribers.pop(run_id, None)
+
+    async def _worker_loop(self) -> None:
+        while self._running:
+            run_id = await self._queue.get()
+            try:
+                await self._execute_run(run_id)
+            except Exception as exc:
+                await self._mark_run_failed(run_id, str(exc))
+            finally:
+                self._queue.task_done()
+
+    async def _update_job_status(
+        self,
+        run_id: str,
+        module: str,
+        status: str,
+        output_meta: dict[str, Any] | None = None,
+    ) -> None:
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            result = await session.execute(
+                select(Job).where(Job.run_id == run_id, Job.module == module)
+            )
+            job = result.scalar_one_or_none()
+            now = _utcnow()
+            if job is None:
+                job = Job(
+                    run_id=run_id,
+                    module=module,
+                    status=status,
+                    output_meta=output_meta or {},
+                    started_at=now if status == "running" else None,
+                    finished_at=now if status in {"completed", "failed"} else None,
+                )
+                session.add(job)
+            else:
+                job.status = status
+                if status == "running":
+                    job.started_at = now
+                if status in {"completed", "failed"}:
+                    job.finished_at = now
+                if output_meta is not None:
+                    job.output_meta = output_meta
+            await session.commit()
+
+    async def _mark_run_failed(self, run_id: str, error_msg: str) -> None:
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            run = await session.get(Run, run_id)
+            if run is not None:
+                run.status = "failed"
+                run.finished_at = _utcnow()
+                metrics = dict(run.summary_metrics or {})
+                metrics["error"] = error_msg
+                run.summary_metrics = metrics
+                await session.commit()
+        self._publish(
+            run_id,
+            {
+                "event": "run_failed",
+                "run_id": run_id,
+                "error": error_msg,
+                "timestamp": _utcnow().isoformat(),
+            },
+        )
+
+    async def _execute_run(self, run_id: str) -> None:
+        session_factory = get_session_factory()
+        async with session_factory() as session:
+            run = await session.get(Run, run_id)
+            if run is None:
+                return
+
+            run.status = "running"
+            run.started_at = _utcnow()
+            await session.commit()
+
+            cfg = dict(run.config_snapshot or {})
+            target_url: str | None = cfg.get("target_url")
+            if not target_url and run.target_id:
+                target = await session.get(Target, run.target_id)
+                if target is not None:
+                    target_url = target.base_url
+
+            modules: list[str] = list(cfg.get("modules") or DEFAULT_MODULES)
+            workspace_dir = Path(run.workspace_dir)
+
+            # Resolve optional auth profiles for the project
+            auth_a_path: Path | None = None
+            auth_b_path: Path | None = None
+            auth_a_headers: dict[str, str] | None = None
+            auth_b_headers: dict[str, str] | None = None
+
+            profiles_res = await session.execute(
+                select(AuthProfile).where(AuthProfile.project_id == run.project_id)
+            )
+            for prof in profiles_res.scalars().all():
+                if prof.role_tag == "account_a":
+                    if prof.storage_state_path and Path(prof.storage_state_path).is_file():
+                        auth_a_path = Path(prof.storage_state_path)
+                    if prof.extra_headers_ref:
+                        auth_a_headers = {str(k): str(v) for k, v in prof.extra_headers_ref.items()}
+                elif prof.role_tag == "account_b":
+                    if prof.storage_state_path and Path(prof.storage_state_path).is_file():
+                        auth_b_path = Path(prof.storage_state_path)
+                    if prof.extra_headers_ref:
+                        auth_b_headers = {str(k): str(v) for k, v in prof.extra_headers_ref.items()}
+
+        self._publish(
+            run_id,
+            {
+                "event": "run_started",
+                "run_id": run_id,
+                "modules": modules,
+                "timestamp": _utcnow().isoformat(),
+            },
+        )
+
+        loop = asyncio.get_running_loop()
+        module_events: list[tuple[str, str, dict[str, Any]]] = []
+
+        def on_log(message: str) -> None:
+            self._publish_threadsafe(
+                run_id,
+                {
+                    "event": "log",
+                    "run_id": run_id,
+                    "message": message,
+                    "timestamp": _utcnow().isoformat(),
+                },
+            )
+
+        def on_module(module: str, status: str, meta: dict[str, Any]) -> None:
+            module_events.append((module, status, meta))
+            self._publish_threadsafe(
+                run_id,
+                {
+                    "event": f"job_{status}",
+                    "run_id": run_id,
+                    "module": module,
+                    "status": status,
+                    "timestamp": _utcnow().isoformat(),
+                },
+            )
+            asyncio.run_coroutine_threadsafe(
+                self._update_job_status(run_id, module, status, meta),
+                loop,
+            )
+
+        har_sources_raw = cfg.get("har_sources")
+        har_sources = [Path(p) for p in har_sources_raw] if har_sources_raw else None
+        config_path_raw = cfg.get("config_path")
+        config_path = Path(config_path_raw) if config_path_raw else None
+
+        summary = await asyncio.to_thread(
+            run_pipeline,
+            workspace_dir,
+            target_url=target_url,
+            modules=modules,
+            har_sources=har_sources,
+            config_path=config_path,
+            auth_a=auth_a_path,
+            auth_b=auth_b_path,
+            include_mutations=bool(cfg.get("include_mutations", False)),
+            discovery_mode=str(cfg.get("discovery_mode", "passive")),
+            run_nuclei=bool(cfg.get("run_nuclei", False)),
+            run_k6=bool(cfg.get("run_k6", False)),
+            run_schemathesis=bool(cfg.get("run_schemathesis", False)),
+            log_cb=on_log,
+            auth_a_headers=auth_a_headers,
+            auth_b_headers=auth_b_headers,
+            module_cb=on_module,
+        )
+
+        # Ensure all module statuses & findings/artifacts are persisted cleanly
+        async with session_factory() as session:
+            # Finalize any jobs that were updated via threadsafe callbacks
+            seen_final: dict[str, tuple[str, dict[str, Any]]] = {}
+            for mod, st, meta in module_events:
+                seen_final[mod] = (st, meta)
+
+            jobs_res = await session.execute(select(Job).where(Job.run_id == run_id))
+            existing_jobs = {j.module: j for j in jobs_res.scalars().all()}
+            now = _utcnow()
+            for mod, (st, meta) in seen_final.items():
+                if mod in existing_jobs:
+                    existing_jobs[mod].status = st
+                    existing_jobs[mod].output_meta = meta
+                    if st in {"completed", "failed"} and existing_jobs[mod].finished_at is None:
+                        existing_jobs[mod].finished_at = now
+                else:
+                    session.add(
+                        Job(
+                            run_id=run_id,
+                            module=mod,
+                            status=st,
+                            output_meta=meta,
+                            started_at=now,
+                            finished_at=now,
+                        )
+                    )
+
+            # Replace findings and artifacts with latest run results
+            await session.execute(delete(Finding).where(Finding.run_id == run_id))
+            for f in summary.get("findings", []):
+                session.add(
+                    Finding(
+                        run_id=run_id,
+                        category=str(f.get("category", "general")),
+                        severity=str(f.get("severity", "info")),
+                        endpoint=str(f.get("endpoint", "")),
+                        title=str(f.get("title", "Finding"))[:255],
+                        evidence=f.get("evidence") if isinstance(f.get("evidence"), dict) else {},
+                    )
+                )
+
+            await session.execute(delete(Artifact).where(Artifact.run_id == run_id))
+            for art in summary.get("artifacts", []):
+                session.add(
+                    Artifact(
+                        run_id=run_id,
+                        kind=str(art.get("kind", "file")),
+                        rel_path=str(art.get("rel_path", "")),
+                        size_bytes=int(art.get("size_bytes", 0)),
+                        sha256=str(art.get("sha256", "")),
+                    )
+                )
+
+            run = await session.get(Run, run_id)
+            if run is not None:
+                run.status = "completed"
+                run.summary_metrics = summary.get("summary_metrics", {})
+                run.finished_at = _utcnow()
+
+            await session.commit()
+
+        self._publish(
+            run_id,
+            {
+                "event": "run_completed",
+                "run_id": run_id,
+                "status": "completed",
+                "summary_metrics": summary.get("summary_metrics", {}),
+                "timestamp": _utcnow().isoformat(),
+            },
+        )

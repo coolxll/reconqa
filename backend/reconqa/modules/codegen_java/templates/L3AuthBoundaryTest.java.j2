@@ -1,0 +1,100 @@
+package {{ package_name }}.security;
+
+import {{ package_name }}.base.ApiBaseTest;
+import {{ package_name }}.util.JsonUtils;
+import {{ package_name }}.util.ReportUtils;
+import io.qameta.allure.Allure;
+import io.qameta.allure.Epic;
+import io.qameta.allure.Feature;
+import io.qameta.allure.Story;
+import io.restassured.http.Method;
+import io.restassured.response.Response;
+import org.testng.Assert;
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+import java.util.Locale;
+import java.util.Map;
+
+/**
+ * L3 Authentication & Access Boundary Tests.
+ * Sends unauthenticated requests (stripping Cookie/Authorization and skipping CookieFilter)
+ * to protected endpoints and verifies either HTTP 401/403 or a non-success business code.
+ */
+@Epic("ReconQA API Automation")
+@Feature("L3 Security Auth Boundary Tests")
+public class L3AuthBoundaryTest extends ApiBaseTest {
+
+    @DataProvider(name = "protectedEndpoints")
+    public Object[][] protectedEndpoints() {
+        return new Object[][] {
+{% for item in l3_cases %}
+            {
+                "{{ item.case_id | java_str }}",
+                "{{ item.method | java_str }}",
+                "{{ item.path | java_str }}",
+                "{{ item.query_json_path | java_str }}",
+                "{{ item.headers_json_path | java_str }}",
+                "{{ item.payload_json_path | java_str }}",
+                "{{ item.biz_code_field | java_str }}",
+                "{{ item.biz_code_value | java_str }}"
+            }{% if not loop.last %},{% endif %}
+{% endfor %}
+        };
+    }
+
+    @Test(dataProvider = "protectedEndpoints", description = "Verify protected endpoint rejects unauthenticated access")
+    @Story("Unauthenticated Access Rejection")
+    public void verifyUnauthenticatedAccessBlocked(
+            String caseId,
+            String method,
+            String path,
+            String queryJsonPath,
+            String headersJsonPath,
+            String payloadJsonPath,
+            String bizCodeField,
+            String bizCodeValue
+    ) {
+        Allure.parameter("caseId", caseId);
+        Allure.parameter("endpoint", method + " " + path);
+
+        Map<String, Object> queryParams = JsonUtils.readAsMap(queryJsonPath);
+        Map<String, String> headers = JsonUtils.readAsStringMap(headersJsonPath);
+        String payload = (payloadJsonPath != null && !payloadJsonPath.trim().isEmpty())
+                ? JsonUtils.readJsonFile(payloadJsonPath)
+                : null;
+
+        Method httpMethod = Method.valueOf(method.trim().toUpperCase(Locale.ROOT));
+        Response response = sendUnauthenticatedRequest(httpMethod, path, headers, queryParams, payload);
+        ReportUtils.saveResponseAsAttachment(caseId + " Unauth " + method + " " + path, response);
+
+        int status = response.getStatusCode();
+        boolean httpRejected = (status == 401 || status == 403);
+        boolean bizRejected = false;
+        if (!httpRejected
+                && bizCodeField != null && !bizCodeField.trim().isEmpty()
+                && bizCodeValue != null && !bizCodeValue.trim().isEmpty()) {
+            try {
+                Object actualBizCode = response.jsonPath().get(bizCodeField.trim());
+                if (actualBizCode != null && !bizCodeValue.trim().equals(String.valueOf(actualBizCode))) {
+                    bizRejected = true;
+                }
+            } catch (Exception ignored) {
+                // Non-JSON or unexpected payload format; rely on HTTP status assertion
+            }
+        }
+
+        Assert.assertTrue(
+                httpRejected || bizRejected,
+                String.format(
+                        "Expected unauthenticated request %s %s to be rejected (HTTP 401/403 or %s != %s), but got HTTP %d with body: %s",
+                        method,
+                        path,
+                        bizCodeField,
+                        bizCodeValue,
+                        status,
+                        ReportUtils.getUtf8Body(response)
+                )
+        );
+    }
+}

@@ -1,0 +1,85 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    image: reconqa-backend:latest
+    ports:
+      - "8000:8000"
+    environment:
+      RECONQA_DATA_DIR: /data/workspaces
+      RECONQA_DATABASE_URL: ${RECONQA_DATABASE_URL:-sqlite+aiosqlite:////data/workspaces/reconqa.db}
+      RECONQA_CORS_ORIGINS: ${RECONQA_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      RECONQA_K6_PROXY_URL: ${RECONQA_K6_PROXY_URL:-}
+      RECONQA_ZAP_API_URL: ${RECONQA_ZAP_API_URL:-}
+      RECONQA_ZAP_API_KEY: ${RECONQA_ZAP_API_KEY:-}
+    volumes:
+      - ./workspaces:/data/workspaces
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  mitmproxy:
+    image: reconqa-backend:latest
+    profiles: ["recorder"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./workspaces:/data/workspaces
+    command:
+      - reconqa
+      - record
+      - --mitm
+      - --port
+      - "8080"
+      - -o
+      - /data/workspaces/mitm/har
+
+  java-runner:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.java-runner
+    image: reconqa-java-runner:latest
+    profiles: ["runner"]
+    volumes:
+      - ${JAVA_TESTS_DIR:-./workspaces/cli_run/java-tests}:/work
+    environment:
+      RECONQA_BASE_URI: ${RECONQA_BASE_URI:-https://api.example.com}
+      RECONQA_AUTH_TOKEN: ${RECONQA_AUTH_TOKEN:-}
+      RECONQA_AUTH_COOKIE: ${RECONQA_AUTH_COOKIE:-}
+
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    profiles: ["security"]
+    ports:
+      - "8090:8090"
+    command:
+      - zap.sh
+      - -daemon
+      - -host
+      - "0.0.0.0"
+      - -port
+      - "8090"
+      - -config
+      - api.addrs.addr.name=.*
+      - -config
+      - api.addrs.addr.regex=true
+      - -config
+      - api.disablekey=true
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["prod"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-reconqa}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-reconqa_dev_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-reconqa}
+    ports:
+      - "5432:5432"
+    volumes:
+      - reconqa_pg_data:/var/lib/postgresql/data
+
+volumes:
+  reconqa_pg_data:

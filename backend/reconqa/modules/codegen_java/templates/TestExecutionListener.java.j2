@@ -1,0 +1,174 @@
+package {{ package_name }}.listener;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import io.qameta.allure.Epic;
+import io.qameta.allure.Feature;
+import io.qameta.allure.Story;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.testng.ISuite;
+import org.testng.ISuiteListener;
+import org.testng.ITestListener;
+import org.testng.ITestResult;
+
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.lang.reflect.Method;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Captures suite & test metadata (@Epic/@Feature/@Story, duration, status, failure details)
+ * and persists a structured JSON execution summary to target/reconqa-execution-summary.json.
+ */
+public class TestExecutionListener implements ISuiteListener, ITestListener {
+
+    private static final Logger log = LoggerFactory.getLogger(TestExecutionListener.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
+
+    private final ConcurrentLinkedQueue<Map<String, Object>> records = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger passedCount = new AtomicInteger(0);
+    private final AtomicInteger failedCount = new AtomicInteger(0);
+    private final AtomicInteger skippedCount = new AtomicInteger(0);
+
+    private long suiteStartMillis;
+    private String suiteStartedAt;
+
+    @Override
+    public void onStart(ISuite suite) {
+        suiteStartMillis = System.currentTimeMillis();
+        suiteStartedAt = Instant.now().toString();
+        records.clear();
+        passedCount.set(0);
+        failedCount.set(0);
+        skippedCount.set(0);
+    }
+
+    @Override
+    public void onTestSuccess(ITestResult result) {
+        passedCount.incrementAndGet();
+        records.add(buildRecord(result, "PASSED"));
+    }
+
+    @Override
+    public void onTestFailure(ITestResult result) {
+        failedCount.incrementAndGet();
+        records.add(buildRecord(result, "FAILED"));
+    }
+
+    @Override
+    public void onTestSkipped(ITestResult result) {
+        skippedCount.incrementAndGet();
+        records.add(buildRecord(result, "SKIPPED"));
+    }
+
+    @Override
+    public void onFinish(ISuite suite) {
+        long durationMs = Math.max(0L, System.currentTimeMillis() - suiteStartMillis);
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("suiteName", suite != null ? suite.getName() : "ReconQA Suite");
+        summary.put("startedAt", suiteStartedAt);
+        summary.put("finishedAt", Instant.now().toString());
+        summary.put("durationMs", durationMs);
+        summary.put("total", passedCount.get() + failedCount.get() + skippedCount.get());
+        summary.put("passed", passedCount.get());
+        summary.put("failed", failedCount.get());
+        summary.put("skipped", skippedCount.get());
+        summary.put("tests", new ArrayList<>(records));
+
+        Path outPath = Paths.get("target", "reconqa-execution-summary.json");
+        try {
+            Path parent = outPath.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            MAPPER.writeValue(outPath.toFile(), summary);
+            log.info("ReconQA execution summary written to {}", outPath.toAbsolutePath());
+        } catch (IOException e) {
+            log.error("Failed to write ReconQA execution summary to {}: {}", outPath, e.getMessage());
+        }
+    }
+
+    private Map<String, Object> buildRecord(ITestResult result, String status) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        Class<?> testClass = result.getTestClass() != null ? result.getTestClass().getRealClass() : null;
+        Method method = result.getMethod() != null && result.getMethod().getConstructorOrMethod() != null
+                ? result.getMethod().getConstructorOrMethod().getMethod()
+                : null;
+
+        String className = testClass != null ? testClass.getName() : "unknown";
+        String methodName = method != null ? method.getName() : result.getName();
+        Object[] params = result.getParameters();
+        String displayName = methodName;
+        if (params != null && params.length > 0) {
+            displayName = methodName + Arrays.toString(params);
+        }
+
+        item.put("testClass", className);
+        item.put("testMethod", methodName);
+        item.put("displayName", displayName);
+        item.put("status", status);
+        item.put("durationMs", Math.max(0L, result.getEndMillis() - result.getStartMillis()));
+        item.put("epic", resolveEpic(method, testClass));
+        item.put("feature", resolveFeature(method, testClass));
+        item.put("story", resolveStory(method, testClass));
+
+        Throwable err = result.getThrowable();
+        if (err != null) {
+            item.put("failureMessage", err.getMessage() != null ? err.getMessage() : err.toString());
+            item.put("stackTrace", formatStackTrace(err));
+        } else {
+            item.put("failureMessage", null);
+            item.put("stackTrace", null);
+        }
+        return item;
+    }
+
+    private static String resolveEpic(Method method, Class<?> clazz) {
+        if (method != null && method.isAnnotationPresent(Epic.class)) {
+            return method.getAnnotation(Epic.class).value();
+        }
+        if (clazz != null && clazz.isAnnotationPresent(Epic.class)) {
+            return clazz.getAnnotation(Epic.class).value();
+        }
+        return "";
+    }
+
+    private static String resolveFeature(Method method, Class<?> clazz) {
+        if (method != null && method.isAnnotationPresent(Feature.class)) {
+            return method.getAnnotation(Feature.class).value();
+        }
+        if (clazz != null && clazz.isAnnotationPresent(Feature.class)) {
+            return clazz.getAnnotation(Feature.class).value();
+        }
+        return "";
+    }
+
+    private static String resolveStory(Method method, Class<?> clazz) {
+        if (method != null && method.isAnnotationPresent(Story.class)) {
+            return method.getAnnotation(Story.class).value();
+        }
+        if (clazz != null && clazz.isAnnotationPresent(Story.class)) {
+            return clazz.getAnnotation(Story.class).value();
+        }
+        return "";
+    }
+
+    private static String formatStackTrace(Throwable err) {
+        StringWriter sw = new StringWriter();
+        err.printStackTrace(new PrintWriter(sw));
+        String full = sw.toString();
+        return full.length() > 4000 ? full.substring(0, 4000) + "\n... (truncated)" : full;
+    }
+}

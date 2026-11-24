@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Runtime workspaces, secrets & local binaries
+.env
+workspaces/
+bin/
+*.db
+*.sqlite
+*.sqlite3
+*.har
+!tests/fixtures/**/*.har
+storage_state*.json
+auth_*.json
+
+# Java / Allure outputs
+target/
+allure-results/
+allure-report/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

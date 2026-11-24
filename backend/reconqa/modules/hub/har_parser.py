@@ -1,0 +1,655 @@
+"""HAR 1.2 parser, cleaner, static-asset filter, and semantic path normalizer."""
+
+from __future__ import annotations
+
+import base64
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qsl, unquote, urlsplit
+
+from reconqa.utils.io import read_json
+
+STATIC_EXTENSIONS = {
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".css",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".webp",
+    ".avif",
+    ".bmp",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".otf",
+    ".map",
+    ".mp4",
+    ".mp3",
+    ".wav",
+    ".webm",
+    ".ogg",
+    ".wasm",
+    ".pdf",
+    ".zip",
+    ".gz",
+}
+
+STATIC_MIME_PREFIXES = (
+    "image/",
+    "font/",
+    "audio/",
+    "video/",
+    "text/css",
+    "application/font",
+    "application/wasm",
+    "application/octet-stream",
+)
+
+STATIC_MIME_SUBSTRINGS = (
+    "javascript",
+    "ecmascript",
+)
+
+AUTH_HEADER_NAMES = {
+    "authorization",
+    "cookie",
+    "x-auth-token",
+    "x-api-key",
+    "x-access-token",
+    "token",
+    "access-token",
+}
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_HEX_ID_RE = re.compile(r"^[0-9a-fA-F]{16,}$")
+_INT_RE = re.compile(r"^\d+$")
+_PREFIXED_SEP_ID_RE = re.compile(r"^[A-Za-z]{2,12}[-_]([0-9A-Za-z_-]{3,})$")
+_PREFIXED_COMPACT_ID_RE = re.compile(r"^[A-Za-z]{2,8}\d{4,}$")
+_VERSION_SEG_RE = re.compile(r"^(?:v\d+(?:\.\d+)?|api[-_]?v\d+|v\d+[-_](?:alpha|beta|rc\d*))$", re.IGNORECASE)
+
+_STATIC_TOKENS = {
+    "api",
+    "rest",
+    "graphql",
+    "oauth",
+    "oauth2",
+    "openid",
+    "base64",
+    "sha256",
+    "sha512",
+    "md5",
+    "utf8",
+    "utf-8",
+    "html5",
+    "http2",
+    "web3",
+    "i18n",
+    "l10n",
+    "k8s",
+    "b2b",
+    "b2c",
+    "h5",
+    "3d",
+}
+
+_GENERIC_PARENT_SEGMENTS = {
+    "",
+    "api",
+    "rest",
+    "rpc",
+    "gateway",
+    "gw",
+    "public",
+    "private",
+    "internal",
+    "external",
+    "service",
+    "services",
+    "v1",
+    "v2",
+    "v3",
+    "v4",
+}
+
+_IRREGULAR_SINGULARS = {
+    "people": "person",
+    "children": "child",
+    "indices": "index",
+    "statuses": "status",
+    "addresses": "address",
+    "businesses": "business",
+    "batches": "batch",
+    "matches": "match",
+    "boxes": "box",
+    "categories": "category",
+    "entries": "entry",
+    "companies": "company",
+    "policies": "policy",
+    "histories": "history",
+    "inventories": "inventory",
+    "deliveries": "delivery",
+    "queries": "query",
+    "skus": "sku",
+    "menus": "menu",
+}
+
+
+@dataclass
+class HarEntry:
+    """Normalized representation of a single HAR 1.2 HTTP API transaction."""
+
+    index: int
+    scenario: str
+    started_datetime: str
+    timestamp_ms: float
+    method: str
+    url: str
+    scheme: str
+    host: str
+    raw_path: str
+    normalized_path: str
+    path_params: dict[str, str] = field(default_factory=dict)
+    query_params: dict[str, str] = field(default_factory=dict)
+    request_headers: dict[str, str] = field(default_factory=dict)
+    request_cookies: dict[str, str] = field(default_factory=dict)
+    request_mime_type: str = ""
+    request_body_raw: str | None = None
+    request_json: Any = None
+    request_form: dict[str, str] = field(default_factory=dict)
+    status: int = 0
+    status_text: str = ""
+    response_headers: dict[str, str] = field(default_factory=dict)
+    response_headers_list: list[tuple[str, str]] = field(default_factory=list)
+    response_mime_type: str = ""
+    response_body_raw: str | None = None
+    response_json: Any = None
+    response_size: int = 0
+    time_ms: float = 0.0
+    timings: dict[str, float] = field(default_factory=dict)
+    ttfb_ms: float = 0.0
+    has_auth: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "scenario": self.scenario,
+            "started_datetime": self.started_datetime,
+            "timestamp_ms": self.timestamp_ms,
+            "method": self.method,
+            "url": self.url,
+            "scheme": self.scheme,
+            "host": self.host,
+            "raw_path": self.raw_path,
+            "normalized_path": self.normalized_path,
+            "path_params": dict(self.path_params),
+            "query_params": dict(self.query_params),
+            "request_headers": dict(self.request_headers),
+            "request_cookies": dict(self.request_cookies),
+            "request_mime_type": self.request_mime_type,
+            "request_body_raw": self.request_body_raw,
+            "request_json": self.request_json,
+            "request_form": dict(self.request_form),
+            "status": self.status,
+            "status_text": self.status_text,
+            "response_headers": dict(self.response_headers),
+            "response_mime_type": self.response_mime_type,
+            "response_body_raw": self.response_body_raw,
+            "response_json": self.response_json,
+            "response_size": self.response_size,
+            "time_ms": self.time_ms,
+            "timings": dict(self.timings),
+            "ttfb_ms": self.ttfb_ms,
+            "has_auth": self.has_auth,
+        }
+
+
+def _to_camel_case(segment: str) -> str:
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", segment) if p]
+    if not parts:
+        return ""
+    first = parts[0].lower()
+    rest = [p[0].upper() + p[1:].lower() if p else "" for p in parts[1:]]
+    return first + "".join(rest)
+
+
+def _singularize(word: str) -> str:
+    lower = word.lower()
+    if lower in _IRREGULAR_SINGULARS:
+        return _IRREGULAR_SINGULARS[lower]
+    if len(lower) > 3 and lower.endswith("ies"):
+        return lower[:-3] + "y"
+    if len(lower) > 3 and lower.endswith(("ses", "xes", "zes", "ches", "shes")):
+        return lower[:-2]
+    if len(lower) > 2 and lower.endswith("s") and not lower.endswith(("ss", "us", "is")):
+        return lower[:-1]
+    return lower
+
+
+def _is_dynamic_segment(segment: str) -> bool:
+    if not segment:
+        return False
+    lower = segment.lower()
+    if lower in _STATIC_TOKENS or _VERSION_SEG_RE.match(segment):
+        return False
+    if _INT_RE.match(segment):
+        return True
+    if _UUID_RE.match(segment):
+        return True
+    if _HEX_ID_RE.match(segment):
+        return True
+    sep_match = _PREFIXED_SEP_ID_RE.match(segment)
+    if sep_match and any(ch.isdigit() for ch in sep_match.group(1)):
+        return True
+    return bool(_PREFIXED_COMPACT_ID_RE.match(segment))
+
+
+def _derive_param_name(prev_segment: str, used: set[str]) -> str:
+    cleaned = prev_segment.strip()
+    if (
+        not cleaned
+        or cleaned.startswith("{")
+        or cleaned.lower() in _GENERIC_PARENT_SEGMENTS
+        or _VERSION_SEG_RE.match(cleaned)
+    ):
+        base = "id"
+    else:
+        parts = [p for p in re.split(r"[^A-Za-z0-9]+", cleaned) if p]
+        if parts:
+            parts[-1] = _singularize(parts[-1])
+            camel = _to_camel_case("_".join(parts))
+            if camel.lower().endswith("id"):
+                base = camel
+            else:
+                base = f"{camel}Id"
+        else:
+            base = "id"
+
+    candidate = base
+    counter = 2
+    while candidate in used:
+        candidate = f"{base}{counter}"
+        counter += 1
+    used.add(candidate)
+    return candidate
+
+
+def normalize_path(path: str) -> tuple[str, dict[str, str]]:
+    """Normalize dynamic path segments into semantic OpenAPI placeholders.
+
+    Returns ``(normalized_path, raw_params_map)``, e.g.:
+    ``normalize_path("/api/v1/items/9823410")`` ->
+    ``("/api/v1/items/{itemId}", {"itemId": "9823410"})``.
+    """
+    raw = path.split("?", 1)[0].split("#", 1)[0].strip()
+    if not raw:
+        return "/", {}
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    raw = re.sub(r"/{2,}", "/", raw)
+    if len(raw) > 1 and raw.endswith("/"):
+        raw = raw.rstrip("/")
+
+    segments = raw.split("/")[1:]
+    normalized_segments: list[str] = []
+    raw_params: dict[str, str] = {}
+    used_names: set[str] = set()
+
+    for idx, seg in enumerate(segments):
+        decoded = unquote(seg)
+        if _is_dynamic_segment(decoded):
+            prev_seg = ""
+            for back in range(idx - 1, -1, -1):
+                if not normalized_segments[back].startswith("{"):
+                    prev_seg = segments[back]
+                    break
+            param_name = _derive_param_name(prev_seg, used_names)
+            normalized_segments.append(f"{{{param_name}}}")
+            raw_params[param_name] = decoded
+        else:
+            normalized_segments.append(seg)
+
+    return "/" + "/".join(normalized_segments), raw_params
+
+
+def _normalize_target_domain(target_domain: str | None) -> str | None:
+    if not target_domain:
+        return None
+    raw = target_domain.strip().lower()
+    if "://" in raw:
+        raw = urlsplit(raw).hostname or ""
+    else:
+        raw = raw.split("/", 1)[0].split(":", 1)[0]
+    return raw or None
+
+
+def _host_matches(host: str, target_domain: str | None) -> bool:
+    if not target_domain:
+        return True
+    norm_host = host.lower().split(":", 1)[0]
+    return norm_host == target_domain or norm_host.endswith("." + target_domain)
+
+
+def _clean_headers(
+    raw_headers: list[dict[str, Any]],
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """Strip HTTP/2 pseudo-headers (:method, :path, :authority, :scheme) cleanly."""
+    header_map: dict[str, str] = {}
+    header_list: list[tuple[str, str]] = []
+    for item in raw_headers or []:
+        name = str(item.get("name", "")).strip()
+        if not name or name.startswith(":"):
+            continue
+        value = str(item.get("value", ""))
+        header_list.append((name, value))
+        header_map[name] = value
+    return header_map, header_list
+
+
+def _clean_timings(raw_timings: dict[str, Any] | None, total_time: Any) -> tuple[dict[str, float], float]:
+    keys = ("blocked", "dns", "connect", "ssl", "send", "wait", "receive")
+    cleaned: dict[str, float] = {}
+    for k in keys:
+        val = (raw_timings or {}).get(k, 0)
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            num = 0.0
+        cleaned[k] = round(max(0.0, num), 3)
+
+    try:
+        total = float(total_time)
+    except (TypeError, ValueError):
+        total = 0.0
+    if total < 0:
+        total = sum(cleaned.values())
+    return cleaned, round(max(0.0, total), 3)
+
+
+def _decode_har_content(content: dict[str, Any]) -> tuple[str | None, int]:
+    text = content.get("text")
+    encoding = str(content.get("encoding") or "").lower()
+    raw_size = content.get("size", 0)
+    try:
+        size = max(0, int(raw_size))
+    except (TypeError, ValueError):
+        size = 0
+
+    if text is None:
+        return None, size
+
+    text_str = str(text)
+    if encoding == "base64":
+        try:
+            decoded_bytes = base64.b64decode(text_str, validate=False)
+            if size == 0:
+                size = len(decoded_bytes)
+            return decoded_bytes.decode("utf-8", errors="replace"), size
+        except (ValueError, TypeError):
+            return text_str, size
+
+    if size == 0 and text_str:
+        size = len(text_str.encode("utf-8"))
+    return text_str, size
+
+
+def _try_parse_json(text: str | None, mime_type: str = "") -> Any:
+    if not text:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    looks_json = "json" in mime_type.lower() or stripped.startswith(("{", "["))
+    if not looks_json:
+        return None
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _parse_timestamp_ms(started_dt: str) -> float:
+    if not started_dt:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(started_dt)
+        return dt.timestamp() * 1000.0
+    except ValueError:
+        return 0.0
+
+
+def _is_static_asset(
+    raw_path: str,
+    response_mime: str,
+    response_json: Any,
+    ignore_prefixes: list[str],
+) -> bool:
+    if response_json is not None:
+        return False
+
+    path_lower = raw_path.lower()
+    for prefix in ignore_prefixes:
+        if prefix and path_lower.startswith(prefix.lower()):
+            return True
+
+    suffix = Path(path_lower).suffix
+    if suffix in STATIC_EXTENSIONS:
+        return True
+
+    mime_lower = response_mime.lower().split(";", 1)[0].strip()
+    if any(mime_lower.startswith(p) for p in STATIC_MIME_PREFIXES):
+        return True
+    if any(sub in mime_lower for sub in STATIC_MIME_SUBSTRINGS):
+        return True
+
+    return mime_lower == "text/html" and (
+        path_lower == "/" or suffix in {".html", ".htm", ".xhtml"}
+    )
+
+
+def parse_har_file(
+    path: Path,
+    scenario: str | None = None,
+    target_domain: str | None = None,
+    *,
+    ignore_path_prefixes: list[str] | None = None,
+    include_static: bool = False,
+) -> list[HarEntry]:
+    """Parse a single HAR 1.2 file into cleaned, normalized HarEntry records."""
+    har_path = Path(path)
+    if not har_path.is_file():
+        return []
+
+    raw = read_json(har_path)
+    raw_entries = raw.get("log", {}).get("entries", []) if isinstance(raw, dict) else []
+    scenario_name = scenario or har_path.stem
+    norm_domain = _normalize_target_domain(target_domain)
+    ignore_prefixes = list(ignore_path_prefixes or [])
+
+    parsed: list[tuple[float, int, HarEntry]] = []
+    for raw_idx, item in enumerate(raw_entries):
+        if not isinstance(item, dict):
+            continue
+        req = item.get("request") or {}
+        resp = item.get("response") or {}
+
+        method = str(req.get("method", "GET")).upper().strip()
+        if method == "OPTIONS":
+            continue
+
+        url = str(req.get("url", "")).strip()
+        if not url or url.startswith(("data:", "blob:", "chrome-extension:", "about:")):
+            continue
+
+        split = urlsplit(url)
+        scheme = split.scheme.lower() or "https"
+        host = split.netloc.lower()
+        if not host or not _host_matches(host, norm_domain):
+            continue
+
+        raw_path = split.path or "/"
+        req_headers, _ = _clean_headers(req.get("headers") or [])
+        resp_headers, resp_headers_list = _clean_headers(resp.get("headers") or [])
+
+        resp_content = resp.get("content") or {}
+        resp_mime = str(
+            resp_content.get("mimeType")
+            or next(
+                (v for k, v in resp_headers.items() if k.lower() == "content-type"),
+                "",
+            )
+        )
+        resp_body_raw, resp_size = _decode_har_content(resp_content)
+        resp_json = _try_parse_json(resp_body_raw, resp_mime)
+
+        if not include_static and _is_static_asset(
+            raw_path, resp_mime, resp_json, ignore_prefixes
+        ):
+            continue
+
+        # Query params (merge URL query string + HAR queryString array)
+        query_params: dict[str, str] = {}
+        for k, v in parse_qsl(split.query, keep_blank_values=True):
+            query_params[k] = v
+        for q_item in req.get("queryString") or []:
+            if isinstance(q_item, dict) and q_item.get("name"):
+                query_params[str(q_item["name"])] = str(q_item.get("value", ""))
+
+        # Request cookies
+        req_cookies: dict[str, str] = {}
+        for c_item in req.get("cookies") or []:
+            if isinstance(c_item, dict) and c_item.get("name"):
+                req_cookies[str(c_item["name"])] = str(c_item.get("value", ""))
+
+        # Request body
+        post_data = req.get("postData") or {}
+        req_mime = str(
+            post_data.get("mimeType")
+            or next(
+                (v for k, v in req_headers.items() if k.lower() == "content-type"),
+                "",
+            )
+        )
+        req_body_raw = post_data.get("text")
+        if req_body_raw is not None:
+            req_body_raw = str(req_body_raw)
+        req_json = _try_parse_json(req_body_raw, req_mime)
+        req_form: dict[str, str] = {}
+        if post_data.get("params"):
+            for p_item in post_data["params"]:
+                if isinstance(p_item, dict) and p_item.get("name"):
+                    req_form[str(p_item["name"])] = str(p_item.get("value", ""))
+        elif req_body_raw and "application/x-www-form-urlencoded" in req_mime.lower():
+            for k, v in parse_qsl(req_body_raw, keep_blank_values=True):
+                req_form[k] = v
+
+        timings, total_time = _clean_timings(item.get("timings"), item.get("time", 0))
+        started_dt = str(item.get("startedDateTime") or "")
+        ts_ms = _parse_timestamp_ms(started_dt)
+        normalized_path, path_params = normalize_path(raw_path)
+
+        lower_req_headers = {k.lower() for k in req_headers}
+        has_auth = bool(lower_req_headers & AUTH_HEADER_NAMES) or bool(req_cookies)
+
+        try:
+            status_code = int(resp.get("status", 0))
+        except (TypeError, ValueError):
+            status_code = 0
+
+        entry = HarEntry(
+            index=raw_idx,
+            scenario=scenario_name,
+            started_datetime=started_dt,
+            timestamp_ms=ts_ms,
+            method=method,
+            url=url,
+            scheme=scheme,
+            host=host,
+            raw_path=raw_path,
+            normalized_path=normalized_path,
+            path_params=path_params,
+            query_params=query_params,
+            request_headers=req_headers,
+            request_cookies=req_cookies,
+            request_mime_type=req_mime,
+            request_body_raw=req_body_raw,
+            request_json=req_json,
+            request_form=req_form,
+            status=status_code,
+            status_text=str(resp.get("statusText", "")),
+            response_headers=resp_headers,
+            response_headers_list=resp_headers_list,
+            response_mime_type=resp_mime,
+            response_body_raw=resp_body_raw,
+            response_json=resp_json,
+            response_size=resp_size,
+            time_ms=total_time,
+            timings=timings,
+            ttfb_ms=timings.get("wait", 0.0),
+            has_auth=has_auth,
+        )
+        parsed.append((ts_ms, raw_idx, entry))
+
+    has_timestamps = all(ts > 0.0 for ts, _, _ in parsed) if parsed else False
+    if has_timestamps:
+        parsed.sort(key=lambda row: (row[0], row[1]))
+
+    entries = [row[2] for row in parsed]
+    for seq_idx, entry in enumerate(entries):
+        entry.index = seq_idx
+    return entries
+
+
+def parse_har_dir(
+    har_dir: Path,
+    target_domain: str | None = None,
+    *,
+    ignore_path_prefixes: list[str] | None = None,
+    include_static: bool = False,
+) -> list[HarEntry]:
+    """Parse all *.har files in a directory (or a single HAR file) in chronological order."""
+    target = Path(har_dir)
+    if not target.exists():
+        return []
+    if target.is_file():
+        return parse_har_file(
+            target,
+            target_domain=target_domain,
+            ignore_path_prefixes=ignore_path_prefixes,
+            include_static=include_static,
+        )
+
+    har_files = sorted(p for p in target.glob("*.har") if p.is_file())
+    combined: list[tuple[float, int, int, HarEntry]] = []
+    for file_idx, har_file in enumerate(har_files):
+        file_entries = parse_har_file(
+            har_file,
+            scenario=har_file.stem,
+            target_domain=target_domain,
+            ignore_path_prefixes=ignore_path_prefixes,
+            include_static=include_static,
+        )
+        for entry_idx, entry in enumerate(file_entries):
+            combined.append((entry.timestamp_ms, file_idx, entry_idx, entry))
+
+    has_timestamps = all(row[0] > 0.0 for row in combined) if combined else False
+    if has_timestamps:
+        combined.sort(key=lambda row: (row[0], row[1], row[2]))
+    else:
+        combined.sort(key=lambda row: (row[1], row[2]))
+
+    result = [row[3] for row in combined]
+    for seq_idx, entry in enumerate(result):
+        entry.index = seq_idx
+    return result

@@ -1,0 +1,84 @@
+package {{ package_name }}.smoke;
+
+import {{ package_name }}.base.ApiBaseTest;
+import {{ package_name }}.util.ConfigUtils;
+import {{ package_name }}.util.CsvUtils;
+import {{ package_name }}.util.JsonUtils;
+import io.qameta.allure.Allure;
+import io.qameta.allure.Epic;
+import io.qameta.allure.Feature;
+import io.qameta.allure.Story;
+import io.restassured.http.Method;
+import io.restassured.module.jsv.JsonSchemaValidator;
+import io.restassured.response.Response;
+import org.hamcrest.Matchers;
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+import java.util.Locale;
+import java.util.Map;
+
+/**
+ * L1 Read-Only Contract Smoke Tests driven by externalized CSV and JSON parameter/schema files.
+ */
+@Epic("ReconQA API Automation")
+@Feature("L1 Smoke Contract Tests")
+public class L1SmokeContractTest extends ApiBaseTest {
+
+    private static final double DEFAULT_LATENCY_MULTIPLIER = {{ latency_multiplier }};
+
+    @DataProvider(name = "l1SmokeEndpoints")
+    public Object[][] l1SmokeEndpoints() {
+        return CsvUtils.readCsvData("data/l1_smoke_endpoints.csv");
+    }
+
+    @Test(dataProvider = "l1SmokeEndpoints", description = "L1 Read-Only Contract Smoke Validation")
+    @Story("Read-Only Endpoint Contract & Schema Smoke")
+    public void verifyEndpointContract(
+            String caseId,
+            String scenario,
+            String method,
+            String path,
+            String queryJsonPath,
+            String headersJsonPath,
+            String payloadJsonPath,
+            String expectedStatus,
+            String bizCodeField,
+            String bizCodeValue,
+            String schemaPath,
+            String maxLatencyMs
+    ) {
+        Allure.parameter("caseId", caseId);
+        Allure.parameter("scenario", scenario);
+        Allure.parameter("endpoint", method + " " + path);
+
+        Map<String, Object> queryParams = JsonUtils.readAsMap(queryJsonPath);
+        Map<String, String> headers = JsonUtils.readAsStringMap(headersJsonPath);
+        String payload = (payloadJsonPath != null && !payloadJsonPath.trim().isEmpty())
+                ? JsonUtils.readJsonFile(payloadJsonPath)
+                : null;
+
+        Method httpMethod = Method.valueOf(method.trim().toUpperCase(Locale.ROOT));
+        int status = (expectedStatus != null && !expectedStatus.trim().isEmpty())
+                ? Integer.parseInt(expectedStatus.trim())
+                : 200;
+
+        Response response = sendRequest(httpMethod, path, headers, queryParams, payload);
+        performStandardValidations(response, caseId + " " + method + " " + path, status, bizCodeField, bizCodeValue);
+
+        if (schemaPath != null && !schemaPath.trim().isEmpty()) {
+            response.then().assertThat()
+                    .body(JsonSchemaValidator.matchesJsonSchemaInClasspath(schemaPath.trim()));
+        }
+
+        if (maxLatencyMs != null && !maxLatencyMs.trim().isEmpty()) {
+            long baseMaxMs = Long.parseLong(maxLatencyMs.trim());
+            double currentMultiplier = ConfigUtils.getLatencyMultiplier();
+            long effectiveMaxMs = Math.max(
+                    1000L,
+                    Math.round(baseMaxMs * (currentMultiplier / DEFAULT_LATENCY_MULTIPLIER))
+            );
+            response.then().time(Matchers.lessThan(effectiveMaxMs));
+        }
+    }
+}
