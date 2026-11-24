@@ -746,7 +746,11 @@ onMounted(() => {
         :project-id="run.project_id"
       />
 
-      <CorrelationPanel v-else-if="activeTab === 'correlation'" :run-id="run.id" />
+      <CorrelationPanel
+        v-else-if="activeTab === 'correlation'"
+        :run-id="run.id"
+        :project-id="run.project_id"
+      />
 
       <JavaAllureBoard
         v-else-if="activeTab === 'java'"

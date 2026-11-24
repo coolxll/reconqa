@@ -91,6 +91,44 @@ const duplicateRequests = computed<Array<Record<string, unknown>>>(() => {
   return Array.isArray(raw) ? (raw as Array<Record<string, unknown>>) : [];
 });
 
+interface AggregatedDuplicate {
+  method: string;
+  url: string;
+  count: number;
+  scenarios: string[];
+}
+
+const aggregatedDuplicates = computed<AggregatedDuplicate[]>(() => {
+  const byKey = new Map<string, { method: string; url: string; count: number; scenarios: Set<string> }>();
+  for (const row of duplicateRequests.value) {
+    const method = String(row.method ?? "GET").toUpperCase();
+    const url = String(row.url ?? row.path ?? "/");
+    const count = Number(row.count ?? 1);
+    const scenario = String(row.scenario ?? "default").trim() || "default";
+    const key = `${method} ${url}`;
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.count += count;
+      existing.scenarios.add(scenario);
+    } else {
+      byKey.set(key, {
+        method,
+        url,
+        count,
+        scenarios: new Set<string>([scenario]),
+      });
+    }
+  }
+  return Array.from(byKey.values())
+    .map((entry) => ({
+      method: entry.method,
+      url: entry.url,
+      count: entry.count,
+      scenarios: Array.from(entry.scenarios),
+    }))
+    .sort((a, b) => b.count - a.count);
+});
+
 const cacheStats = computed(() => {
   const cs = (profiler.value?.cache_stats ?? {}) as Record<string, unknown>;
   const hit = Number(cs.hit ?? 0);
@@ -129,7 +167,10 @@ const kpis = computed(() => {
     p95Subtitle:
       p95Ttfb > 0 ? t("perf.kpiP95Sub", { ms: Math.round(p95Ttfb) }) : t("perf.kpiHighestWaitSub"),
     uncompressedCount: Number(s.uncompressed_count ?? uncompressedResponses.value.length),
-    duplicateCount: Number(s.duplicate_group_count ?? duplicateRequests.value.length),
+    duplicateCount:
+      aggregatedDuplicates.value.length > 0
+        ? aggregatedDuplicates.value.length
+        : Number(s.duplicate_group_count ?? 0),
     cacheHitLabel:
       cacheStats.value.hitRatePct !== null ? `${cacheStats.value.hitRatePct}%` : "N/A",
   };
@@ -732,23 +773,23 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- Duplicate Redundant Requests -->
+          <!-- Duplicate Redundant Requests (Aggregated by Method + URL across Scenarios) -->
           <div class="card overflow-hidden">
             <div class="card-header">
               <h3 class="text-sm font-semibold text-slate-900">
                 {{ t("perf.duplicatesTitle") }}
               </h3>
               <span class="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-600">
-                {{ duplicateRequests.length }}
+                {{ aggregatedDuplicates.length }}
               </span>
             </div>
             <div
-              v-if="duplicateRequests.length === 0"
+              v-if="aggregatedDuplicates.length === 0"
               class="px-5 py-6 text-center text-xs text-slate-500"
             >
               {{ t("perf.duplicatesEmpty") }}
             </div>
-            <div v-else class="max-h-48 overflow-auto">
+            <div v-else class="max-h-56 overflow-auto">
               <table class="min-w-full divide-y divide-slate-200 text-xs">
                 <thead class="table-head">
                   <tr>
@@ -759,15 +800,23 @@ onBeforeUnmount(() => {
                   </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-100 bg-white">
-                  <tr v-for="(d, idx) in duplicateRequests" :key="idx" class="hover:bg-slate-50/70">
+                  <tr v-for="(d, idx) in aggregatedDuplicates" :key="idx" class="hover:bg-slate-50/70">
                     <td class="px-4 py-2">
                       <span class="rounded-full bg-amber-50 px-2 py-0.5 font-mono font-semibold text-amber-800 ring-1 ring-amber-200">
                         {{ d.count }}x
                       </span>
                     </td>
-                    <td class="px-3 py-2 font-mono text-slate-600">{{ d.scenario || "default" }}</td>
-                    <td class="px-3 py-2 font-mono font-semibold text-slate-700">{{ d.method || "GET" }}</td>
-                    <td class="max-w-md truncate px-4 py-2 font-mono text-slate-700" :title="String(d.url || '')">
+                    <td class="px-3 py-2 font-mono text-slate-600" :title="d.scenarios.join(', ')">
+                      <span
+                        v-if="d.scenarios.length > 1"
+                        class="rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700"
+                      >
+                        {{ t("perf.scenariosCountBadge", { count: d.scenarios.length }) }}
+                      </span>
+                      <span v-else>{{ d.scenarios[0] || "default" }}</span>
+                    </td>
+                    <td class="px-3 py-2 font-mono font-semibold text-slate-700">{{ d.method }}</td>
+                    <td class="max-w-md truncate px-4 py-2 font-mono text-slate-700" :title="d.url">
                       {{ d.url }}
                     </td>
                   </tr>

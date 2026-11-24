@@ -459,7 +459,13 @@ def cmd_serve(
     """Start the ReconQA FastAPI + Async Worker server."""
     import uvicorn
 
-    uvicorn.run("reconqa.server.app:app", host=host, port=port, reload=reload)
+    uvicorn.run(
+        "reconqa.server.app:app",
+        host=host,
+        port=port,
+        reload=reload,
+        timeout_graceful_shutdown=3,
+    )
 
 
 @app.command("mcp")

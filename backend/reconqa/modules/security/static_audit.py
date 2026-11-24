@@ -309,6 +309,52 @@ def _scan_text_for_leaks(
         break
 
 
+_TWO_PART_TLDS = {
+    "com.cn",
+    "net.cn",
+    "org.cn",
+    "gov.cn",
+    "edu.cn",
+    "co.uk",
+    "org.uk",
+    "ac.uk",
+    "co.jp",
+    "ne.jp",
+    "or.jp",
+    "com.hk",
+    "com.tw",
+    "com.sg",
+    "com.au",
+    "co.nz",
+    "co.kr",
+    "com.br",
+}
+
+
+def _registrable_root_domain(host: str) -> str:
+    h = (host or "").strip().lower().rstrip(".")
+    if ":" in h and not h.startswith("["):
+        h = h.split(":", 1)[0]
+    if not h or h == "localhost" or re.fullmatch(r"\d+(?:\.\d+){3}", h):
+        return h
+    parts = [p for p in h.split(".") if p]
+    if len(parts) >= 3 and ".".join(parts[-2:]) in _TWO_PART_TLDS:
+        return ".".join(parts[-3:])
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return h
+
+
+def _same_registrable_root(origin_url: str, target_host: str) -> bool:
+    raw = (origin_url or "").strip()
+    if not raw:
+        return False
+    origin_host = (urlparse(raw).hostname if "://" in raw else raw.split("/", 1)[0]) or ""
+    r1 = _registrable_root_domain(origin_host)
+    r2 = _registrable_root_domain(target_host)
+    return bool(r1 and r2 and r1 == r2)
+
+
 def run_static_audit(
     har_dir: Path,
     out_dir: Path,
@@ -325,8 +371,33 @@ def run_static_audit(
     seen_cookie_keys: set[tuple[str, str, tuple[str, ...]]] = set()
     leaks: dict[str, list[dict[str, str]]] = defaultdict(list)
     seen_leak_keys: set[tuple[str, str, str]] = set()
-    cors_issues: list[dict[str, Any]] = []
-    seen_cors_keys: set[tuple[str, str, str]] = set()
+    cors_agg: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _record_cors(
+        c_host: str,
+        c_path: str,
+        kind: str,
+        acao_val: str,
+        acac_val: str,
+        severity: str,
+    ) -> None:
+        ckey = (c_host, kind)
+        entry_agg = cors_agg.get(ckey)
+        if entry_agg is None:
+            cors_agg[ckey] = {
+                "host": c_host,
+                "kind": kind,
+                "acao": acao_val,
+                "acac": acac_val,
+                "severity": severity,
+                "paths": {c_path},
+                "sample_endpoints": [c_path],
+            }
+        else:
+            if c_path not in entry_agg["paths"]:
+                entry_agg["paths"].add(c_path)
+                if len(entry_agg["sample_endpoints"]) < 5:
+                    entry_agg["sample_endpoints"].append(c_path)
 
     total_entries = 0
     scanned_js_files = 0
@@ -383,7 +454,7 @@ def run_static_audit(
                 if srv.strip():
                     hs["servers"].add(srv.strip()[:60])
 
-            # CORS audit
+            # CORS audit (host-level aggregated; skip legitimate same-root-domain CORS)
             acao = (rh.get("access-control-allow-origin", [""])[0]).strip()
             acac = (rh.get("access-control-allow-credentials", [""])[0]).strip().lower()
             req_origin = (qh.get("origin", [""])[0]).strip()
@@ -391,47 +462,19 @@ def run_static_audit(
                 hs["cors_wildcard"] += 1
                 if acac == "true":
                     hs["cors_dangerous"] += 1
-                    ckey = (host, path, "wildcard_with_credentials")
-                    if ckey not in seen_cors_keys:
-                        seen_cors_keys.add(ckey)
-                        cors_issues.append(
-                            {
-                                "host": host,
-                                "endpoint": f"{host}{path}",
-                                "kind": "wildcard_with_credentials",
-                                "acao": acao,
-                                "acac": acac,
-                                "severity": "high",
-                            }
-                        )
+                    _record_cors(host, path, "wildcard_with_credentials", acao, acac, "high")
                 else:
-                    ckey = (host, path, "wildcard_origin")
-                    if ckey not in seen_cors_keys:
-                        seen_cors_keys.add(ckey)
-                        cors_issues.append(
-                            {
-                                "host": host,
-                                "endpoint": f"{host}{path}",
-                                "kind": "wildcard_origin",
-                                "acao": acao,
-                                "acac": acac or "false",
-                                "severity": "low",
-                            }
-                        )
+                    _record_cors(host, path, "wildcard_origin", acao, acac or "false", "low")
             elif acao and req_origin and acao == req_origin and acac == "true":
-                hs["cors_dangerous"] += 1
-                ckey = (host, path, "reflected_origin_with_credentials")
-                if ckey not in seen_cors_keys:
-                    seen_cors_keys.add(ckey)
-                    cors_issues.append(
-                        {
-                            "host": host,
-                            "endpoint": f"{host}{path}",
-                            "kind": "reflected_origin_with_credentials",
-                            "acao": acao[:80],
-                            "acac": acac,
-                            "severity": "high",
-                        }
+                if not _same_registrable_root(req_origin, host):
+                    hs["cors_dangerous"] += 1
+                    _record_cors(
+                        host,
+                        path,
+                        "reflected_origin_with_credentials",
+                        acao[:80],
+                        acac,
+                        "high",
                     )
 
             # Set-Cookie audit (never record raw cookie value)
@@ -524,6 +567,7 @@ def run_static_audit(
     host_headers_out: dict[str, dict[str, Any]] = {}
     findings: list[dict[str, Any]] = []
 
+    missing_hdr_agg: dict[tuple[str, str, str], dict[str, Any]] = {}
     for host, st in sorted(host_stats.items(), key=lambda kv: -kv[1]["seen"]):
         seen = st["seen"]
         coverage: dict[str, dict[str, Any]] = {}
@@ -537,20 +581,13 @@ def run_static_audit(
                 "coverage": ratio,
             }
             if seen > 0 and present == 0:
-                findings.append(
-                    {
-                        "category": "security_header",
-                        "severity": sev,
-                        "endpoint": host,
-                        "title": f"Missing {label} ({hdr}) header on {host}",
-                        "evidence": {
-                            "host": host,
-                            "header": hdr,
-                            "present": present,
-                            "total": seen,
-                        },
-                    }
+                hkey = (hdr, label, sev)
+                agg = missing_hdr_agg.setdefault(
+                    hkey,
+                    {"header": hdr, "label": label, "severity": sev, "hosts": [], "total": 0},
                 )
+                agg["hosts"].append(host)
+                agg["total"] += seen
 
         host_headers_out[host] = {
             "seen": seen,
@@ -560,13 +597,57 @@ def run_static_audit(
             "servers": sorted(st["servers"]),
         }
 
+    for agg in missing_hdr_agg.values():
+        hosts = agg["hosts"]
+        hdr = agg["header"]
+        label = agg["label"]
+        sev = agg["severity"]
+        if len(hosts) == 1:
+            ep_label = hosts[0]
+            title_str = f"Missing {label} ({hdr}) header on {hosts[0]}"
+        else:
+            ep_label = f"{len(hosts)} hosts"
+            title_str = f"Missing {label} ({hdr}) header across {len(hosts)} hosts"
+        findings.append(
+            {
+                "category": "security_header",
+                "severity": sev,
+                "endpoint": ep_label,
+                "title": title_str,
+                "evidence": {
+                    "host": hosts[0],
+                    "affected_hosts": hosts,
+                    "affected_endpoints_count": len(hosts),
+                    "sample_endpoints": hosts[:10],
+                    "header": hdr,
+                    "present": 0,
+                    "total": agg["total"],
+                },
+            }
+        )
+
+    cors_issues: list[dict[str, Any]] = [
+        {
+            "host": agg["host"],
+            "endpoint": agg["host"],
+            "kind": agg["kind"],
+            "acao": agg["acao"],
+            "acac": agg["acac"],
+            "severity": agg["severity"],
+            "affected_endpoints_count": len(agg["paths"]),
+            "sample_endpoints": agg["sample_endpoints"],
+        }
+        for agg in cors_agg.values()
+    ]
+
     for ci in cors_issues:
+        count = ci["affected_endpoints_count"]
         findings.append(
             {
                 "category": "cors",
                 "severity": ci["severity"],
-                "endpoint": ci["endpoint"],
-                "title": f"Permissive CORS policy ({ci['kind']}) on {ci['endpoint']}",
+                "endpoint": ci["host"],
+                "title": f"Permissive CORS policy ({ci['kind']}) on {ci['host']} ({count} endpoints)",
                 "evidence": ci,
             }
         )
@@ -585,18 +666,45 @@ def run_static_audit(
 
     leaks_dict = {k: v for k, v in sorted(leaks.items())}
     for kind, items in leaks_dict.items():
+        by_sev: dict[str, list[dict[str, str]]] = defaultdict(list)
         for item in items:
+            by_sev[str(item.get("severity") or "low")].append(item)
+
+        for sev, grp in by_sev.items():
+            unique_eps = list(dict.fromkeys(str(it["source"]) for it in grp if it.get("source")))
+            occ_list = [
+                {
+                    "endpoint": str(it.get("source") or ""),
+                    "masked": str(it.get("sample") or ""),
+                    "context": str(it.get("context") or ""),
+                }
+                for it in grp[:25]
+            ]
+            first = grp[0]
+            if len(unique_eps) == 1:
+                ep_label = unique_eps[0]
+                title_str = f"Potential {kind} exposure (redacted) in {unique_eps[0]}"
+            else:
+                ep_label = f"{len(unique_eps)} endpoints"
+                title_str = (
+                    f"Potential {kind} exposure (redacted) across {len(unique_eps)} endpoints"
+                )
             findings.append(
                 {
                     "category": "sensitive_leak",
-                    "severity": item["severity"],
-                    "endpoint": item["source"],
-                    "title": f"Potential {kind} exposure (redacted) in {item['source']}",
+                    "severity": sev,
+                    "endpoint": ep_label,
+                    "title": title_str,
                     "evidence": {
+                        "kind": kind,
                         "leak_type": kind,
-                        "source": item["source"],
-                        "redacted_sample": item["sample"],
-                        "context": item.get("context", ""),
+                        "source": first.get("source", ""),
+                        "redacted_sample": first.get("sample", ""),
+                        "context": first.get("context", ""),
+                        "affected_endpoints_count": len(unique_eps),
+                        "occurrence_count": len(grp),
+                        "sample_endpoints": unique_eps[:10],
+                        "occurrences": occ_list,
                     },
                 }
             )

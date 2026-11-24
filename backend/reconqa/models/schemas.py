@@ -54,6 +54,40 @@ class TargetUpdate(BaseModel):
     scope_rules: dict[str, Any] | None = None
 
 
+class BatchTargetItem(BaseModel):
+    root_domain: str
+    base_url: str
+    portal_label: str | None = None
+
+
+class BatchTargetsCreateRequest(BaseModel):
+    targets: list[BatchTargetItem] = Field(default_factory=list)
+
+
+class BatchTargetsCreateResponse(BaseModel):
+    added: list[TargetOut] = Field(default_factory=list)
+    skipped: int = 0
+
+
+class DiscoveredPortal(BaseModel):
+    host: str
+    url: str
+    status_code: int
+    title: str = ""
+    is_api_gateway: bool = False
+    suggested_label: str = ""
+
+
+class DiscoverPortalsRequest(BaseModel):
+    seed_url: str | None = None
+
+
+class DiscoverPortalsResponse(BaseModel):
+    root_domain: str
+    env_suffix: str = ""
+    portals: list[DiscoveredPortal] = Field(default_factory=list)
+
+
 class TargetOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

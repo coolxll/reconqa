@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 from collections import Counter
@@ -33,6 +34,7 @@ from reconqa.models.db import get_db
 from reconqa.models.schemas import RunCreate, RunOut
 from reconqa.models.tables import Artifact, Job, Project, Run, Target
 from reconqa.modules.recorder.har_importer import import_hars
+from reconqa.modules.recorder.har_slimmer import slim_har_file
 from reconqa.modules.recorder.text_importer import import_traffic_text
 from reconqa.pipeline import ALL_MODULES, DEFAULT_MODULES
 from reconqa.server.worker import InProcessTaskRunner
@@ -241,12 +243,21 @@ async def list_project_runs(
     return list(res.scalars().all())
 
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Hardlink a file for zero extra disk usage, falling back to copy2 across filesystems."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
 @router.post("/runs/{run_id}/hars")
 async def upload_run_hars(
     run_id: str,
     files: list[UploadFile] = File(...),
     scenario: str | None = Form(default=None),
     target_domain: str | None = Form(default=None),
+    slim: bool = Form(default=True),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     run = await _get_run_with_jobs(db, run_id)
@@ -274,8 +285,45 @@ async def upload_run_hars(
             har_dir,
             scenario_name=scenario_override,
             target_domain=target_domain,
-            extract_js=True,
+            extract_js=not slim,
         )
+
+    slim_stats: dict[str, Any] = {
+        "enabled": slim,
+        "files_slimmed": 0,
+        "original_bytes": 0,
+        "slimmed_bytes": 0,
+        "saved_pct": 0.0,
+        "stripped_binary_count": 0,
+        "stripped_js_count": 0,
+        "extracted_js_files": 0,
+    }
+    if slim:
+        js_bundles_dir = har_dir / "js_bundles"
+        imported_files = [
+            Path(f["dest"])
+            for f in (import_res.get("imported") or [])
+            if isinstance(f, dict) and f.get("dest")
+        ]
+        target_har_paths = [p for p in imported_files if p.is_file()] or sorted(har_dir.glob("*.har"))
+        for hp in target_har_paths:
+            st = slim_har_file(hp, js_bundles_dir=js_bundles_dir)
+            if st.get("slimmed"):
+                slim_stats["files_slimmed"] += 1
+                slim_stats["original_bytes"] += int(st.get("original_bytes") or 0)
+                slim_stats["slimmed_bytes"] += int(st.get("slimmed_bytes") or 0)
+                slim_stats["stripped_binary_count"] += int(st.get("stripped_binary_count") or 0)
+                slim_stats["stripped_js_count"] += int(st.get("stripped_js_count") or 0)
+                slim_stats["extracted_js_files"] += int(st.get("extracted_js_files") or 0)
+        if slim_stats["original_bytes"] > 0:
+            slim_stats["saved_pct"] = round(
+                (
+                    (slim_stats["original_bytes"] - slim_stats["slimmed_bytes"])
+                    / slim_stats["original_bytes"]
+                )
+                * 100.0,
+                2,
+            )
 
     await _upsert_har_artifacts(db, run)
     har_paths = sorted(har_dir.glob("*.har"))
@@ -293,6 +341,7 @@ async def upload_run_hars(
     return {
         "run_id": run_id,
         "import_result": import_res,
+        "slim_stats": slim_stats,
         "har_files": har_files,
         "total_hars": len(har_files),
     }
@@ -391,15 +440,23 @@ async def reuse_run_hars(
         dst_har = dst_har_dir / src_har.name
         if dst_har.exists():
             dst_har = dst_har_dir / f"{src_har.stem}_{digest[:8]}.har"
-        shutil.copy2(src_har, dst_har)
+        _link_or_copy(src_har, dst_har)
         existing_hashes.add(digest)
         reused.append(dst_har.name)
 
-        # Also carry over extracted JS bundles for this scenario if present
-        src_js_dir = src_har_dir / "js_bundles" / src_har.stem
-        if src_js_dir.is_dir():
-            dst_js_dir = dst_har_dir / "js_bundles" / dst_har.stem
-            shutil.copytree(src_js_dir, dst_js_dir, dirs_exist_ok=True)
+    # Carry over extracted JS bundles (both deduplicated flat files and scenario subdirs) via hardlink
+    src_js_root = src_har_dir / "js_bundles"
+    if src_js_root.is_dir():
+        dst_js_root = ensure_dir(dst_har_dir / "js_bundles")
+        for js_file in sorted(src_js_root.rglob("*")):
+            if not js_file.is_file():
+                continue
+            rel = js_file.relative_to(src_js_root)
+            dst_js_file = dst_js_root / rel
+            if dst_js_file.exists():
+                continue
+            ensure_dir(dst_js_file.parent)
+            _link_or_copy(js_file, dst_js_file)
 
     await _upsert_har_artifacts(db, target_run)
     cfg = dict(target_run.config_snapshot or {})

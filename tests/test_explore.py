@@ -573,3 +573,156 @@ async def test_multi_url_batch_explore_all_portals_and_target_patch(
         if db_mod._engine is not None:
             await db_mod._engine.dispose()
 
+
+@pytest.mark.asyncio
+async def test_discover_sibling_portals_and_batch_targets_idempotency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify #183: discover_sibling_portals, POST /projects/{id}/discover-portals, and /targets/batch idempotency."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "discover_portals.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+
+    from reconqa.config import Settings
+    from reconqa.models import db as db_mod
+    from reconqa.modules.discovery import seed_explorer
+
+    monkeypatch.setattr(Settings, "resolve_bin", lambda self, name: None)
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+
+    # Mock CLI probe so discover_sibling_portals runs deterministically without external network
+    monkeypatch.setattr(seed_explorer, "_resolve_httpx_cli", lambda: "/usr/local/bin/httpx")
+
+    def _fake_cli_probe(httpx_bin: str, candidate_urls: list[str], *, timeout_sec: int) -> list[dict]:
+        assert any("admin-stage.example.test" in u for u in candidate_urls)
+        assert any("patient-stage.example.test" in u for u in candidate_urls)
+        return [
+            {
+                "input": "https://admin-stage.example.test",
+                "url": "https://admin-stage.example.test",
+                "status_code": 200,
+                "title": "Admin Console",
+            },
+            {
+                "input": "https://patient-stage.example.test",
+                "url": "https://patient-stage.example.test",
+                "status_code": 200,
+                "title": "Online Clinic",
+            },
+            {
+                "input": "https://api-stage.example.test",
+                "url": "https://api-stage.example.test",
+                "status_code": 404,
+                "title": "",
+            },
+            {
+                "input": "https://dead-stage.example.test",
+                "url": "https://dead-stage.example.test",
+                "status_code": 502,
+                "title": "502 Bad Gateway",
+            },
+            {
+                "input": "https://missing-stage.example.test",
+                "url": "https://missing-stage.example.test",
+                "status_code": 404,
+                "title": "404 Not Found",
+            },
+        ]
+
+    monkeypatch.setattr(seed_explorer, "_probe_portals_with_cli", _fake_cli_probe)
+
+    # Direct unit test of discover_sibling_portals
+    direct = seed_explorer.discover_sibling_portals("https://admin-stage.example.test")
+    assert direct["root_domain"] == "example.test"
+    assert direct["env_suffix"] == "-stage"
+    hosts = [p["host"] for p in direct["portals"]]
+    assert hosts == [
+        "admin-stage.example.test",
+        "patient-stage.example.test",
+        "api-stage.example.test",
+    ], direct["portals"]
+    by_host = {p["host"]: p for p in direct["portals"]}
+    assert by_host["patient-stage.example.test"]["suggested_label"] == "Online Clinic"
+    assert by_host["api-stage.example.test"]["is_api_gateway"] is True
+    assert "dead-stage.example.test" not in by_host
+    assert "missing-stage.example.test" not in by_host
+
+    from reconqa.server.app import create_app
+
+    try:
+        fastapi_app = create_app()
+        async with fastapi_app.router.lifespan_context(fastapi_app):
+            transport = httpx.ASGITransport(app=fastapi_app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                pid = (
+                    await client.post("/api/v1/projects", json={"name": "Discovery Suite"})
+                ).json()["id"]
+
+                # Seed 1 initial Target so discover-portals works with omitted seed_url
+                await client.post(
+                    f"/api/v1/projects/{pid}/targets",
+                    json={
+                        "root_domain": "example.test",
+                        "base_url": "https://admin-stage.example.test",
+                        "scope_rules": {"portal_label": "HQ Admin"},
+                    },
+                )
+
+                r_disc = await client.post(f"/api/v1/projects/{pid}/discover-portals", json={})
+                assert r_disc.status_code == 200, r_disc.text
+                disc_data = r_disc.json()
+                assert disc_data["root_domain"] == "example.test"
+                assert disc_data["env_suffix"] == "-stage"
+                assert len(disc_data["portals"]) == 3
+
+                # Batch add: admin-stage (duplicate with trailing slash) + patient-stage (new) + api-stage (new)
+                r_batch1 = await client.post(
+                    f"/api/v1/projects/{pid}/targets/batch",
+                    json={
+                        "targets": [
+                            {
+                                "root_domain": "example.test",
+                                "base_url": "https://admin-stage.example.test/",
+                                "portal_label": "Dup Admin",
+                            },
+                            {
+                                "root_domain": "example.test",
+                                "base_url": "https://patient-stage.example.test",
+                                "portal_label": "Online Clinic",
+                            },
+                            {
+                                "root_domain": "example.test",
+                                "base_url": "https://api-stage.example.test",
+                                "portal_label": "API Gateway",
+                            },
+                        ]
+                    },
+                )
+                assert r_batch1.status_code == 201, r_batch1.text
+                b1 = r_batch1.json()
+                assert b1["skipped"] == 1
+                assert len(b1["added"]) == 2
+                added_labels = {t["scope_rules"].get("portal_label") for t in b1["added"]}
+                assert added_labels == {"Online Clinic", "API Gateway"}
+
+                # Re-running identical batch is 100% idempotent (0 added, 3 skipped)
+                r_batch2 = await client.post(
+                    f"/api/v1/projects/{pid}/targets/batch",
+                    json={
+                        "targets": [
+                            {"root_domain": "example.test", "base_url": "https://admin-stage.example.test"},
+                            {"root_domain": "example.test", "base_url": "https://patient-stage.example.test/"},
+                            {"root_domain": "example.test", "base_url": "https://api-stage.example.test"},
+                        ]
+                    },
+                )
+                assert r_batch2.status_code == 201
+                assert r_batch2.json()["skipped"] == 3
+                assert len(r_batch2.json()["added"]) == 0
+    finally:
+        if db_mod._engine is not None:
+            await db_mod._engine.dispose()
+

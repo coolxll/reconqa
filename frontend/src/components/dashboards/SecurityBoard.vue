@@ -60,6 +60,20 @@ interface LeakSignalRow {
   severity: string;
 }
 
+interface LeakSignalGroup {
+  kind: string;
+  severity: string;
+  totalHits: number;
+  uniqueSourcesCount: number;
+  items: LeakSignalRow[];
+}
+
+interface FindingOccurrenceItem {
+  endpoint: string;
+  masked: string;
+  context: string;
+}
+
 interface NormalizedAuthRow {
   key: string;
   checkType: "unauth" | "idor" | "auth";
@@ -113,6 +127,7 @@ const severityFilter = ref<string>("all");
 const categoryFilter = ref<string>("all");
 const findingSearch = ref("");
 const expandedFindingIds = ref<Set<string>>(new Set());
+const expandedLeakKinds = ref<Set<string>>(new Set());
 
 const authVerdictFilter = ref<string>("all");
 const authSearch = ref("");
@@ -261,6 +276,90 @@ const leakSignals = computed<LeakSignalRow[]>(() => {
   }
   return out;
 });
+
+const SEV_RANK: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  low: 3,
+  info: 4,
+};
+
+const leakGroups = computed<LeakSignalGroup[]>(() => {
+  const byKind = new Map<string, LeakSignalRow[]>();
+  for (const row of leakSignals.value) {
+    const list = byKind.get(row.kind) ?? [];
+    list.push(row);
+    byKind.set(row.kind, list);
+  }
+  return Array.from(byKind.entries())
+    .map(([kind, items]) => {
+      let topSev = "info";
+      const sources = new Set<string>();
+      for (const it of items) {
+        if ((SEV_RANK[it.severity] ?? 9) < (SEV_RANK[topSev] ?? 9)) {
+          topSev = it.severity;
+        }
+        if (it.source) sources.add(it.source);
+      }
+      return {
+        kind,
+        severity: topSev,
+        totalHits: items.length,
+        uniqueSourcesCount: sources.size || items.length,
+        items,
+      };
+    })
+    .sort(
+      (a, b) =>
+        (SEV_RANK[a.severity] ?? 9) - (SEV_RANK[b.severity] ?? 9) ||
+        b.uniqueSourcesCount - a.uniqueSourcesCount
+    );
+});
+
+function toggleLeakKind(kind: string): void {
+  const next = new Set(expandedLeakKinds.value);
+  if (next.has(kind)) next.delete(kind);
+  else next.add(kind);
+  expandedLeakKinds.value = next;
+}
+
+function getFindingAffectedEndpointsCount(f: Finding): number {
+  const ev = f.evidence ?? {};
+  if (typeof ev.affected_endpoints_count === "number" && ev.affected_endpoints_count > 0) {
+    return ev.affected_endpoints_count;
+  }
+  if (Array.isArray(ev.occurrences) && ev.occurrences.length > 1) {
+    return ev.occurrences.length;
+  }
+  if (Array.isArray(ev.sample_endpoints) && ev.sample_endpoints.length > 1) {
+    return ev.sample_endpoints.length;
+  }
+  return 0;
+}
+
+function getFindingAffectedHosts(f: Finding): string[] {
+  const raw = f.evidence?.affected_hosts;
+  return Array.isArray(raw) ? raw.map(String).filter(Boolean) : [];
+}
+
+function getFindingOccurrences(f: Finding): FindingOccurrenceItem[] {
+  const raw = f.evidence?.occurrences;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => {
+    const obj = (item ?? {}) as Record<string, unknown>;
+    return {
+      endpoint: String(obj.endpoint ?? obj.source ?? ""),
+      masked: String(obj.masked ?? obj.sample ?? ""),
+      context: typeof obj.context === "string" ? obj.context : "",
+    };
+  });
+}
+
+function getFindingSampleEndpoints(f: Finding): string[] {
+  const raw = f.evidence?.sample_endpoints;
+  return Array.isArray(raw) ? raw.map(String).filter(Boolean) : [];
+}
 
 const authMatrixRows = computed<NormalizedAuthRow[]>(() => {
   const am = security.value?.auth_matrix as Record<string, unknown> | null | undefined;
@@ -1133,7 +1232,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- Redacted Leak Signals -->
+        <!-- Redacted Leak Signals (Aggregated Collapsible Accordion by Rule Kind) -->
         <div class="card flex flex-col overflow-hidden">
           <div class="card-header">
             <div class="flex items-center gap-2">
@@ -1141,37 +1240,76 @@ onBeforeUnmount(() => {
               <h3 class="text-sm font-semibold text-slate-900">{{ t("sec.leaksTitle") }}</h3>
             </div>
             <span class="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-600">
-              {{ leakSignals.length }}
+              {{
+                leakGroups.length > 0
+                  ? t("sec.leaksGroupedCount", { groups: leakGroups.length, total: leakSignals.length })
+                  : 0
+              }}
             </span>
           </div>
-          <div v-if="leakSignals.length === 0" class="px-5 py-8 text-center text-xs text-slate-500">
+          <div v-if="leakGroups.length === 0" class="px-5 py-8 text-center text-xs text-slate-500">
             {{ t("sec.leaksEmpty") }}
           </div>
-          <div v-else class="max-h-72 divide-y divide-slate-100 overflow-y-auto">
+          <div v-else class="max-h-96 divide-y divide-slate-100 overflow-y-auto">
             <div
-              v-for="(leak, idx) in leakSignals"
-              :key="`${leak.kind}-${leak.source}-${idx}`"
-              class="flex items-start justify-between gap-3 px-5 py-3 text-xs"
+              v-for="group in leakGroups"
+              :key="group.kind"
+              data-testid="leak-group-card"
+              class="bg-white"
             >
-              <div class="min-w-0 flex-1">
-                <div class="flex items-center gap-2">
-                  <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-700">
-                    {{ leak.kind }}
+              <button
+                type="button"
+                class="flex w-full items-center justify-between gap-3 px-4 py-3 text-left text-xs transition hover:bg-slate-50"
+                @click="toggleLeakKind(group.kind)"
+              >
+                <div class="flex min-w-0 items-center gap-2">
+                  <ChevronDown
+                    v-if="expandedLeakKinds.has(group.kind)"
+                    class="h-3.5 w-3.5 shrink-0 text-indigo-600"
+                  />
+                  <ChevronRight v-else class="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                  <span class="rounded bg-slate-100 px-2 py-0.5 font-mono text-[11px] font-semibold text-slate-800">
+                    {{ group.kind }}
                   </span>
-                  <span class="truncate text-slate-600" :title="leak.source">{{ leak.source }}</span>
+                  <span class="rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700">
+                    {{ t("sec.affectedEndpoints", { count: group.uniqueSourcesCount }) }}
+                  </span>
+                  <span
+                    v-if="group.totalHits > group.uniqueSourcesCount"
+                    class="text-[11px] text-slate-400"
+                  >
+                    ({{ t("sec.occurrencesHits", { count: group.totalHits }) }})
+                  </span>
                 </div>
-                <p class="mt-1.5 inline-block rounded bg-slate-900 px-2 py-0.5 font-mono text-[11px] text-amber-300">
-                  {{ leak.sample }}
-                </p>
-                <p
-                  v-if="leak.context"
-                  data-testid="leak-context-snippet"
-                  class="mt-1.5 rounded bg-slate-900/5 px-2.5 py-1.5 font-mono text-[11px] leading-relaxed break-all text-slate-700 ring-1 ring-inset ring-slate-200/80"
+                <StatusBadge :status="group.severity" />
+              </button>
+
+              <div
+                v-if="expandedLeakKinds.has(group.kind)"
+                class="divide-y divide-slate-100 border-t border-slate-100 bg-slate-50/70"
+              >
+                <div
+                  v-for="(leak, idx) in group.items"
+                  :key="`${group.kind}-${leak.source}-${idx}`"
+                  class="space-y-1.5 px-6 py-2.5 text-xs"
                 >
-                  {{ leak.context }}
-                </p>
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="truncate font-mono text-[11px] font-medium text-slate-700" :title="leak.source">
+                      {{ leak.source }}
+                    </span>
+                    <span class="rounded bg-slate-900 px-2 py-0.5 font-mono text-[11px] text-amber-300">
+                      {{ leak.sample }}
+                    </span>
+                  </div>
+                  <p
+                    v-if="leak.context"
+                    data-testid="leak-context-snippet"
+                    class="rounded bg-white px-2.5 py-1.5 font-mono text-[11px] leading-relaxed break-all text-slate-700 ring-1 ring-inset ring-slate-200/80"
+                  >
+                    {{ leak.context }}
+                  </p>
+                </div>
               </div>
-              <StatusBadge :status="leak.severity" />
             </div>
           </div>
         </div>
@@ -1294,13 +1432,98 @@ onBeforeUnmount(() => {
                       {{ f.category }}
                     </span>
                   </td>
-                  <td class="px-3 py-2.5 font-medium text-slate-800">{{ f.title }}</td>
+                  <td class="px-3 py-2.5 font-medium text-slate-800">
+                    <div class="flex flex-wrap items-center gap-1.5">
+                      <span>{{ f.title }}</span>
+                      <span
+                        v-if="getFindingAffectedEndpointsCount(f) > 1"
+                        data-testid="finding-aggregated-badge"
+                        class="inline-flex shrink-0 rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 ring-1 ring-inset ring-indigo-200"
+                      >
+                        {{ t("sec.affectedEndpoints", { count: getFindingAffectedEndpointsCount(f) }) }}
+                      </span>
+                      <span
+                        v-else-if="getFindingAffectedHosts(f).length > 1"
+                        data-testid="finding-aggregated-badge"
+                        class="inline-flex shrink-0 rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-700 ring-1 ring-inset ring-indigo-200"
+                      >
+                        {{ t("sec.affectedHosts", { count: getFindingAffectedHosts(f).length }) }}
+                      </span>
+                    </div>
+                  </td>
                   <td class="max-w-xs truncate px-4 py-2.5 font-mono text-slate-600" :title="f.endpoint">
                     {{ f.endpoint }}
                   </td>
                 </tr>
                 <tr v-if="expandedFindingIds.has(f.id)" class="bg-slate-50/70">
-                  <td colspan="5" class="space-y-2 px-6 py-3">
+                  <td colspan="5" class="space-y-3 px-6 py-3.5">
+                    <!-- Aggregated Hosts Pills -->
+                    <div v-if="getFindingAffectedHosts(f).length > 0" class="flex flex-wrap items-center gap-1.5">
+                      <span class="text-[11px] font-semibold text-slate-500">
+                        {{ t("sec.affectedHosts", { count: getFindingAffectedHosts(f).length }) }}:
+                      </span>
+                      <span
+                        v-for="h in getFindingAffectedHosts(f)"
+                        :key="h"
+                        class="rounded bg-white px-2 py-0.5 font-mono text-[11px] text-slate-700 ring-1 ring-slate-200"
+                      >
+                        {{ h }}
+                      </span>
+                    </div>
+
+                    <!-- Aggregated Occurrences with Redacted Context -->
+                    <div
+                      v-if="getFindingOccurrences(f).length > 0"
+                      data-testid="finding-occurrences-list"
+                      class="space-y-1.5"
+                    >
+                      <p class="text-[11px] font-semibold text-slate-600">
+                        {{ t("sec.affectedListTitle", { count: getFindingOccurrences(f).length }) }}
+                      </p>
+                      <div class="max-h-56 divide-y divide-slate-200/70 overflow-y-auto rounded-lg border border-slate-200 bg-white">
+                        <div
+                          v-for="(occ, oIdx) in getFindingOccurrences(f)"
+                          :key="`${occ.endpoint}-${oIdx}`"
+                          class="space-y-1 px-3 py-2 text-xs"
+                        >
+                          <div class="flex flex-wrap items-center justify-between gap-2">
+                            <span class="font-mono text-[11px] font-medium text-slate-800">
+                              {{ occ.endpoint }}
+                            </span>
+                            <span
+                              v-if="occ.masked"
+                              class="rounded bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] text-amber-300"
+                            >
+                              {{ occ.masked }}
+                            </span>
+                          </div>
+                          <p
+                            v-if="occ.context"
+                            class="rounded bg-slate-50 px-2 py-1 font-mono text-[11px] break-all text-slate-600"
+                          >
+                            {{ occ.context }}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- Fallback Sample Endpoints List -->
+                    <div
+                      v-else-if="getFindingSampleEndpoints(f).length > 1"
+                      class="flex flex-wrap items-center gap-1.5"
+                    >
+                      <span class="text-[11px] font-semibold text-slate-500">
+                        {{ t("sec.affectedEndpoints", { count: getFindingSampleEndpoints(f).length }) }}:
+                      </span>
+                      <span
+                        v-for="ep in getFindingSampleEndpoints(f)"
+                        :key="ep"
+                        class="rounded bg-white px-2 py-0.5 font-mono text-[11px] text-slate-700 ring-1 ring-slate-200"
+                      >
+                        {{ ep }}
+                      </span>
+                    </div>
+
                     <div
                       v-if="typeof f.evidence?.context === 'string' && f.evidence.context"
                       data-testid="finding-context-snippet"
@@ -1308,9 +1531,14 @@ onBeforeUnmount(() => {
                     >
                       {{ f.evidence.context }}
                     </div>
-                    <pre
-                      class="max-h-48 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-200"
-                    >{{ JSON.stringify(f.evidence, null, 2) }}</pre>
+                    <details class="text-xs">
+                      <summary class="cursor-pointer font-medium text-slate-500 hover:text-slate-800">
+                        {{ t("sec.rawEvidenceLabel") }}
+                      </summary>
+                      <pre
+                        class="mt-2 max-h-48 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-200"
+                      >{{ JSON.stringify(f.evidence, null, 2) }}</pre>
+                    </details>
                   </td>
                 </tr>
               </template>

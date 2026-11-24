@@ -1,5 +1,5 @@
 import { apiFetch } from "./client";
-import type { Run } from "./types";
+import type { DiscoveredPortal, Run } from "./types";
 
 export type ExploreMode = "passive" | "active";
 
@@ -89,6 +89,7 @@ export interface ExploreResult {
   merged_hosts?: string[];
   seed_hosts?: string[];
   explored_targets?: ExploredTargetResult[];
+  discovered_portals?: DiscoveredPortal[];
   discovered_endpoints: DiscoveredEndpoint[];
   openapi_docs_found: OpenApiDocFound[];
   spa_routes: string[];

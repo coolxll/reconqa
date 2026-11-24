@@ -34,11 +34,12 @@ import {
   type ExploreMode,
   type ExploreResult,
 } from "@/api/explore";
-import { listProjects, listTargets } from "@/api/projects";
-import type { Project, Target } from "@/api/types";
+import { discoverProjectPortals, listProjects, listTargets } from "@/api/projects";
+import type { DiscoveredPortal, Project, Target } from "@/api/types";
 import { useWorkspace } from "@/stores/workspace";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import MetricCard from "@/components/layout/MetricCard.vue";
+import DiscoveredPortalsPanel from "@/components/workspace/DiscoveredPortalsPanel.vue";
 import { useI18n } from "@/i18n";
 import "@/i18n/locales/explore";
 
@@ -85,6 +86,10 @@ const result = ref<ExploreResult | null>(null);
 // Project Multi-Portal Targets state
 const projectTargets = ref<Target[]>([]);
 const selectedPortalIds = ref<Set<string>>(new Set());
+const discoveringPortals = ref(false);
+const discoveredPortals = ref<DiscoveredPortal[] | null>(null);
+const discoveredRootDomain = ref("");
+const portalNotice = ref<string | null>(null);
 
 // Result explorer state
 const activeResultTab = ref<"endpoints" | "spa" | "assets" | "warnings">("endpoints");
@@ -348,6 +353,47 @@ function applyResult(res: ExploreResult): void {
   activeResultTab.value = "endpoints";
   expandedEndpointIds.value = new Set();
   selectedEndpointIds.value = new Set((res.discovered_endpoints ?? []).map((ep) => ep.id));
+  if (Array.isArray(res.discovered_portals) && res.discovered_portals.length > 0) {
+    discoveredPortals.value = res.discovered_portals;
+    discoveredRootDomain.value = res.seed?.root_domain || "";
+  }
+}
+
+async function handleDiscoverSiblingPortals(): Promise<void> {
+  if (!projectId.value || discoveringPortals.value) return;
+  discoveringPortals.value = true;
+  error.value = null;
+  portalNotice.value = null;
+  try {
+    const res = await discoverProjectPortals(projectId.value);
+    discoveredPortals.value = res.portals ?? [];
+    discoveredRootDomain.value = res.root_domain || "";
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : t("settings.target.errDiscover");
+  } finally {
+    discoveringPortals.value = false;
+  }
+}
+
+async function onBatchPortalsAdded(added: Target[], skipped: number): Promise<void> {
+  portalNotice.value = t("settings.target.batchAddedToast", {
+    added: added.length,
+    skipped,
+  });
+  if (projectId.value) {
+    try {
+      const fresh = await listTargets(projectId.value);
+      projectTargets.value = fresh;
+      const nextSel = new Set(selectedPortalIds.value);
+      for (const tItem of added) nextSel.add(tItem.id);
+      selectedPortalIds.value = nextSel;
+    } catch {
+      // ignore refresh failure
+    }
+  }
+  window.setTimeout(() => {
+    portalNotice.value = null;
+  }, 5000);
 }
 
 function loadSampleCurl(): void {
@@ -710,6 +756,23 @@ onMounted(async () => {
         <div class="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            data-testid="discover-portals-btn"
+            class="btn-secondary !px-3 !py-1.5 !text-xs"
+            :disabled="discoveringPortals || !projectId"
+            @click="handleDiscoverSiblingPortals"
+          >
+            <Loader2 v-if="discoveringPortals" class="h-3.5 w-3.5 animate-spin text-emerald-600" />
+            <Sparkles v-else class="h-3.5 w-3.5 text-emerald-600" />
+            <span>
+              {{
+                discoveringPortals
+                  ? t("explore.discoveringPortalsBtn")
+                  : t("explore.discoverPortalsBtn")
+              }}
+            </span>
+          </button>
+          <button
+            type="button"
             class="text-xs font-medium text-indigo-600 hover:underline"
             @click="selectAllPortals"
           >
@@ -767,7 +830,33 @@ onMounted(async () => {
           </span>
         </button>
       </div>
+
+      <div v-if="portalNotice" class="px-5 pb-3 text-xs font-medium text-emerald-700">
+        {{ portalNotice }}
+      </div>
+
+      <div v-if="discoveredPortals !== null && projectId" class="px-5 pb-4">
+        <DiscoveredPortalsPanel
+          :project-id="projectId"
+          :portals="discoveredPortals"
+          :existing-targets="projectTargets"
+          :root-domain="discoveredRootDomain"
+          @added="onBatchPortalsAdded"
+          @error="(msg) => (error = msg)"
+        />
+      </div>
     </div>
+
+    <!-- Discovered Portals Panel when project has 0 targets yet but explore returned discovered_portals -->
+    <DiscoveredPortalsPanel
+      v-else-if="discoveredPortals !== null && discoveredPortals.length > 0 && projectId"
+      :project-id="projectId"
+      :portals="discoveredPortals"
+      :existing-targets="projectTargets"
+      :root-domain="discoveredRootDomain"
+      @added="onBatchPortalsAdded"
+      @error="(msg) => (error = msg)"
+    />
 
     <!-- Seed Input Card -->
     <div class="card overflow-hidden">

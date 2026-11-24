@@ -19,11 +19,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from reconqa.config import settings
 from reconqa.models.db import get_db
-from reconqa.models.schemas import RunOut
+from reconqa.models.schemas import (
+    DiscoverPortalsRequest,
+    DiscoverPortalsResponse,
+    RunOut,
+)
 from reconqa.models.tables import Job, Project, Run, Target
 from reconqa.modules.discovery.seed_explorer import (
     _collect_merged_hosts,
     _registrable_root_domain,
+    discover_sibling_portals,
     explore_from_seed,
     extract_seed_root_domain,
     merge_explore_results,
@@ -45,6 +50,7 @@ class ExploreRequest(BaseModel):
     mode: Literal["passive", "active"] = "passive"
     probe_openapi_docs: bool = True
     crawl_js: bool = True
+    discover_portals: bool = True
     depth: int = 2
     merge: bool = True
     project_id: str | None = None
@@ -55,6 +61,7 @@ class ExploreAllTargetsRequest(BaseModel):
     mode: Literal["passive", "active"] = "passive"
     probe_openapi_docs: bool = True
     crawl_js: bool = True
+    discover_portals: bool = True
     depth: int = 2
     merge: bool = True
 
@@ -373,6 +380,7 @@ async def _run_batch_explore_urls(
     mode: str,
     probe_openapi_docs: bool,
     crawl_js: bool,
+    discover_portals: bool = True,
     depth: int,
     merge: bool,
     project_id: str | None,
@@ -381,7 +389,7 @@ async def _run_batch_explore_urls(
     sem = asyncio.Semaphore(2)
     per_url_out: list[tuple[str, Path | None, dict[str, Any] | None, str | None]] = []
 
-    async def _explore_one(u: str) -> tuple[str, Path | None, dict[str, Any] | None, str | None]:
+    async def _explore_one(idx: int, u: str) -> tuple[str, Path | None, dict[str, Any] | None, str | None]:
         async with sem:
             sid = uuid.uuid4().hex[:12]
             tdir = ensure_dir(_explores_root() / f"_tmp_{sid}")
@@ -393,6 +401,7 @@ async def _run_batch_explore_urls(
                     mode=mode,
                     probe_openapi_docs=probe_openapi_docs,
                     crawl_js=crawl_js,
+                    discover_portals=discover_portals and idx == 0,
                     depth=depth,
                     explore_id=sid,
                 )
@@ -403,7 +412,7 @@ async def _run_batch_explore_urls(
                 shutil.rmtree(tdir, ignore_errors=True)
                 return u, None, None, str(exc)
 
-    results = await asyncio.gather(*(_explore_one(u) for u in urls))
+    results = await asyncio.gather(*(_explore_one(i, u) for i, u in enumerate(urls)))
     per_url_out.extend(results)
 
     succeeded = [(u, tdir, res) for (u, tdir, res, err) in per_url_out if res is not None and tdir is not None]
@@ -488,6 +497,7 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
             mode=body.mode,
             probe_openapi_docs=body.probe_openapi_docs,
             crawl_js=body.crawl_js,
+            discover_portals=body.discover_portals,
             depth=body.depth,
             merge=body.merge,
             project_id=body.project_id,
@@ -506,6 +516,7 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
             mode=body.mode,
             probe_openapi_docs=body.probe_openapi_docs,
             crawl_js=body.crawl_js,
+            discover_portals=body.discover_portals,
             depth=body.depth,
             explore_id=scan_id,
         )
@@ -593,6 +604,7 @@ async def explore_all_project_targets(
         mode=body.mode,
         probe_openapi_docs=body.probe_openapi_docs,
         crawl_js=body.crawl_js,
+        discover_portals=body.discover_portals,
         depth=body.depth,
         merge=body.merge,
         project_id=project_id,
@@ -612,6 +624,38 @@ async def explore_all_project_targets(
     if dest_path.parent.is_dir():
         write_json(dest_path, merged_result)
     return merged_result
+
+
+@router.post(
+    "/projects/{project_id}/discover-portals",
+    response_model=DiscoverPortalsResponse,
+)
+async def discover_project_portals(
+    project_id: str,
+    body: DiscoverPortalsRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Discover live sibling environment portals from a seed URL or the project's first Target."""
+    project = await db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    seed_url = (body.seed_url or "").strip()
+    if not seed_url:
+        t_res = await db.execute(select(Target).where(Target.project_id == project_id))
+        first_target = t_res.scalars().first()
+        if first_target is not None:
+            seed_url = (first_target.base_url or "").strip()
+            if not seed_url and first_target.root_domain:
+                seed_url = f"https://{first_target.root_domain.strip()}"
+
+    if not seed_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide seed_url or configure at least one Target on this project.",
+        )
+
+    return await asyncio.to_thread(discover_sibling_portals, seed_url)
 
 
 @router.get("/explore")

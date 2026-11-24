@@ -82,15 +82,12 @@ watch(
 const activeProjectSubtitle = computed(() => {
   const count = activeProjectTargets.value.length;
   if (count > 1) {
-    const firstRoot = activeProjectTargets.value[0]?.root_domain || "";
-    return firstRoot
-      ? `${t("projOverview.portalsCount", { count })} · ${firstRoot}`
-      : t("projOverview.portalsCount", { count });
+    return t("projOverview.portalsCount", { count });
   }
   if (count === 1) {
-    return activeProjectTargets.value[0].root_domain || activeProject.value?.slug || "";
+    return activeProjectTargets.value[0].root_domain || "";
   }
-  return activeProject.value?.slug || t("ws.allProjects");
+  return "";
 });
 
 // Quick Create Project modal
@@ -322,7 +319,7 @@ onBeforeUnmount(() => {
             <div class="truncate text-xs font-semibold text-white">
               {{ activeProject?.name || t("ws.noProjectSelected") }}
             </div>
-            <div class="truncate font-mono text-[10px] text-slate-400">
+            <div v-if="activeProjectSubtitle" class="truncate font-mono text-[10px] text-slate-400">
               {{ activeProjectSubtitle }}
             </div>
           </div>
@@ -361,7 +358,6 @@ onBeforeUnmount(() => {
           >
             <div class="min-w-0">
               <div class="truncate font-medium">{{ proj.name }}</div>
-              <div class="truncate font-mono text-[10px] text-slate-400">{{ proj.slug }}</div>
             </div>
             <Check
               v-if="proj.id === activeProjectId"

@@ -118,6 +118,8 @@ registerMessages({
     "explore.multiUrlPlaceholder": "https://admin.example.com\nhttps://merchant.example.com\nhttps://api.example.com",
     "explore.mergedHostsLabel": "已合并门户域名 ({count})",
     "explore.historyHostsBadge": "{count} 个门户域名",
+    "explore.discoverPortalsBtn": "探测同环境存活门户",
+    "explore.discoveringPortalsBtn": "探测同环境门户中…",
   },
   en: {
     "explore.title": "Explore & Discovery Workbench",
@@ -240,5 +242,7 @@ registerMessages({
     "explore.multiUrlPlaceholder": "https://admin.example.com\nhttps://merchant.example.com\nhttps://api.example.com",
     "explore.mergedHostsLabel": "Merged Portal Hosts ({count})",
     "explore.historyHostsBadge": "{count} portal hosts",
+    "explore.discoverPortalsBtn": "Discover Sibling Portals",
+    "explore.discoveringPortalsBtn": "Discovering Portals…",
   },
 });

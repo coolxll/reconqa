@@ -4,6 +4,9 @@ import type {
   AcceptancePromptResponse,
   AuthProfile,
   AuthProfileCreate,
+  BatchTargetItem,
+  BatchTargetsResponse,
+  DiscoverPortalsResponse,
   ExecuteExternalToolRequest,
   ExecuteExternalToolResponse,
   ExtractCredentialRequest,
@@ -86,6 +89,32 @@ export function deleteTarget(
   return apiFetch<{ deleted: boolean; id: string }>(
     `/projects/${encodeURIComponent(projectId)}/targets/${encodeURIComponent(targetId)}`,
     { method: "DELETE" }
+  );
+}
+
+export function discoverProjectPortals(
+  projectId: string,
+  seedUrl?: string | null
+): Promise<DiscoverPortalsResponse> {
+  return apiFetch<DiscoverPortalsResponse>(
+    `/projects/${encodeURIComponent(projectId)}/discover-portals`,
+    {
+      method: "POST",
+      body: JSON.stringify(seedUrl ? { seed_url: seedUrl } : {}),
+    }
+  );
+}
+
+export function batchCreateTargets(
+  projectId: string,
+  targets: BatchTargetItem[]
+): Promise<BatchTargetsResponse> {
+  return apiFetch<BatchTargetsResponse>(
+    `/projects/${encodeURIComponent(projectId)}/targets/batch`,
+    {
+      method: "POST",
+      body: JSON.stringify({ targets }),
+    }
   );
 }
 

@@ -23,15 +23,17 @@ import {
   createTarget,
   deleteAuthProfile,
   deleteTarget,
+  discoverProjectPortals,
   extractCredentialFromHar,
   listAuthProfiles,
   listTargets,
   updateTarget,
   uploadStorageState,
 } from "@/api/projects";
-import type { AuthProfile, RoleTag, Target } from "@/api/types";
+import type { AuthProfile, DiscoveredPortal, RoleTag, Target } from "@/api/types";
 import StatusBadge from "@/components/layout/StatusBadge.vue";
 import EmptyState from "@/components/layout/EmptyState.vue";
+import DiscoveredPortalsPanel from "@/components/workspace/DiscoveredPortalsPanel.vue";
 import { useWorkspace } from "@/stores/workspace";
 import { useI18n } from "@/i18n";
 
@@ -84,6 +86,9 @@ const editTargetPortalLabel = ref("");
 const editTargetRootDomain = ref("");
 const editTargetBaseUrl = ref("");
 const savingTarget = ref(false);
+const discoveringPortals = ref(false);
+const discoveredPortals = ref<DiscoveredPortal[] | null>(null);
+const discoveredRootDomain = ref("");
 
 // Credentials form
 const ROLE_PRESETS = ["admin", "pharmacy", "doctor", "assistant", "account_a", "account_b", "guest"] as const;
@@ -207,6 +212,7 @@ async function loadDetails(): Promise<void> {
 
 watch(projectId, () => {
   confirmingDeleteProject.value = false;
+  discoveredPortals.value = null;
   void loadDetails();
 });
 
@@ -296,6 +302,29 @@ async function handleDeleteTarget(targetId: string): Promise<void> {
   } catch (err) {
     notifyError(err, t("projects.err.deleteTarget"));
   }
+}
+
+async function handleDiscoverPortals(): Promise<void> {
+  if (!projectId.value || discoveringPortals.value) return;
+  discoveringPortals.value = true;
+  bannerError.value = null;
+  try {
+    const res = await discoverProjectPortals(projectId.value);
+    discoveredPortals.value = res.portals ?? [];
+    discoveredRootDomain.value = res.root_domain || "";
+  } catch (err) {
+    notifyError(err, t("settings.target.errDiscover"));
+  } finally {
+    discoveringPortals.value = false;
+  }
+}
+
+function onSettingsPortalsAdded(added: Target[], skipped: number): void {
+  if (added.length > 0) {
+    const existingIds = new Set(targets.value.map((tItem) => tItem.id));
+    targets.value = [...targets.value, ...added.filter((a) => !existingIds.has(a.id))];
+  }
+  notifySuccess(t("settings.target.batchAddedToast", { added: added.length, skipped }));
 }
 
 async function handleAddAuthProfile(): Promise<void> {
@@ -538,6 +567,34 @@ onMounted(() => {
       <div class="card overflow-hidden">
         <div class="card-header">
           <h3 class="text-sm font-semibold text-slate-900">{{ t("projects.target.listTitle") }}</h3>
+          <button
+            type="button"
+            data-testid="settings-discover-portals-btn"
+            class="btn-secondary !px-3 !py-1.5 !text-xs"
+            :disabled="discoveringPortals || !projectId"
+            @click="handleDiscoverPortals"
+          >
+            <Loader2 v-if="discoveringPortals" class="h-3.5 w-3.5 animate-spin text-emerald-600" />
+            <Sparkles v-else class="h-3.5 w-3.5 text-emerald-600" />
+            <span>
+              {{
+                discoveringPortals
+                  ? t("settings.target.discoveringBtn")
+                  : t("settings.target.discoverBtn")
+              }}
+            </span>
+          </button>
+        </div>
+
+        <div v-if="discoveredPortals !== null && projectId" class="border-b border-slate-100 p-4">
+          <DiscoveredPortalsPanel
+            :project-id="projectId"
+            :portals="discoveredPortals"
+            :existing-targets="targets"
+            :root-domain="discoveredRootDomain"
+            @added="onSettingsPortalsAdded"
+            @error="(msg) => notifyError(new Error(msg), msg)"
+          />
         </div>
         <div v-if="loadingDetails" class="p-6 text-center text-xs text-slate-500">
           {{ t("projects.target.loading") }}

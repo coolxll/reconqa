@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
 import re
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -14,6 +17,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from reconqa.config import settings
 from reconqa.modules.discovery.runner import run_discovery
 from reconqa.modules.discovery.spa_parser import extract_spa_routes
 from reconqa.modules.recorder.js_extractor import extract_js_endpoints
@@ -628,6 +632,22 @@ def merge_explore_results(
     merged_project_id = incoming.get("project_id") or existing.get("project_id")
     merged_hosts = _collect_merged_hosts(existing, incoming)
 
+    merged_portals_by_host: dict[str, dict[str, Any]] = {}
+    for p in existing.get("discovered_portals") or []:
+        if isinstance(p, dict) and p.get("host"):
+            merged_portals_by_host[str(p["host"]).lower()] = dict(p)
+    for p in incoming.get("discovered_portals") or []:
+        if isinstance(p, dict) and p.get("host"):
+            merged_portals_by_host[str(p["host"]).lower()] = dict(p)
+    merged_portals = sorted(
+        merged_portals_by_host.values(),
+        key=lambda item: (
+            1 if item.get("is_api_gateway") else 0,
+            0 if item.get("status_code") == 200 else 1,
+            str(item.get("host") or ""),
+        ),
+    )
+
     merged_out: dict[str, Any] = {
         "explore_id": merged_id,
         "created_at": created_at,
@@ -647,6 +667,7 @@ def merge_explore_results(
         "scans_count": len(merged_scans),
         "scans": merged_scans,
         "discovered_endpoints": merged_endpoints,
+        "discovered_portals": merged_portals,
         "openapi_docs_found": merged_docs,
         "spa_routes": merged_spa_routes,
         "micro_frontends": merged_mfe,
@@ -697,6 +718,284 @@ def _collect_merged_hosts(*docs: dict[str, Any]) -> list[str]:
 
 def _extract_host_for_result(base_url: str, seed_url: str) -> list[str]:
     return _collect_merged_hosts({"seed": {"base_url": base_url, "seed_url": seed_url}})
+
+
+_ENV_SUFFIXES = ("-staging", "-stage", "-test", "-dev", "-uat", "-sit", "-pre", "-qa")
+
+_PORTAL_PREFIXES = (
+    "admin",
+    "api",
+    "app",
+    "portal",
+    "web",
+    "m",
+    "h5",
+    "ops",
+    "manage",
+    "console",
+    "merchant",
+    "seller",
+    "shop",
+    "mall",
+    "store",
+    "vendor",
+    "partner",
+    "doctor",
+    "patient",
+    "medicine",
+    "pharmacy",
+    "hospital",
+    "clinic",
+    "yz",
+    "kf",
+    "crm",
+    "erp",
+    "sso",
+)
+
+_FRIENDLY_PREFIX_LABELS: dict[str, str] = {
+    "admin": "管理后台",
+    "api": "API 网关",
+    "app": "App 端",
+    "portal": "门户",
+    "web": "Web 端",
+    "m": "移动端",
+    "h5": "H5 端",
+    "ops": "运维后台",
+    "manage": "管理端",
+    "console": "控制台",
+    "merchant": "商户端",
+    "seller": "卖家端",
+    "shop": "商城端",
+    "mall": "商城端",
+    "store": "门店端",
+    "vendor": "供应商端",
+    "partner": "合作伙伴端",
+    "doctor": "医生端",
+    "patient": "患者端",
+    "medicine": "药店端",
+    "pharmacy": "药店端",
+    "hospital": "医院端",
+    "clinic": "诊所端",
+    "yz": "医助端",
+    "kf": "客服端",
+    "crm": "CRM",
+    "erp": "ERP",
+    "sso": "单点登录",
+}
+
+_GENERIC_TITLES = {"document", "index", "home", "loading", "loading...", "vite app", "vue app", "react app", "404", "403", "401"}
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _detect_env_suffix(seed_host: str, root_domain: str) -> str:
+    if not seed_host or not root_domain or seed_host == root_domain:
+        return ""
+    if seed_host.endswith("." + root_domain):
+        sub = seed_host[: -(len(root_domain) + 1)]
+    else:
+        sub = seed_host.split(".", 1)[0]
+    first_label = sub.split(".", 1)[0].lower()
+    for suf in _ENV_SUFFIXES:
+        if first_label.endswith(suf) and len(first_label) > len(suf):
+            return suf
+    return ""
+
+
+def _build_portal_label(host: str, title: str, env_suffix: str) -> str:
+    clean_title = re.sub(r"\s+", " ", (title or "")).strip()
+    if clean_title and clean_title.lower() not in _GENERIC_TITLES and not clean_title.lower().startswith(("404 ", "403 ", "502 ", "nginx")):
+        return clean_title[:24]
+    first_label = (host or "").split(".", 1)[0].lower()
+    if env_suffix and first_label.endswith(env_suffix):
+        prefix = first_label[: -len(env_suffix)]
+    else:
+        prefix = first_label
+    return _FRIENDLY_PREFIX_LABELS.get(prefix, first_label or host)
+
+
+def _resolve_httpx_cli() -> str | None:
+    found = settings.resolve_bin("httpx")
+    if found:
+        return found
+    home_bin = Path.home() / ".reconqa" / "bin" / "httpx"
+    if home_bin.is_file() and os.access(home_bin, os.X_OK):
+        return str(home_bin.resolve())
+    return shutil.which("httpx")
+
+
+def _probe_portals_with_cli(
+    httpx_bin: str,
+    candidate_urls: list[str],
+    *,
+    timeout_sec: int,
+) -> list[dict[str, Any]]:
+    cmd = [
+        httpx_bin,
+        "-silent",
+        "-status-code",
+        "-title",
+        "-json",
+        "-timeout",
+        "4",
+        "-threads",
+        "20",
+    ]
+    proxy_val = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+        or ""
+    ).strip()
+    if proxy_val and proxy_val.startswith(("http://", "https://", "socks5://")):
+        cmd.extend(["-http-proxy", proxy_val])
+
+    stdin_payload = "\n".join(candidate_urls) + "\n"
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=stdin_payload,
+            capture_output=True,
+            text=True,
+            timeout=max(5, int(timeout_sec)),
+            check=False,
+        )
+    except Exception:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for line in (proc.stdout or "").splitlines():
+        s = line.strip()
+        if not s or not s.startswith("{"):
+            continue
+        try:
+            rec = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            rows.append(rec)
+    return rows
+
+
+def _probe_portals_with_python(
+    candidate_urls: list[str],
+    *,
+    timeout_sec: int,
+) -> list[dict[str, Any]]:
+    per_req_timeout = httpx.Timeout(min(4.0, float(timeout_sec)), connect=3.0)
+
+    def _check_one(u: str) -> dict[str, Any] | None:
+        try:
+            with httpx.Client(timeout=per_req_timeout, follow_redirects=True, verify=False) as client:
+                resp = client.get(u)
+                title = ""
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if "html" in ctype or "<title" in resp.text[:4096].lower():
+                    m = _HTML_TITLE_RE.search(resp.text[:16384])
+                    if m:
+                        title = re.sub(r"\s+", " ", m.group(1)).strip()
+                return {
+                    "url": str(resp.url),
+                    "input": u,
+                    "status_code": resp.status_code,
+                    "title": title,
+                }
+        except Exception:
+            return None
+
+    rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for res in pool.map(_check_one, candidate_urls):
+            if res is not None:
+                rows.append(res)
+    return rows
+
+
+def discover_sibling_portals(seed_url: str, timeout_sec: int = 12) -> dict[str, Any]:
+    """Probe ~28 high-signal sibling portal subdomains matching the seed host's environment suffix."""
+    raw = (seed_url or "").strip()
+    if raw and "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    seed_host = (parsed.hostname or "").lower()
+    if not seed_host or _is_loopback(seed_host):
+        return {"root_domain": seed_host, "env_suffix": "", "portals": []}
+    try:
+        ipaddress.ip_address(seed_host)
+        return {"root_domain": seed_host, "env_suffix": "", "portals": []}
+    except ValueError:
+        pass
+
+    root_domain = _registrable_root_domain(seed_host)
+    if not root_domain or "." not in root_domain:
+        return {"root_domain": root_domain or seed_host, "env_suffix": "", "portals": []}
+
+    env_suffix = _detect_env_suffix(seed_host, root_domain)
+    candidate_hosts: list[str] = []
+    seen_hosts: set[str] = set()
+    for prefix in _PORTAL_PREFIXES:
+        h = f"{prefix}{env_suffix}.{root_domain}"
+        if h not in seen_hosts:
+            seen_hosts.add(h)
+            candidate_hosts.append(h)
+    if seed_host not in seen_hosts:
+        candidate_hosts.insert(0, seed_host)
+
+    candidate_urls = [f"https://{h}" for h in candidate_hosts]
+    httpx_bin = _resolve_httpx_cli()
+    if httpx_bin:
+        raw_rows = _probe_portals_with_cli(httpx_bin, candidate_urls, timeout_sec=timeout_sec)
+    else:
+        raw_rows = _probe_portals_with_python(candidate_urls, timeout_sec=timeout_sec)
+
+    portals_by_host: dict[str, dict[str, Any]] = {}
+    for rec in raw_rows:
+        raw_url = str(rec.get("input") or rec.get("url") or "").strip()
+        if not raw_url:
+            continue
+        p = urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+        host = (p.hostname or str(rec.get("host") or "")).strip().lower()
+        if not host:
+            continue
+        status_raw = rec.get("status_code") if rec.get("status_code") is not None else rec.get("status-code")
+        try:
+            status_code = int(status_raw) if status_raw is not None else 0
+        except (TypeError, ValueError):
+            status_code = 0
+
+        if status_code <= 0 or status_code >= 500:
+            continue
+
+        first_label = host.split(".", 1)[0].lower()
+        is_api_gw = first_label == "api" or first_label.startswith("api-")
+        if not (200 <= status_code <= 403 or (status_code == 404 and is_api_gw)):
+            continue
+
+        title = re.sub(r"\s+", " ", str(rec.get("title") or "")).strip()[:120]
+        canonical_url = f"https://{host}"
+        portals_by_host[host] = {
+            "host": host,
+            "url": canonical_url,
+            "status_code": status_code,
+            "title": title,
+            "is_api_gateway": is_api_gw,
+            "suggested_label": _build_portal_label(host, title, env_suffix),
+        }
+
+    portals = sorted(
+        portals_by_host.values(),
+        key=lambda item: (
+            1 if item["is_api_gateway"] else 0,
+            0 if item["status_code"] == 200 else 1,
+            item["host"],
+        ),
+    )
+    return {
+        "root_domain": root_domain,
+        "env_suffix": env_suffix,
+        "portals": portals,
+    }
 
 
 def _probe_openapi_on_origin(
@@ -814,6 +1113,7 @@ def explore_from_seed(
     mode: str = "passive",
     probe_openapi_docs: bool = True,
     crawl_js: bool = True,
+    discover_portals: bool = True,
     depth: int = 2,
     timeout: int = 30,
     explore_id: str | None = None,
@@ -1203,6 +1503,14 @@ def explore_from_seed(
         except Exception as exc:
             warnings.append(f"Optional PD discovery step failed: {exc}")
 
+    discovered_portals: list[dict[str, Any]] = []
+    if discover_portals and not loopback and base_url:
+        try:
+            portal_res = discover_sibling_portals(base_url, timeout_sec=min(timeout, 12))
+            discovered_portals = list(portal_res.get("portals") or [])
+        except Exception as exc:
+            warnings.append(f"Sibling portal discovery skipped: {exc}")
+
     subdomains = sorted(subdomains_set)
     discovered_endpoints = sorted(
         endpoints_bucket.values(),
@@ -1247,6 +1555,7 @@ def explore_from_seed(
             }
         ],
         "discovered_endpoints": discovered_endpoints,
+        "discovered_portals": discovered_portals,
         "openapi_docs_found": openapi_docs_found,
         "spa_routes": spa_routes,
         "micro_frontends": micro_frontends,

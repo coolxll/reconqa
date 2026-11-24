@@ -668,3 +668,124 @@ async def test_worker_monotonic_job_state_and_startup_self_heal(
 
     if db_mod._engine is not None:
         await db_mod._engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_worker_reconciles_orphaned_running_runs_and_unblocks_sse_on_shutdown(
+    fixtures_har_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify #192: orphaned running/queued runs self-heal on startup & stop() unblocks SSE streams."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "orphan_recovery.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+
+    from sqlalchemy import select
+
+    from reconqa.models import db as db_mod
+    from reconqa.models.tables import Job, Project, Run
+    from reconqa.server.worker import InProcessTaskRunner
+
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+    await db_mod.init_db()
+
+    # 1. Seed an orphaned running Run (merge=completed, perf=queued) + an orphaned running Run with all jobs completed
+    session_factory = db_mod.get_session_factory()
+    orphan_ws = ws_dir / "runs" / "orphan_run_1"
+    orphan_har_dir = orphan_ws / "har"
+    orphan_har_dir.mkdir(parents=True, exist_ok=True)
+    for har_src in sorted(fixtures_har_dir.glob("*.har")):
+        (orphan_har_dir / har_src.name).write_bytes(har_src.read_bytes())
+
+    async with session_factory() as session:
+        proj = Project(slug="orphan-proj", name="Orphan Proj")
+        session.add(proj)
+        await session.flush()
+
+        run_orphan = Run(
+            project_id=proj.id,
+            status="running",
+            trigger_source="web",
+            workspace_dir=str(orphan_ws),
+            config_snapshot={"modules": ["merge", "perf"], "pending_modules": ["perf"]},
+        )
+        run_done_jobs = Run(
+            project_id=proj.id,
+            status="running",
+            trigger_source="web",
+            workspace_dir=str(ws_dir / "runs" / "orphan_run_2"),
+            config_snapshot={"modules": ["merge"]},
+        )
+        session.add_all([run_orphan, run_done_jobs])
+        await session.flush()
+        orphan_id = run_orphan.id
+        done_jobs_id = run_done_jobs.id
+
+        session.add_all(
+            [
+                Job(run_id=orphan_id, module="merge", status="completed"),
+                Job(run_id=orphan_id, module="perf", status="queued"),
+                Job(run_id=done_jobs_id, module="merge", status="completed"),
+            ]
+        )
+        await session.commit()
+
+    # 2. Test runner.stop() immediately unblocks active subscribe_events() with server_shutdown
+    runner = InProcessTaskRunner()
+    await runner.start()
+    received_events: list[dict] = []
+
+    async def _listen() -> None:
+        async for ev in runner.subscribe_events(orphan_id):
+            received_events.append(ev)
+
+    listener_task = asyncio.create_task(_listen())
+    await asyncio.sleep(0.05)
+    await runner.stop()
+    await asyncio.wait_for(listener_task, timeout=1.5)
+    assert any(ev.get("event") == "server_shutdown" for ev in received_events), received_events
+
+    # 3. Verify startup reconciliation healed BOTH runs cleanly
+    async with session_factory() as session:
+        healed_orphan = await session.get(Run, orphan_id)
+        healed_done = await session.get(Run, done_jobs_id)
+        assert healed_orphan is not None and healed_done is not None
+        assert healed_orphan.status == "failed"
+        assert "pending_modules" not in (healed_orphan.config_snapshot or {})
+        assert healed_done.status == "completed"
+
+        perf_job = (
+            await session.execute(
+                select(Job).where(Job.run_id == orphan_id, Job.module == "perf")
+            )
+        ).scalar_one()
+        assert perf_job.status == "failed"
+        assert "Interrupted by server restart" in str((perf_job.output_meta or {}).get("error") or "")
+
+    # 4. Verify POST /runs/{id}/execute-modules immediately succeeds (not 409!) and finishes perf
+    from reconqa.server.app import create_app
+
+    fastapi_app = create_app()
+    async with fastapi_app.router.lifespan_context(fastapi_app):
+        transport = httpx.ASGITransport(app=fastapi_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            r_exec = await client.post(
+                f"/api/v1/runs/{orphan_id}/execute-modules",
+                json={"modules": ["perf"]},
+            )
+            assert r_exec.status_code == 200, r_exec.text
+
+            final_run: dict = {}
+            for _ in range(100):
+                final_run = (await client.get(f"/api/v1/runs/{orphan_id}")).json()
+                if final_run["status"] in ("completed", "failed"):
+                    break
+                await asyncio.sleep(0.05)
+            assert final_run["status"] == "completed", final_run
+            job_map = {j["module"]: j["status"] for j in final_run["jobs"]}
+            assert job_map["perf"] == "completed", job_map
+
+    if db_mod._engine is not None:
+        await db_mod._engine.dispose()

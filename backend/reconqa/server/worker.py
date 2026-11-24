@@ -49,22 +49,64 @@ class InProcessTaskRunner:
         self._db_lock: asyncio.Lock = asyncio.Lock()
 
     async def _reconcile_inconsistent_jobs(self) -> int:
-        """Self-heal any completed runs whose child jobs were left stuck in running state."""
+        """Self-heal inconsistent completed runs and orphaned running/queued runs on fresh startup."""
         reconciled = 0
         try:
             async with self._db_lock:
                 session_factory = get_session_factory()
                 async with session_factory() as session:
+                    now = _utcnow()
+
+                    # 1. Completed runs whose child jobs were left in running/queued state
                     res = await session.execute(
                         select(Job, Run)
                         .join(Run, Job.run_id == Run.id)
-                        .where(Run.status == "completed", Job.status == "running")
+                        .where(
+                            Run.status == "completed",
+                            Job.status.in_(("running", "queued")),
+                        )
                     )
-                    now = _utcnow()
                     for job, run in res.all():
                         job.status = "completed"
                         job.finished_at = job.finished_at or run.finished_at or now
                         reconciled += 1
+
+                    # 2. Orphaned in-flight runs (fresh startup has an empty in-memory queue)
+                    orphan_runs_res = await session.execute(
+                        select(Run).where(Run.status.in_(("running", "queued")))
+                    )
+                    for run in orphan_runs_res.scalars().all():
+                        jobs_res = await session.execute(
+                            select(Job).where(Job.run_id == run.id)
+                        )
+                        child_jobs = list(jobs_res.scalars().all())
+
+                        cfg_snap = dict(run.config_snapshot or {})
+                        cfg_snap.pop("pending_modules", None)
+                        run.config_snapshot = cfg_snap
+
+                        if child_jobs and all(j.status == "completed" for j in child_jobs):
+                            run.status = "completed"
+                            run.finished_at = run.finished_at or now
+                        else:
+                            for job in child_jobs:
+                                if job.status in {"running", "queued"}:
+                                    job.status = "failed"
+                                    job.finished_at = now
+                                    meta = dict(job.output_meta or {})
+                                    meta["error"] = (
+                                        "Interrupted by server restart — please re-run this module"
+                                    )
+                                    job.output_meta = meta
+                            run.status = "failed"
+                            run.finished_at = now
+                            metrics = dict(run.summary_metrics or {})
+                            metrics["error"] = (
+                                "Interrupted by server restart — please re-run incomplete module(s)"
+                            )
+                            run.summary_metrics = metrics
+                        reconciled += 1
+
                     if reconciled:
                         await session.commit()
         except SQLAlchemyError:
@@ -81,6 +123,22 @@ class InProcessTaskRunner:
 
     async def stop(self) -> None:
         self._running = False
+        shutdown_event = {
+            "event": "server_shutdown",
+            "timestamp": _utcnow().isoformat(),
+        }
+        for sub_set in list(self._subscribers.values()):
+            for sub_q in list(sub_set):
+                if sub_q.full():
+                    try:
+                        sub_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                try:
+                    sub_q.put_nowait(shutdown_event)
+                except asyncio.QueueFull:
+                    pass
+
         if self._worker_task is not None:
             self._worker_task.cancel()
             try:
@@ -129,7 +187,7 @@ class InProcessTaskRunner:
             while True:
                 event = await sub_q.get()
                 yield event
-                if event.get("event") in {"run_completed", "run_failed"}:
+                if event.get("event") in {"run_completed", "run_failed", "server_shutdown"}:
                     break
         finally:
             self._subscribers[run_id].discard(sub_q)

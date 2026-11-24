@@ -25,6 +25,8 @@ from reconqa.models.db import get_db
 from reconqa.models.schemas import (
     AuthProfileCreate,
     AuthProfileOut,
+    BatchTargetsCreateRequest,
+    BatchTargetsCreateResponse,
     KnowledgeDocCreate,
     KnowledgeDocOut,
     KnowledgeDocUpdate,
@@ -215,6 +217,60 @@ async def update_target(
     await db.commit()
     await db.refresh(target)
     return target
+
+
+@router.post(
+    "/projects/{project_id}/targets/batch",
+    response_model=BatchTargetsCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def batch_create_targets(
+    project_id: str,
+    body: BatchTargetsCreateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Idempotently add multiple portal Targets to a project, skipping duplicate base_urls."""
+    await _get_project_or_404(db, project_id)
+    existing_res = await db.execute(select(Target).where(Target.project_id == project_id))
+    seen_urls = {
+        (t.base_url or "").strip().rstrip("/").lower()
+        for t in existing_res.scalars().all()
+        if (t.base_url or "").strip()
+    }
+
+    added: list[Target] = []
+    skipped = 0
+    for item in body.targets:
+        raw_url = (item.base_url or "").strip()
+        if not raw_url:
+            skipped += 1
+            continue
+        if "://" not in raw_url:
+            raw_url = f"https://{raw_url}"
+        norm_key = raw_url.rstrip("/").lower()
+        if norm_key in seen_urls:
+            skipped += 1
+            continue
+        seen_urls.add(norm_key)
+        root_dom = (item.root_domain or "").strip() or (urlparse(raw_url).hostname or "")
+        rules: dict[str, Any] = {}
+        if item.portal_label and item.portal_label.strip():
+            rules["portal_label"] = item.portal_label.strip()
+        tgt = Target(
+            project_id=project_id,
+            root_domain=root_dom,
+            base_url=raw_url.rstrip("/"),
+            scope_rules=rules,
+        )
+        db.add(tgt)
+        added.append(tgt)
+
+    if added:
+        await db.commit()
+        for tgt in added:
+            await db.refresh(tgt)
+
+    return {"added": added, "skipped": skipped}
 
 
 @router.delete("/projects/{project_id}/targets/{target_id}")

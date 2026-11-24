@@ -41,6 +41,32 @@ export interface TargetUpdate {
   scope_rules?: Record<string, unknown>;
 }
 
+export interface DiscoveredPortal {
+  host: string;
+  url: string;
+  status_code: number;
+  title: string;
+  is_api_gateway: boolean;
+  suggested_label: string;
+}
+
+export interface DiscoverPortalsResponse {
+  root_domain: string;
+  env_suffix: string;
+  portals: DiscoveredPortal[];
+}
+
+export interface BatchTargetItem {
+  root_domain: string;
+  base_url: string;
+  portal_label?: string;
+}
+
+export interface BatchTargetsResponse {
+  added: Target[];
+  skipped: number;
+}
+
 export interface AuthProfile {
   id: string;
   project_id: string;

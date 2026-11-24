@@ -13,6 +13,7 @@ import {
   Gauge,
   GitBranch,
   Globe,
+  HelpCircle,
   RefreshCw,
   Settings,
   ShieldCheck,
@@ -60,6 +61,16 @@ const loading = ref(true);
 const doctorLoading = ref(true);
 const error = ref<string | null>(null);
 const acceptancePromptOpen = ref(false);
+const pillarsManualToggle = ref<boolean | null>(null);
+
+const showPillars = computed(() => {
+  if (pillarsManualToggle.value !== null) return pillarsManualToggle.value;
+  return runs.value.length === 0;
+});
+
+function togglePillars(): void {
+  pillarsManualToggle.value = !showPillars.value;
+}
 
 const inventory = ref<ProjectInventoryResponse | null>(null);
 const scenarioSummary = ref<ScenarioListResponse | null>(null);
@@ -249,6 +260,7 @@ async function refreshAll(): Promise<void> {
 }
 
 watch(projectId, (pid) => {
+  pillarsManualToggle.value = null;
   void loadProjectWorkspace(pid);
 });
 
@@ -283,15 +295,12 @@ onMounted(async () => {
         class="relative overflow-hidden rounded-2xl border border-slate-800 bg-gradient-to-br from-slate-900 via-slate-900 to-indigo-950 p-6 text-white shadow-md"
         data-testid="project-overview-hero"
       >
-        <!-- Top Row: Clean Title + Description on Left, 3 Focused Primary Actions on Right -->
-        <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-          <div class="min-w-0 flex-1 space-y-1.5">
-            <h2 class="text-2xl font-bold tracking-tight text-white">
+        <!-- Top Row: Clean Title on Left, 3 Focused Primary Actions + How It Works toggle on Right -->
+        <div class="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div class="min-w-0 flex-1">
+            <h2 class="truncate text-2xl font-bold tracking-tight text-white">
               {{ activeProject?.name || t("overview.heroTitle") }}
             </h2>
-            <p class="max-w-3xl text-sm leading-relaxed text-slate-300">
-              {{ activeProject?.description || t("overview.heroDesc") }}
-            </p>
           </div>
 
           <div class="flex shrink-0 flex-wrap items-center gap-2">
@@ -320,6 +329,20 @@ onMounted(async () => {
               <Compass class="h-4 w-4 shrink-0 text-sky-300" />
               <span>{{ t("overview.ctaExplore") }}</span>
             </router-link>
+            <button
+              type="button"
+              data-testid="overview-pillars-toggle"
+              class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border px-2.5 py-2 text-xs font-medium transition"
+              :class="
+                showPillars
+                  ? 'border-indigo-400/50 bg-indigo-500/20 text-indigo-100'
+                  : 'border-slate-700 bg-slate-800/80 text-slate-300 hover:bg-slate-700 hover:text-white'
+              "
+              @click="togglePillars"
+            >
+              <HelpCircle class="h-3.5 w-3.5 shrink-0" />
+              <span>{{ t("projOverview.howItWorks") }}</span>
+            </button>
             <router-link
               :to="workspacePath('settings', projectId)"
               class="inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-800/80 p-2 text-slate-300 transition hover:bg-slate-700 hover:text-white"
@@ -366,8 +389,12 @@ onMounted(async () => {
           </router-link>
         </div>
 
-        <!-- Visual User Journey: Input -> Hub -> 3 Core Capabilities -->
-        <div class="mt-6 grid grid-cols-1 gap-3 border-t border-slate-800/80 pt-5 lg:grid-cols-12">
+        <!-- Visual User Journey: Input -> Hub -> 3 Core Capabilities (auto-collapsed once runs > 0) -->
+        <div
+          v-if="showPillars"
+          data-testid="overview-pillars-panel"
+          class="mt-5 grid grid-cols-1 gap-3 border-t border-slate-800/80 pt-5 lg:grid-cols-12"
+        >
           <div class="rounded-xl border border-slate-700/80 bg-slate-800/60 p-4 lg:col-span-3">
             <div class="flex items-center justify-between">
               <span class="font-mono text-[10px] font-bold uppercase tracking-wider text-sky-300">

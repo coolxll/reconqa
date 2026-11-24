@@ -263,21 +263,54 @@ def analyze_har_performance(
                 }
             )
 
+    large_by_ep: dict[tuple[str, str], dict[str, Any]] = {}
     for r in large_body_alerts:
+        lkey = (r["method"], r["path"])
+        agg = large_by_ep.get(lkey)
+        if agg is None:
+            large_by_ep[lkey] = {
+                "method": r["method"],
+                "path": r["path"],
+                "url": r["url"],
+                "max_size_bytes": r["size_bytes"],
+                "mime_type": r["mime_type"],
+                "scenarios": [r["scenario"]],
+                "occurrence_count": 1,
+            }
+        else:
+            agg["occurrence_count"] += 1
+            if r["size_bytes"] > agg["max_size_bytes"]:
+                agg["max_size_bytes"] = r["size_bytes"]
+                agg["url"] = r["url"]
+            if r["scenario"] not in agg["scenarios"]:
+                agg["scenarios"].append(r["scenario"])
+
+    for agg in large_by_ep.values():
+        sc_list = agg["scenarios"]
+        ep_label = f"{agg['method']} {agg['path']}"
+        if len(sc_list) > 1:
+            title_str = (
+                f"Large response payload ({agg['max_size_bytes'] / 1024:.1f}KB across "
+                f"{len(sc_list)} scenarios) on {ep_label}"
+            )
+        else:
+            title_str = (
+                f"Large response payload ({agg['max_size_bytes'] / 1024:.1f}KB) on {ep_label}"
+            )
         findings.append(
             {
                 "category": "perf_large_body",
                 "severity": "medium",
-                "endpoint": f"{r['method']} {r['path']}",
-                "title": (
-                    f"Large response payload ({r['size_bytes'] / 1024:.1f}KB) "
-                    f"on {r['method']} {r['path']}"
-                ),
+                "endpoint": ep_label,
+                "title": title_str,
                 "evidence": {
-                    "scenario": r["scenario"],
-                    "url": r["url"],
-                    "size_bytes": r["size_bytes"],
-                    "mime_type": r["mime_type"],
+                    "scenario": sc_list[0],
+                    "scenarios": sc_list,
+                    "affected_scenarios_count": len(sc_list),
+                    "occurrence_count": agg["occurrence_count"],
+                    "url": agg["url"],
+                    "size_bytes": agg["max_size_bytes"],
+                    "mime_type": agg["mime_type"],
                     "threshold_bytes": large_body_bytes,
                 },
             }
@@ -297,19 +330,53 @@ def analyze_har_performance(
             }
         )
 
+    dup_by_ep: dict[tuple[str, str], dict[str, Any]] = {}
     for d in duplicates:
-        sev = "medium" if d["count"] >= 3 else "low"
         parsed_u = urlparse(d["url"])
+        ep_path = parsed_u.path or "/"
+        dkey = (d["method"], ep_path)
+        agg = dup_by_ep.get(dkey)
+        if agg is None:
+            dup_by_ep[dkey] = {
+                "method": d["method"],
+                "path": ep_path,
+                "url": d["url"],
+                "total_duplicate_calls": int(d["count"]),
+                "max_count": int(d["count"]),
+                "scenarios": [d["scenario"]],
+            }
+        else:
+            agg["total_duplicate_calls"] += int(d["count"])
+            agg["max_count"] = max(agg["max_count"], int(d["count"]))
+            if d["scenario"] not in agg["scenarios"]:
+                agg["scenarios"].append(d["scenario"])
+
+    for agg in sorted(dup_by_ep.values(), key=lambda x: -x["total_duplicate_calls"]):
+        sc_list = agg["scenarios"]
+        total_calls = agg["total_duplicate_calls"]
+        sev = "medium" if (agg["max_count"] >= 3 or total_calls >= 5) else "low"
+        ep_label = f"{agg['method']} {agg['path']}"
+        if len(sc_list) > 1:
+            title_str = (
+                f"Duplicate request ({total_calls}x across {len(sc_list)} scenarios): {ep_label}"
+            )
+        else:
+            title_str = f"Duplicate request ({total_calls}x in {sc_list[0]}): {ep_label}"
         findings.append(
             {
                 "category": "perf_duplicate_request",
                 "severity": sev,
-                "endpoint": f"{d['method']} {parsed_u.path or '/'}",
-                "title": (
-                    f"Duplicate request ({d['count']}x in {d['scenario']}): "
-                    f"{d['method']} {parsed_u.path or '/'}"
-                ),
-                "evidence": d,
+                "endpoint": ep_label,
+                "title": title_str,
+                "evidence": {
+                    "method": agg["method"],
+                    "path": agg["path"],
+                    "url": agg["url"],
+                    "count": total_calls,
+                    "total_duplicate_calls": total_calls,
+                    "affected_scenarios_count": len(sc_list),
+                    "scenarios": sc_list,
+                },
             }
         )
 

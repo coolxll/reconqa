@@ -115,7 +115,13 @@ def test_static_audit_signal_to_noise_dedup_vendor_and_pem_body(
     assert isinstance(ctx, str) and len(ctx) > 0, f"Expected non-empty redacted context: {pem_findings[0]}"
     assert "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5" not in ctx, "Raw PEM body leaked into context!"
 
-    dup_ctx = dup_ip_findings[0].get("evidence", {}).get("context", "")
+    dup_occs = [
+        o
+        for o in dup_ip_findings[0].get("evidence", {}).get("occurrences", [])
+        if "app.dup.js" in str(o.get("endpoint", ""))
+    ]
+    assert len(dup_occs) == 1, f"Expected deduplicated 1 occurrence for app.dup.js, got {dup_occs}"
+    dup_ctx = dup_occs[0].get("context", "")
     assert "internalDb" in dup_ctx, f"Expected surrounding key 'internalDb' in context, got: {dup_ctx!r}"
 
 
@@ -287,3 +293,160 @@ def test_k6_generator_and_proxy_pool(fixtures_har_dir: Path, tmp_path: Path) -> 
         await pool.stop()
 
     asyncio.run(_start_stop())
+
+
+def test_static_audit_cors_skips_same_root_and_aggregates_by_host(tmp_path: Path) -> None:
+    """Verify #183: same-root-domain CORS with credentials produces 0 findings; cross-domain aggregates by host."""
+    har_dir = tmp_path / "har_cors"
+    har_dir.mkdir(parents=True, exist_ok=True)
+
+    def _entry(url: str, origin: str, acao: str, acac: str) -> dict:
+        return {
+            "request": {
+                "method": "GET",
+                "url": url,
+                "headers": [{"name": "Origin", "value": origin}],
+            },
+            "response": {
+                "status": 200,
+                "headers": [
+                    {"name": "Access-Control-Allow-Origin", "value": acao},
+                    {"name": "Access-Control-Allow-Credentials", "value": acac},
+                    {"name": "Content-Type", "value": "application/json"},
+                ],
+                "content": {"mimeType": "application/json", "text": '{"code":0}'},
+            },
+        }
+
+    # 1. Same registrable root domain (including two-part TLD .com.cn) -> MUST yield 0 CORS findings
+    same_root_har = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                _entry(
+                    "https://api-stage.example.com/api/v1/orders",
+                    "https://admin-stage.example.com",
+                    "https://admin-stage.example.com",
+                    "true",
+                ),
+                _entry(
+                    "https://api-stage.example.com/api/v1/users",
+                    "https://doctor-stage.example.com",
+                    "https://doctor-stage.example.com",
+                    "true",
+                ),
+                _entry(
+                    "https://api.portal.example.com.cn/v1/status",
+                    "https://admin.portal.example.com.cn",
+                    "https://admin.portal.example.com.cn",
+                    "true",
+                ),
+            ],
+        }
+    }
+    (har_dir / "same_root.har").write_text(json.dumps(same_root_har), encoding="utf-8")
+
+    rep_clean = run_static_audit(har_dir, tmp_path / "sec_clean")
+    cors_clean = [f for f in rep_clean["findings"] if f.get("category") == "cors"]
+    assert cors_clean == [], f"Same-root-domain CORS should produce 0 findings, got {cors_clean}"
+    assert rep_clean["cors_issues"] == []
+
+    # 2. Cross-domain reflected origin with credentials across 3 endpoints -> 1 aggregated high finding!
+    cross_dir = tmp_path / "har_cross"
+    cross_dir.mkdir(parents=True, exist_ok=True)
+    cross_har = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                _entry(
+                    f"https://api.example.com/api/v1/ep{i}",
+                    "https://evil-attacker.test",
+                    "https://evil-attacker.test",
+                    "true",
+                )
+                for i in (1, 2, 3)
+            ],
+        }
+    }
+    (cross_dir / "cross.har").write_text(json.dumps(cross_har), encoding="utf-8")
+
+    rep_cross = run_static_audit(cross_dir, tmp_path / "sec_cross")
+    cors_findings = [f for f in rep_cross["findings"] if f.get("category") == "cors"]
+    assert len(cors_findings) == 1, f"Expected 1 host-aggregated CORS finding, got {cors_findings}"
+    assert cors_findings[0]["severity"] == "high"
+    ev = cors_findings[0]["evidence"]
+    assert ev["kind"] == "reflected_origin_with_credentials"
+    assert ev["affected_endpoints_count"] == 3
+    assert len(ev["sample_endpoints"]) == 3
+
+
+def test_security_and_perf_findings_aggregation_no_spam(tmp_path: Path) -> None:
+    """Verify #185: 3 endpoints with cn_mobile -> 1 sensitive_leak finding; duplicates across 2 scenarios -> 1 finding."""
+    # 1. Security sensitive_leak aggregation across 3 endpoints
+    sec_har_dir = tmp_path / "har_leaks"
+    sec_har_dir.mkdir(parents=True, exist_ok=True)
+    leak_har = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                {
+                    "request": {"method": "GET", "url": f"https://api.example.com/api/v1/users/{i}"},
+                    "response": {
+                        "status": 200,
+                        "headers": [{"name": "Content-Type", "value": "application/json"}],
+                        "content": {
+                            "mimeType": "application/json",
+                            "text": json.dumps({"phone": f"1380013800{i}"}),
+                        },
+                    },
+                }
+                for i in (1, 2, 3)
+            ],
+        }
+    }
+    (sec_har_dir / "01_users.har").write_text(json.dumps(leak_har), encoding="utf-8")
+
+    sec_rep = run_static_audit(sec_har_dir, tmp_path / "sec_agg")
+    mobile_findings = [
+        f
+        for f in sec_rep["findings"]
+        if f.get("category") == "sensitive_leak"
+        and f.get("evidence", {}).get("kind") == "cn_mobile"
+    ]
+    assert len(mobile_findings) == 1, f"Expected 1 aggregated cn_mobile finding, got {mobile_findings}"
+    ev = mobile_findings[0]["evidence"]
+    assert ev["affected_endpoints_count"] == 3
+    assert ev["occurrence_count"] == 3
+    assert len(ev["sample_endpoints"]) == 3
+    assert len(ev["occurrences"]) == 3
+
+    # 2. Performance duplicate_request aggregation across 2 scenarios
+    perf_har_dir = tmp_path / "har_perf_agg"
+    perf_har_dir.mkdir(parents=True, exist_ok=True)
+    for sc_name in ("01_home", "02_orders"):
+        dup_entries = [
+            {
+                "request": {"method": "GET", "url": "https://api.example.com/system/p/my-info"},
+                "response": {
+                    "status": 200,
+                    "headers": [{"name": "Content-Type", "value": "application/json"}],
+                    "content": {"size": 120, "mimeType": "application/json", "text": '{"ok":true}'},
+                },
+                "timings": {"send": 1, "wait": 25, "receive": 2},
+            }
+            for _ in range(2)
+        ]
+        (perf_har_dir / f"{sc_name}.har").write_text(
+            json.dumps({"log": {"version": "1.2", "entries": dup_entries}}),
+            encoding="utf-8",
+        )
+
+    perf_rep = analyze_har_performance(perf_har_dir, tmp_path / "perf_agg")
+    dup_findings = [
+        f for f in perf_rep["findings"] if f.get("category") == "perf_duplicate_request"
+    ]
+    assert len(dup_findings) == 1, f"Expected 1 aggregated duplicate finding, got {dup_findings}"
+    pev = dup_findings[0]["evidence"]
+    assert pev["affected_scenarios_count"] == 2
+    assert pev["total_duplicate_calls"] == 4
+    assert set(pev["scenarios"]) == {"01_home", "02_orders"}
