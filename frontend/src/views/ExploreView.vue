@@ -4,6 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import {
   AlertTriangle,
   ArrowRight,
+  Check,
   ChevronDown,
   ChevronRight,
   Compass,
@@ -23,6 +24,7 @@ import {
 } from "lucide-vue-next";
 import {
   deleteExplore,
+  exploreAllProjectTargets,
   getExplore,
   listExplores,
   promoteExploreToRun,
@@ -32,8 +34,8 @@ import {
   type ExploreMode,
   type ExploreResult,
 } from "@/api/explore";
-import { listProjects } from "@/api/projects";
-import type { Project } from "@/api/types";
+import { listProjects, listTargets } from "@/api/projects";
+import type { Project, Target } from "@/api/types";
 import { useWorkspace } from "@/stores/workspace";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import MetricCard from "@/components/layout/MetricCard.vue";
@@ -70,6 +72,7 @@ const depth = ref(2);
 
 // Execution & history state
 const running = ref(false);
+const runningPortals = ref(false);
 const loadingHistory = ref(false);
 const deleting = ref(false);
 const confirmingDelete = ref(false);
@@ -78,6 +81,10 @@ const error = ref<string | null>(null);
 const historyItems = ref<ExploreListItem[]>([]);
 const selectedHistoryId = ref("");
 const result = ref<ExploreResult | null>(null);
+
+// Project Multi-Portal Targets state
+const projectTargets = ref<Target[]>([]);
+const selectedPortalIds = ref<Set<string>>(new Set());
 
 // Result explorer state
 const activeResultTab = ref<"endpoints" | "spa" | "assets" | "warnings">("endpoints");
@@ -143,6 +150,63 @@ const parsedSeedPreview = computed(() => {
 });
 
 const endpoints = computed<DiscoveredEndpoint[]>(() => result.value?.discovered_endpoints ?? []);
+
+const resultMergedHosts = computed<string[]>(() => {
+  const res = result.value;
+  if (!res) return [];
+  const hosts = new Set<string>();
+  for (const h of res.merged_hosts ?? []) {
+    if (h) hosts.add(h);
+  }
+  for (const h of res.seed_hosts ?? []) {
+    if (h) hosts.add(h);
+  }
+  for (const et of res.explored_targets ?? []) {
+    if (et.base_url) {
+      try {
+        hosts.add(new URL(et.base_url).host);
+      } catch {
+        hosts.add(et.base_url);
+      }
+    }
+  }
+  if (hosts.size === 0 && res.seed?.base_url) {
+    try {
+      hosts.add(new URL(res.seed.base_url).host);
+    } catch {
+      hosts.add(res.seed.base_url);
+    }
+  }
+  return Array.from(hosts);
+});
+
+function portalTargetLabel(target: Target): string {
+  const raw = target.scope_rules?.portal_label;
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+function portalTargetHost(target: Target): string {
+  try {
+    return new URL(target.base_url).host;
+  } catch {
+    return target.root_domain || target.base_url;
+  }
+}
+
+function togglePortalSelection(id: string): void {
+  const next = new Set(selectedPortalIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  selectedPortalIds.value = next;
+}
+
+function selectAllPortals(): void {
+  selectedPortalIds.value = new Set(projectTargets.value.map((tItem) => tItem.id));
+}
+
+function clearPortalSelection(): void {
+  selectedPortalIds.value = new Set();
+}
 
 const sourceCounts = computed(() => {
   const map = new Map<string, number>();
@@ -236,18 +300,21 @@ function historyOptionLabel(item: ExploreListItem): string {
     item.base_url ||
     "target";
   const count = item.summary?.endpoints_count ?? item.endpoints_count ?? 0;
+  const mergedCount = (item.merged_hosts ?? item.seed_hosts ?? []).length;
+  const hostSuffix =
+    mergedCount > 1 ? ` · ${t("explore.historyHostsBadge", { count: mergedCount })}` : "";
   const scans = item.scans_count ?? item.summary?.scans_count;
   if (typeof scans === "number" && scans > 0) {
     if (scans === 1) {
-      return t("explore.historyOptionSingleScanFmt", { domain, count });
+      return `${t("explore.historyOptionSingleScanFmt", { domain, count })}${hostSuffix}`;
     }
-    return t("explore.historyOptionScansFmt", { domain, count, scans });
+    return `${t("explore.historyOptionScansFmt", { domain, count, scans })}${hostSuffix}`;
   }
   const timeStr = formatShortTime(item.updated_at || item.created_at);
   if (timeStr) {
-    return t("explore.historyOptionFmt", { domain, count, time: timeStr });
+    return `${t("explore.historyOptionFmt", { domain, count, time: timeStr })}${hostSuffix}`;
   }
-  return t("explore.historyOptionNoTime", { domain, count });
+  return `${t("explore.historyOptionNoTime", { domain, count })}${hostSuffix}`;
 }
 
 function startNewExplore(): void {
@@ -325,7 +392,11 @@ async function fetchHistoryAndProjects(resetSelection = false): Promise<void> {
     confirmingDelete.value = false;
   }
   const pid = projectId.value || null;
-  const [histRes, projRes] = await Promise.allSettled([listExplores(pid), listProjects()]);
+  const [histRes, projRes, targetsRes] = await Promise.allSettled([
+    listExplores(pid),
+    listProjects(),
+    pid ? listTargets(pid) : Promise.resolve([] as Target[]),
+  ]);
   if (histRes.status === "fulfilled") {
     historyItems.value = histRes.value;
     if (!result.value && histRes.value.length > 0) {
@@ -343,6 +414,13 @@ async function fetchHistoryAndProjects(resetSelection = false): Promise<void> {
     if (projectId.value && projRes.value.some((p) => p.id === projectId.value)) {
       promoteProjectSelection.value = projectId.value;
     }
+  }
+  if (targetsRes.status === "fulfilled") {
+    projectTargets.value = targetsRes.value;
+    selectedPortalIds.value = new Set(targetsRes.value.map((tItem) => tItem.id));
+  } else {
+    projectTargets.value = [];
+    selectedPortalIds.value = new Set();
   }
   loadingHistory.value = false;
 }
@@ -398,9 +476,15 @@ async function handleDeleteExplore(): Promise<void> {
 async function handleRunExplore(): Promise<void> {
   error.value = null;
   const curlText = inputMode.value === "curl" ? seedCurl.value.trim() : "";
-  const urlText = inputMode.value === "url" ? targetUrl.value.trim() : "";
+  const urlLines =
+    inputMode.value === "url"
+      ? targetUrl.value
+          .split(/[\r\n,]+/)
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
 
-  if (!curlText && !urlText) {
+  if (!curlText && urlLines.length === 0) {
     error.value = t("explore.validationMissingInput");
     return;
   }
@@ -410,7 +494,8 @@ async function handleRunExplore(): Promise<void> {
     const res = await runExplore({
       project_id: projectId.value || null,
       seed_curl: curlText || null,
-      target_url: urlText || null,
+      target_url: urlLines.length === 1 ? urlLines[0] : null,
+      target_urls: urlLines.length > 1 ? urlLines : null,
       mode: discoveryMode.value,
       probe_openapi_docs: probeOpenApiDocs.value,
       crawl_js: crawlJs.value,
@@ -425,6 +510,30 @@ async function handleRunExplore(): Promise<void> {
     error.value = err instanceof Error ? err.message : t("explore.errorRun");
   } finally {
     running.value = false;
+  }
+}
+
+async function handleExploreSelectedPortals(): Promise<void> {
+  if (!projectId.value || selectedPortalIds.value.size === 0 || runningPortals.value || running.value) {
+    return;
+  }
+  error.value = null;
+  runningPortals.value = true;
+  try {
+    const res = await exploreAllProjectTargets(projectId.value, {
+      target_ids: Array.from(selectedPortalIds.value),
+      mode: discoveryMode.value,
+      probe_openapi_docs: probeOpenApiDocs.value,
+      crawl_js: crawlJs.value,
+      depth: depth.value,
+    });
+    applyResult(res);
+    const updatedList = await listExplores(projectId.value).catch(() => historyItems.value);
+    historyItems.value = updatedList;
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : t("explore.errorRun");
+  } finally {
+    runningPortals.value = false;
   }
 }
 
@@ -580,6 +689,86 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- Project Portals One-Click Multi-Portal Explore Card -->
+    <div
+      v-if="projectTargets.length > 0"
+      data-testid="explore-project-portals"
+      class="card overflow-hidden border-indigo-200/80 bg-gradient-to-r from-white to-indigo-50/40"
+    >
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-indigo-100 px-5 py-3">
+        <div>
+          <div class="flex items-center gap-2">
+            <Globe class="h-4 w-4 text-indigo-600" />
+            <h2 class="text-sm font-semibold text-slate-900">{{ t("explore.portalsTitle") }}</h2>
+            <span class="rounded-full bg-indigo-100 px-2 py-0.5 font-mono text-[11px] font-semibold text-indigo-700">
+              {{ projectTargets.length }}
+            </span>
+          </div>
+          <p class="mt-0.5 text-xs text-slate-500">{{ t("explore.portalsSubtitle") }}</p>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            class="text-xs font-medium text-indigo-600 hover:underline"
+            @click="selectAllPortals"
+          >
+            {{ t("explore.portalsSelectAll") }}
+          </button>
+          <span class="text-slate-300">·</span>
+          <button
+            type="button"
+            class="text-xs font-medium text-slate-500 hover:underline"
+            @click="clearPortalSelection"
+          >
+            {{ t("explore.portalsClear") }}
+          </button>
+          <button
+            type="button"
+            data-testid="explore-all-portals-btn"
+            class="btn-primary !px-3.5 !py-1.5 !text-xs"
+            :disabled="selectedPortalIds.size === 0 || runningPortals || running"
+            @click="handleExploreSelectedPortals"
+          >
+            <Loader2 v-if="runningPortals" class="h-3.5 w-3.5 animate-spin" />
+            <Compass v-else class="h-3.5 w-3.5" />
+            <span>
+              {{
+                runningPortals
+                  ? t("explore.portalsExploringBtn")
+                  : t("explore.portalsExploreBtn", { count: selectedPortalIds.size })
+              }}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap gap-2 px-5 py-3.5">
+        <button
+          v-for="tItem in projectTargets"
+          :key="tItem.id"
+          type="button"
+          data-testid="explore-portal-pill"
+          class="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs transition"
+          :class="
+            selectedPortalIds.has(tItem.id)
+              ? 'bg-indigo-600 text-white shadow-sm'
+              : 'bg-white text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50'
+          "
+          @click="togglePortalSelection(tItem.id)"
+        >
+          <Check v-if="selectedPortalIds.has(tItem.id)" class="h-3.5 w-3.5 shrink-0" />
+          <span v-if="portalTargetLabel(tItem)" class="font-semibold">
+            {{ portalTargetLabel(tItem) }}
+          </span>
+          <span v-if="portalTargetLabel(tItem)" class="opacity-60">·</span>
+          <span class="font-mono text-[11px]" :class="selectedPortalIds.has(tItem.id) ? 'text-indigo-100' : 'text-slate-500'">
+            {{ portalTargetHost(tItem) }}
+          </span>
+        </button>
+      </div>
+    </div>
+
     <!-- Seed Input Card -->
     <div class="card overflow-hidden">
       <!-- Input Mode Tabs -->
@@ -692,19 +881,19 @@ onMounted(async () => {
           </div>
         </div>
 
-        <!-- Tab 2: Domain / URL -->
+        <!-- Tab 2: Multi-Domain / URLs -->
         <div v-else class="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <div class="sm:col-span-2">
             <label class="block text-xs font-medium text-slate-700">
               {{ t("explore.targetUrlLabel") }}
             </label>
-            <input
+            <p class="mt-0.5 text-[11px] text-slate-500">{{ t("explore.multiUrlHint") }}</p>
+            <textarea
               v-model="targetUrl"
-              data-testid="explore-url-input"
-              type="text"
-              class="input-field mt-1 font-mono text-xs"
-              :placeholder="t('explore.targetUrlPlaceholder')"
-              @keyup.enter="handleRunExplore"
+              data-testid="explore-multi-urls-input"
+              rows="3"
+              class="input-field mt-1.5 font-mono text-xs leading-relaxed"
+              :placeholder="t('explore.multiUrlPlaceholder')"
             />
           </div>
           <div>
@@ -863,6 +1052,25 @@ onMounted(async () => {
               <span>{{ doc.title || doc.url }} ({{ doc.endpoints_count }})</span>
             </span>
           </div>
+        </div>
+
+        <!-- Merged Portal Hosts Strip (multi-domain visibility) -->
+        <div
+          v-if="resultMergedHosts.length > 0"
+          data-testid="explore-merged-hosts"
+          class="flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-2.5"
+        >
+          <span class="inline-flex items-center gap-1 text-[11px] font-medium text-slate-500">
+            <Globe class="h-3 w-3 text-indigo-500" />
+            <span>{{ t("explore.mergedHostsLabel", { count: resultMergedHosts.length }) }}:</span>
+          </span>
+          <span
+            v-for="host in resultMergedHosts"
+            :key="host"
+            class="rounded-md bg-indigo-50/70 px-2 py-0.5 font-mono text-[11px] font-medium text-indigo-800 ring-1 ring-inset ring-indigo-200/80"
+          >
+            {{ host }}
+          </span>
         </div>
 
         <!-- Accumulated Scans Strip (when multiple scans merged into this domain inventory) -->

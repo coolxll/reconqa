@@ -626,6 +626,7 @@ def merge_explore_results(
     created_at = str(existing.get("created_at") or incoming.get("created_at") or datetime.now(UTC).isoformat())
     updated_at = str(incoming.get("updated_at") or incoming.get("created_at") or datetime.now(UTC).isoformat())
     merged_project_id = incoming.get("project_id") or existing.get("project_id")
+    merged_hosts = _collect_merged_hosts(existing, incoming)
 
     merged_out: dict[str, Any] = {
         "explore_id": merged_id,
@@ -633,6 +634,8 @@ def merge_explore_results(
         "updated_at": updated_at,
         "mode": str(incoming.get("mode") or existing.get("mode") or "passive"),
         "seed": merged_seed,
+        "merged_hosts": merged_hosts,
+        "seed_hosts": list(merged_hosts),
         "summary": {
             "scans_count": len(merged_scans),
             "endpoints_count": len(merged_endpoints),
@@ -654,6 +657,46 @@ def merge_explore_results(
     if merged_project_id:
         merged_out["project_id"] = str(merged_project_id)
     return merged_out
+
+
+def _collect_merged_hosts(*docs: dict[str, Any]) -> list[str]:
+    """Collect deduplicated portal hostnames across explore result seed/scans/merged_hosts."""
+    hosts: list[str] = []
+    seen: set[str] = set()
+
+    def _add_host(raw: str | None) -> None:
+        val = (raw or "").strip()
+        if not val:
+            return
+        if "://" in val:
+            parsed = urlparse(val)
+            host = (parsed.hostname or "").lower()
+            if parsed.port and host in {"127.0.0.1", "localhost", "::1"}:
+                host = f"{host}:{parsed.port}"
+        else:
+            host = val.lower().split("/", 1)[0]
+        if host and host not in seen:
+            seen.add(host)
+            hosts.append(host)
+
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        for key in ("merged_hosts", "seed_hosts"):
+            for h in doc.get(key) or []:
+                _add_host(str(h))
+        seed = doc.get("seed") or {}
+        if isinstance(seed, dict):
+            _add_host(str(seed.get("base_url") or ""))
+            _add_host(str(seed.get("seed_url") or ""))
+        for sc in doc.get("scans") or []:
+            if isinstance(sc, dict):
+                _add_host(str(sc.get("seed_url") or ""))
+    return hosts
+
+
+def _extract_host_for_result(base_url: str, seed_url: str) -> list[str]:
+    return _collect_merged_hosts({"seed": {"base_url": base_url, "seed_url": seed_url}})
 
 
 def _probe_openapi_on_origin(
@@ -1166,6 +1209,7 @@ def explore_from_seed(
         key=lambda ep: (-_SOURCE_PRIORITY.get(ep["source"], 0), ep["path"], ep["method"]),
     )
 
+    initial_hosts = _extract_host_for_result(base_url, seed_url)
     result: dict[str, Any] = {
         "explore_id": exp_id,
         "created_at": created_at,
@@ -1180,6 +1224,8 @@ def explore_from_seed(
             "auth_headers_detected": auth_headers_detected,
             "sibling_api_hosts": sibling_api_hosts,
         },
+        "merged_hosts": initial_hosts,
+        "seed_hosts": list(initial_hosts),
         "summary": {
             "scans_count": 1,
             "endpoints_count": len(discovered_endpoints),

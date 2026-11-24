@@ -4,10 +4,13 @@ import { useRoute } from "vue-router";
 import {
   AlertTriangle,
   BookOpen,
+  Check,
   CheckCircle2,
+  Copy,
   Download,
   ExternalLink,
   Eye,
+  FileCode2,
   FileText,
   Link2,
   Pencil,
@@ -32,6 +35,7 @@ import type {
   KnowledgeDocType,
 } from "@/api/types";
 import EmptyState from "@/components/layout/EmptyState.vue";
+import MarkdownViewer from "@/components/common/MarkdownViewer.vue";
 import { useWorkspace } from "@/stores/workspace";
 import { useI18n } from "@/i18n";
 
@@ -76,6 +80,46 @@ const kbUploadEndpoints = ref("");
 
 // Preview Modal
 const previewDoc = ref<KnowledgeDoc | null>(null);
+const previewMode = ref<"rendered" | "raw">("rendered");
+const copiedMarkdown = ref(false);
+
+function openPreview(doc: KnowledgeDoc): void {
+  previewDoc.value = doc;
+  previewMode.value = "rendered";
+  copiedMarkdown.value = false;
+}
+
+async function copyPreviewMarkdown(): Promise<void> {
+  const text = previewDoc.value?.content;
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    copiedMarkdown.value = true;
+    window.setTimeout(() => {
+      copiedMarkdown.value = false;
+    }, 1800);
+  } catch {
+    copiedMarkdown.value = true;
+  }
+}
+
+function stripMarkdown(raw: string): string {
+  if (!raw) return "";
+  return raw
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s*>\s?/gm, "")
+    .replace(/^\s*[-*_]{3,}\s*$/gm, " ")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/\|/g, " ")
+    .replace(/[*_~]{1,3}/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 const kbDocTypes: KnowledgeDocType[] = [
   "prd",
@@ -464,7 +508,7 @@ onMounted(() => {
                 <button
                   type="button"
                   class="text-left text-sm font-semibold text-slate-900 hover:text-indigo-700 hover:underline"
-                  @click="previewDoc = doc"
+                  @click="openPreview(doc)"
                 >
                   {{ doc.title }}
                 </button>
@@ -484,7 +528,7 @@ onMounted(() => {
               </div>
 
               <p v-if="doc.content" class="line-clamp-2 text-xs leading-relaxed text-slate-600">
-                {{ doc.content }}
+                {{ stripMarkdown(doc.content) }}
               </p>
               <a
                 v-else-if="doc.external_url"
@@ -510,7 +554,7 @@ onMounted(() => {
               <button
                 type="button"
                 class="btn-secondary !px-2 !py-1 !text-xs"
-                @click="previewDoc = doc"
+                @click="openPreview(doc)"
               >
                 <Eye class="h-3.5 w-3.5" />
                 <span>{{ t("projects.kb.viewBtn") }}</span>
@@ -842,8 +886,8 @@ onMounted(() => {
       data-testid="kb-preview-modal"
       @click.self="previewDoc = null"
     >
-      <div class="w-full max-w-2xl overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl">
-        <div class="flex items-start justify-between gap-3 border-b border-slate-100 px-6 py-4">
+      <div class="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl">
+        <div class="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 px-6 py-4">
           <div class="min-w-0 space-y-1">
             <div class="flex flex-wrap items-center gap-2">
               <h3 class="text-base font-bold text-slate-900">{{ previewDoc.title }}</h3>
@@ -862,16 +906,67 @@ onMounted(() => {
               <span v-if="previewDoc.size_bytes > 0"> · {{ formatBytes(previewDoc.size_bytes) }}</span>
             </p>
           </div>
-          <button
-            type="button"
-            class="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
-            @click="previewDoc = null"
-          >
-            <X class="h-4 w-4" />
-          </button>
+
+          <div class="flex shrink-0 items-center gap-2">
+            <!-- Rendered | Raw Toggle -->
+            <div
+              v-if="previewDoc.content"
+              data-testid="kb-preview-mode-toggle"
+              class="inline-flex items-center rounded-lg border border-slate-200 bg-slate-100 p-0.5 text-xs font-medium"
+            >
+              <button
+                type="button"
+                data-testid="kb-preview-mode-rendered"
+                class="inline-flex items-center gap-1 rounded-md px-2.5 py-1 transition"
+                :class="
+                  previewMode === 'rendered'
+                    ? 'bg-white text-indigo-700 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                "
+                @click="previewMode = 'rendered'"
+              >
+                <Eye class="h-3.5 w-3.5" />
+                <span>{{ t("kb.previewRendered") }}</span>
+              </button>
+              <button
+                type="button"
+                data-testid="kb-preview-mode-raw"
+                class="inline-flex items-center gap-1 rounded-md px-2.5 py-1 transition"
+                :class="
+                  previewMode === 'raw'
+                    ? 'bg-white text-indigo-700 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                "
+                @click="previewMode = 'raw'"
+              >
+                <FileCode2 class="h-3.5 w-3.5" />
+                <span>{{ t("kb.previewRaw") }}</span>
+              </button>
+            </div>
+
+            <button
+              v-if="previewDoc.content"
+              type="button"
+              data-testid="kb-copy-markdown-btn"
+              class="btn-secondary !px-2.5 !py-1.5 !text-xs"
+              @click="copyPreviewMarkdown"
+            >
+              <Check v-if="copiedMarkdown" class="h-3.5 w-3.5 text-emerald-600" />
+              <Copy v-else class="h-3.5 w-3.5" />
+              <span>{{ copiedMarkdown ? t("kb.copiedMarkdown") : t("kb.copyMarkdown") }}</span>
+            </button>
+
+            <button
+              type="button"
+              class="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
+              @click="previewDoc = null"
+            >
+              <X class="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
-        <div class="max-h-[70vh] space-y-4 overflow-y-auto px-6 py-5">
+        <div class="flex-1 space-y-4 overflow-y-auto px-6 py-5">
           <div v-if="previewDoc.external_url" class="rounded-lg border border-indigo-200 bg-indigo-50/50 px-3.5 py-2.5">
             <a
               :href="previewDoc.external_url"
@@ -910,10 +1005,19 @@ onMounted(() => {
             </span>
           </div>
 
-          <pre
-            v-if="previewDoc.content"
-            class="whitespace-pre-wrap break-words rounded-xl border border-slate-200 bg-slate-50 p-4 font-mono text-xs leading-relaxed text-slate-800"
-          >{{ previewDoc.content }}</pre>
+          <template v-if="previewDoc.content">
+            <div
+              v-if="previewMode === 'rendered'"
+              class="rounded-xl border border-slate-200 bg-white p-5"
+            >
+              <MarkdownViewer :content="previewDoc.content" />
+            </div>
+            <pre
+              v-else
+              data-testid="kb-preview-raw-content"
+              class="whitespace-pre-wrap break-words rounded-xl border border-slate-200 bg-slate-50 p-4 font-mono text-xs leading-relaxed text-slate-800"
+            >{{ previewDoc.content }}</pre>
+          </template>
           <p v-else class="rounded-xl border border-dashed border-slate-200 p-4 text-xs text-slate-500">
             {{ t("projects.kb.preview.noContent") }}
           </p>

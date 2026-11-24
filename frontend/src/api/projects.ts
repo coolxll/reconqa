@@ -22,6 +22,7 @@ import type {
   ReplayResponse,
   Target,
   TargetCreate,
+  TargetUpdate,
 } from "./types";
 
 export function listProjects(): Promise<Project[]> {
@@ -62,6 +63,20 @@ export function createTarget(projectId: string, payload: TargetCreate): Promise<
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export function updateTarget(
+  projectId: string,
+  targetId: string,
+  payload: TargetUpdate
+): Promise<Target> {
+  return apiFetch<Target>(
+    `/projects/${encodeURIComponent(projectId)}/targets/${encodeURIComponent(targetId)}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }
+  );
 }
 
 export function deleteTarget(

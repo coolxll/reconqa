@@ -7,6 +7,7 @@ import {
   Globe,
   KeyRound,
   Loader2,
+  Pencil,
   PlayCircle,
   Plus,
   Save,
@@ -25,6 +26,7 @@ import {
   extractCredentialFromHar,
   listAuthProfiles,
   listTargets,
+  updateTarget,
   uploadStorageState,
 } from "@/api/projects";
 import type { AuthProfile, RoleTag, Target } from "@/api/types";
@@ -72,11 +74,16 @@ const loadingDetails = ref(true);
 const bannerError = ref<string | null>(null);
 const bannerSuccess = ref<string | null>(null);
 
-// Targets form
+// Targets form & inline edit state
 const addingTarget = ref(false);
 const targetPortalLabel = ref("");
 const targetRootDomain = ref("");
 const targetBaseUrl = ref("");
+const editingTargetId = ref<string | null>(null);
+const editTargetPortalLabel = ref("");
+const editTargetRootDomain = ref("");
+const editTargetBaseUrl = ref("");
+const savingTarget = ref(false);
 
 // Credentials form
 const ROLE_PRESETS = ["admin", "pharmacy", "doctor", "assistant", "account_a", "account_b", "guest"] as const;
@@ -243,6 +250,41 @@ async function handleAddTarget(): Promise<void> {
 function getTargetPortalLabel(target: Target): string {
   const raw = target.scope_rules?.portal_label;
   return typeof raw === "string" ? raw.trim() : "";
+}
+
+function startEditTarget(target: Target): void {
+  editingTargetId.value = target.id;
+  editTargetPortalLabel.value = getTargetPortalLabel(target);
+  editTargetRootDomain.value = target.root_domain;
+  editTargetBaseUrl.value = target.base_url;
+}
+
+function cancelEditTarget(): void {
+  editingTargetId.value = null;
+}
+
+async function handleSaveTargetEdit(target: Target): Promise<void> {
+  if (!projectId.value || savingTarget.value) return;
+  savingTarget.value = true;
+  try {
+    const nextRules = { ...(target.scope_rules ?? {}) };
+    const trimmedLabel = editTargetPortalLabel.value.trim();
+    if (trimmedLabel) nextRules.portal_label = trimmedLabel;
+    else delete nextRules.portal_label;
+
+    const updated = await updateTarget(projectId.value, target.id, {
+      root_domain: editTargetRootDomain.value.trim() || target.root_domain,
+      base_url: editTargetBaseUrl.value.trim() || target.base_url,
+      scope_rules: nextRules,
+    });
+    targets.value = targets.value.map((item) => (item.id === updated.id ? updated : item));
+    editingTargetId.value = null;
+    notifySuccess(t("settings.target.updatedToast"));
+  } catch (err) {
+    notifyError(err, t("settings.target.errUpdate"));
+  } finally {
+    savingTarget.value = false;
+  }
 }
 
 async function handleDeleteTarget(targetId: string): Promise<void> {
@@ -510,41 +552,114 @@ onMounted(() => {
           <div
             v-for="target in targets"
             :key="target.id"
-            class="flex flex-col justify-between gap-3 px-5 py-4 sm:flex-row sm:items-center"
+            class="px-5 py-4"
           >
-            <div class="min-w-0">
-              <div class="flex flex-wrap items-center gap-2">
-                <Globe class="h-4 w-4 shrink-0 text-indigo-500" />
-                <span
-                  v-if="getTargetPortalLabel(target)"
-                  data-testid="target-portal-badge"
-                  class="rounded-md bg-indigo-50 px-2 py-0.5 text-xs font-semibold text-indigo-700 ring-1 ring-inset ring-indigo-600/20"
-                >
-                  {{ getTargetPortalLabel(target) }}
-                </span>
-                <span class="truncate font-mono text-sm font-semibold text-slate-900">
-                  {{ target.root_domain }}
-                </span>
+            <form
+              v-if="editingTargetId === target.id"
+              data-testid="edit-target-form"
+              class="grid grid-cols-1 gap-3 sm:grid-cols-12 sm:items-end"
+              @submit.prevent="handleSaveTargetEdit(target)"
+            >
+              <div class="sm:col-span-3">
+                <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                  {{ t("settings.target.portalLabel") }}
+                </label>
+                <input
+                  v-model="editTargetPortalLabel"
+                  data-testid="edit-target-portal-input"
+                  type="text"
+                  :placeholder="t('settings.target.portalPlaceholder')"
+                  class="input-field !py-1.5 text-xs"
+                />
               </div>
-              <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{{ target.base_url }}</p>
-            </div>
-            <div class="flex shrink-0 items-center gap-2">
-              <button
-                type="button"
-                class="btn-secondary !px-2.5 !py-1.5 !text-xs"
-                @click="launchRunForTarget(target)"
-              >
-                <PlayCircle class="h-3.5 w-3.5 text-indigo-600" />
-                <span>{{ t("projects.target.runBtn") }}</span>
-              </button>
-              <button
-                type="button"
-                class="btn-danger !px-2.5 !py-1.5 !text-xs"
-                :title="t('projects.target.deleteTitle')"
-                @click="handleDeleteTarget(target.id)"
-              >
-                <Trash2 class="h-3.5 w-3.5" />
-              </button>
+              <div class="sm:col-span-3">
+                <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                  {{ t("projects.target.rootDomain") }}
+                </label>
+                <input
+                  v-model="editTargetRootDomain"
+                  type="text"
+                  required
+                  class="input-field !py-1.5 font-mono text-xs"
+                />
+              </div>
+              <div class="sm:col-span-4">
+                <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                  {{ t("projects.target.baseUrl") }}
+                </label>
+                <input
+                  v-model="editTargetBaseUrl"
+                  type="url"
+                  required
+                  class="input-field !py-1.5 font-mono text-xs"
+                />
+              </div>
+              <div class="flex items-center justify-end gap-1.5 sm:col-span-2">
+                <button
+                  type="submit"
+                  data-testid="edit-target-save-btn"
+                  class="btn-primary !px-2.5 !py-1.5 !text-xs"
+                  :disabled="savingTarget"
+                >
+                  {{ t("settings.target.saveBtn") }}
+                </button>
+                <button
+                  type="button"
+                  class="btn-secondary !px-2 !py-1.5 !text-xs"
+                  @click="cancelEditTarget"
+                >
+                  {{ t("common.cancel") }}
+                </button>
+              </div>
+            </form>
+
+            <div
+              v-else
+              class="flex flex-col justify-between gap-3 sm:flex-row sm:items-center"
+            >
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <Globe class="h-4 w-4 shrink-0 text-indigo-500" />
+                  <span
+                    v-if="getTargetPortalLabel(target)"
+                    data-testid="target-portal-badge"
+                    class="rounded-md bg-indigo-50 px-2 py-0.5 text-xs font-semibold text-indigo-700 ring-1 ring-inset ring-indigo-600/20"
+                  >
+                    {{ getTargetPortalLabel(target) }}
+                  </span>
+                  <span class="truncate font-mono text-sm font-semibold text-slate-900">
+                    {{ target.root_domain }}
+                  </span>
+                </div>
+                <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{{ target.base_url }}</p>
+              </div>
+              <div class="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  data-testid="edit-target-btn"
+                  class="btn-secondary !px-2.5 !py-1.5 !text-xs"
+                  @click="startEditTarget(target)"
+                >
+                  <Pencil class="h-3.5 w-3.5 text-slate-500" />
+                  <span>{{ t("settings.target.editBtn") }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="btn-secondary !px-2.5 !py-1.5 !text-xs"
+                  @click="launchRunForTarget(target)"
+                >
+                  <PlayCircle class="h-3.5 w-3.5 text-indigo-600" />
+                  <span>{{ t("projects.target.runBtn") }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="btn-danger !px-2.5 !py-1.5 !text-xs"
+                  :title="t('projects.target.deleteTitle')"
+                  @click="handleDeleteTarget(target.id)"
+                >
+                  <Trash2 class="h-3.5 w-3.5" />
+                </button>
+              </div>
             </div>
           </div>
         </div>

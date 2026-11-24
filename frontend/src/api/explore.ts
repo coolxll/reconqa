@@ -6,12 +6,28 @@ export type ExploreMode = "passive" | "active";
 export interface ExploreRequest {
   seed_curl?: string | null;
   target_url?: string | null;
+  target_urls?: string[] | null;
   mode?: ExploreMode;
   probe_openapi_docs?: boolean;
   crawl_js?: boolean;
   depth?: number;
   merge?: boolean;
   project_id?: string | null;
+}
+
+export interface ExploreAllTargetsRequest {
+  target_ids?: string[] | null;
+  mode?: ExploreMode;
+  probe_openapi_docs?: boolean;
+  crawl_js?: boolean;
+  depth?: number;
+}
+
+export interface ExploredTargetResult {
+  id: string;
+  portal_label?: string;
+  base_url: string;
+  endpoints_found: number;
 }
 
 export interface ExploreSeedInfo {
@@ -70,6 +86,9 @@ export interface ExploreResult {
   summary: ExploreSummary;
   scans_count?: number;
   scans?: ExploreScanRecord[];
+  merged_hosts?: string[];
+  seed_hosts?: string[];
+  explored_targets?: ExploredTargetResult[];
   discovered_endpoints: DiscoveredEndpoint[];
   openapi_docs_found: OpenApiDocFound[];
   spa_routes: string[];
@@ -89,6 +108,8 @@ export interface ExploreListItem {
   summary?: Partial<ExploreSummary>;
   base_url?: string;
   root_domain?: string;
+  merged_hosts?: string[];
+  seed_hosts?: string[];
   endpoints_count?: number;
   scans_count?: number;
   [key: string]: unknown;
@@ -106,6 +127,19 @@ export function runExplore(body: ExploreRequest): Promise<ExploreResult> {
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export function exploreAllProjectTargets(
+  projectId: string,
+  body?: ExploreAllTargetsRequest
+): Promise<ExploreResult> {
+  return apiFetch<ExploreResult>(
+    `/projects/${encodeURIComponent(projectId)}/explore-all`,
+    {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+    }
+  );
 }
 
 export async function listExplores(projectId?: string | null): Promise<ExploreListItem[]> {

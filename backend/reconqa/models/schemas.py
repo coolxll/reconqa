@@ -48,6 +48,12 @@ class TargetCreate(BaseModel):
     scope_rules: dict[str, Any] = Field(default_factory=dict)
 
 
+class TargetUpdate(BaseModel):
+    root_domain: str | None = None
+    base_url: str | None = None
+    scope_rules: dict[str, Any] | None = None
+
+
 class TargetOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

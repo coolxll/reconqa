@@ -423,3 +423,153 @@ async def test_explore_merges_multiple_scans_by_root_domain(
     if db_mod._engine is not None:
         await db_mod._engine.dispose()
 
+
+@pytest.mark.asyncio
+async def test_multi_url_batch_explore_all_portals_and_target_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify #172: target_urls multi-portal batch explore, POST /projects/{id}/explore-all, and PATCH Target."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "multi_portal_explore.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+
+    from reconqa.config import Settings
+    from reconqa.models import db as db_mod
+
+    monkeypatch.setattr(Settings, "resolve_bin", lambda self, name: None)
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+
+    def _make_portal_handler(endpoint_path: str, title: str):
+        class _PortalHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.path == "/openapi.json":
+                    body = json.dumps(
+                        {
+                            "openapi": "3.0.3",
+                            "info": {"title": title, "version": "1.0.0"},
+                            "paths": {
+                                endpoint_path: {
+                                    "get": {"summary": f"{title} endpoint", "responses": {"200": {"description": "OK"}}}
+                                }
+                            },
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        return _PortalHandler
+
+    srv1 = ThreadingHTTPServer(("127.0.0.1", 0), _make_portal_handler("/api/v1/admin/users", "Admin Portal"))
+    srv2 = ThreadingHTTPServer(("127.0.0.1", 0), _make_portal_handler("/api/v1/pharmacy/stock", "Pharmacy Portal"))
+    url1 = f"http://127.0.0.1:{srv1.server_address[1]}"
+    url2 = f"http://127.0.0.1:{srv2.server_address[1]}"
+    t1 = threading.Thread(target=srv1.serve_forever, daemon=True)
+    t2 = threading.Thread(target=srv2.serve_forever, daemon=True)
+    t1.start()
+    t2.start()
+
+    from reconqa.server.app import create_app
+
+    try:
+        fastapi_app = create_app()
+        async with fastapi_app.router.lifespan_context(fastapi_app):
+            transport = httpx.ASGITransport(app=fastapi_app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                proj = (await client.post("/api/v1/projects", json={"name": "Multi Portal Suite"})).json()
+                pid = proj["id"]
+
+                # 1. Batch explore via POST /api/v1/explore with target_urls
+                r_batch = await client.post(
+                    "/api/v1/explore",
+                    json={
+                        "target_urls": [url1, url2],
+                        "probe_openapi_docs": True,
+                        "crawl_js": False,
+                        "project_id": pid,
+                    },
+                )
+                assert r_batch.status_code == 201, r_batch.text
+                b_data = r_batch.json()
+                paths = {e["path"] for e in b_data["discovered_endpoints"]}
+                assert "/api/v1/admin/users" in paths
+                assert "/api/v1/pharmacy/stock" in paths
+                assert len(b_data.get("merged_hosts") or []) == 2
+                assert b_data.get("project_id") == pid
+
+                # GET /api/v1/explore exposes merged_hosts and root_domain
+                list_items = (await client.get("/api/v1/explore", params={"project_id": pid})).json()
+                assert len(list_items) == 1
+                assert len(list_items[0]["merged_hosts"]) == 2
+                assert "root_domain" in list_items[0]
+
+                # 2. Create 2 Targets and PATCH portal_label on Target 1
+                tg1 = (
+                    await client.post(
+                        f"/api/v1/projects/{pid}/targets",
+                        json={"root_domain": "127.0.0.1", "base_url": url1, "scope_rules": {}},
+                    )
+                ).json()
+                tg2 = (
+                    await client.post(
+                        f"/api/v1/projects/{pid}/targets",
+                        json={
+                            "root_domain": "127.0.0.1",
+                            "base_url": url2,
+                            "scope_rules": {"portal_label": "Pharmacy Portal"},
+                        },
+                    )
+                ).json()
+
+                r_patch = await client.patch(
+                    f"/api/v1/projects/{pid}/targets/{tg1['id']}",
+                    json={"scope_rules": {"portal_label": "HQ Admin Portal"}},
+                )
+                assert r_patch.status_code == 200, r_patch.text
+                assert r_patch.json()["scope_rules"]["portal_label"] == "HQ Admin Portal"
+
+                r_patch_404 = await client.patch(
+                    f"/api/v1/projects/{pid}/targets/nonexistent-target",
+                    json={"scope_rules": {"portal_label": "Ghost"}},
+                )
+                assert r_patch_404.status_code == 404
+
+                # 3. POST /api/v1/projects/{id}/explore-all across both Targets
+                r_all = await client.post(
+                    f"/api/v1/projects/{pid}/explore-all",
+                    json={
+                        "target_ids": [tg1["id"], tg2["id"]],
+                        "probe_openapi_docs": True,
+                        "crawl_js": False,
+                    },
+                )
+                assert r_all.status_code == 201, r_all.text
+                all_data = r_all.json()
+                assert len(all_data.get("explored_targets") or []) == 2
+                by_tid = {et["id"]: et for et in all_data["explored_targets"]}
+                assert by_tid[tg1["id"]]["portal_label"] == "HQ Admin Portal"
+                assert by_tid[tg1["id"]]["endpoints_found"] >= 1
+                assert by_tid[tg2["id"]]["portal_label"] == "Pharmacy Portal"
+                assert by_tid[tg2["id"]]["endpoints_found"] >= 1
+                assert len(all_data.get("merged_hosts") or []) == 2
+    finally:
+        srv1.shutdown()
+        srv1.server_close()
+        srv2.shutdown()
+        srv2.server_close()
+        t1.join(timeout=3)
+        t2.join(timeout=3)
+        if db_mod._engine is not None:
+            await db_mod._engine.dispose()
+

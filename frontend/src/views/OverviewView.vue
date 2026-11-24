@@ -4,19 +4,15 @@ import { useRoute } from "vue-router";
 import {
   AlertTriangle,
   ArrowRight,
-  BookOpen,
   Bot,
   CheckCircle2,
   Code2,
   Compass,
-  Database,
   FileUp,
   FolderKanban,
   Gauge,
   GitBranch,
   Globe,
-  Layers,
-  ListChecks,
   RefreshCw,
   Settings,
   ShieldCheck,
@@ -72,7 +68,19 @@ const targets = ref<Target[]>([]);
 const knowledgeDocs = ref<KnowledgeDoc[]>([]);
 const doctorTools = ref<Record<string, DoctorToolStatus>>({});
 
-const primaryDomain = computed(() => targets.value[0]?.root_domain || null);
+const portalTargetBadges = computed(() =>
+  targets.value.map((tItem) => {
+    const rawLabel = tItem.scope_rules?.portal_label;
+    const label = typeof rawLabel === "string" ? rawLabel.trim() : "";
+    let host = tItem.root_domain;
+    try {
+      host = new URL(tItem.base_url).host;
+    } catch {
+      // fallback to root_domain
+    }
+    return { id: tItem.id, label, host, baseUrl: tItem.base_url };
+  })
+);
 
 const totalEndpoints = computed(() => {
   if (inventory.value) return inventory.value.total_endpoints;
@@ -275,28 +283,13 @@ onMounted(async () => {
         class="relative overflow-hidden rounded-2xl border border-slate-800 bg-gradient-to-br from-slate-900 via-slate-900 to-indigo-950 p-6 text-white shadow-md"
         data-testid="project-overview-hero"
       >
-        <div class="flex flex-col justify-between gap-5 lg:flex-row lg:items-center">
-          <div class="max-w-2xl space-y-2">
-            <div class="flex flex-wrap items-center gap-2">
-              <span
-                class="inline-flex items-center gap-1.5 rounded-full bg-indigo-500/20 px-3 py-1 text-xs font-medium text-indigo-200 ring-1 ring-inset ring-indigo-400/30"
-              >
-                <Layers class="h-3.5 w-3.5" />
-                <span>{{ t("overview.heroPill") }}</span>
-              </span>
-              <span
-                v-if="primaryDomain"
-                class="inline-flex items-center gap-1 rounded-full bg-slate-800/90 px-2.5 py-1 font-mono text-xs text-sky-300 ring-1 ring-inset ring-slate-700"
-              >
-                <Globe class="h-3 w-3" />
-                <span>{{ primaryDomain }}</span>
-              </span>
-            </div>
-
+        <!-- Top Row: Clean Title + Description on Left, 3 Focused Primary Actions on Right -->
+        <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+          <div class="min-w-0 flex-1 space-y-1.5">
             <h2 class="text-2xl font-bold tracking-tight text-white">
               {{ activeProject?.name || t("overview.heroTitle") }}
             </h2>
-            <p class="text-sm leading-relaxed text-slate-300">
+            <p class="max-w-3xl text-sm leading-relaxed text-slate-300">
               {{ activeProject?.description || t("overview.heroDesc") }}
             </p>
           </div>
@@ -305,59 +298,72 @@ onMounted(async () => {
             <button
               type="button"
               data-testid="ai-acceptance-prompt-btn"
-              class="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-violet-500 to-indigo-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm ring-1 ring-inset ring-white/20 transition hover:from-violet-400 hover:to-indigo-400"
+              class="inline-flex items-center gap-2 whitespace-nowrap rounded-lg bg-gradient-to-r from-violet-500 to-indigo-500 px-4 py-2 text-sm font-semibold text-white shadow-sm ring-1 ring-inset ring-white/20 transition hover:from-violet-400 hover:to-indigo-400"
               @click="acceptancePromptOpen = true"
             >
-              <Bot class="h-4 w-4" />
+              <Bot class="h-4 w-4 shrink-0" />
               <span>{{ t("acceptPrompt.btn") }}</span>
             </button>
             <router-link
               :to="{ path: workspacePath('runs', projectId), query: { new: '1' } }"
-              class="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-400"
+              class="inline-flex items-center gap-2 whitespace-nowrap rounded-lg bg-indigo-500 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-400"
               data-testid="overview-new-run-cta"
             >
-              <FileUp class="h-4 w-4" />
+              <FileUp class="h-4 w-4 shrink-0" />
               <span>{{ t("overview.ctaImport") }}</span>
             </router-link>
             <router-link
-              :to="workspacePath('inventory', projectId)"
-              class="inline-flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-500/15 px-3.5 py-2.5 text-sm font-medium text-emerald-100 transition hover:bg-emerald-500/25"
-              data-testid="overview-inventory-cta"
-            >
-              <Database class="h-4 w-4 text-emerald-300" />
-              <span>{{ t("projOverview.quickInventory") }}</span>
-            </router-link>
-            <router-link
-              :to="workspacePath('scenarios', projectId)"
-              class="inline-flex items-center gap-2 rounded-lg border border-teal-400/40 bg-teal-500/15 px-3.5 py-2.5 text-sm font-medium text-teal-100 transition hover:bg-teal-500/25"
-              data-testid="overview-scenarios-cta"
-            >
-              <ListChecks class="h-4 w-4 text-teal-300" />
-              <span>{{ t("projOverview.quickScenarios") }}</span>
-            </router-link>
-            <router-link
               :to="workspacePath('explore', projectId)"
-              class="inline-flex items-center gap-2 rounded-lg border border-sky-400/40 bg-sky-500/15 px-3.5 py-2.5 text-sm font-medium text-sky-100 transition hover:bg-sky-500/25"
+              class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-2 text-sm font-medium text-slate-200 transition hover:border-sky-400/50 hover:bg-slate-800 hover:text-white"
               data-testid="overview-explore-cta"
             >
-              <Compass class="h-4 w-4 text-sky-300" />
+              <Compass class="h-4 w-4 shrink-0 text-sky-300" />
               <span>{{ t("overview.ctaExplore") }}</span>
             </router-link>
             <router-link
-              :to="workspacePath('kb', projectId)"
-              class="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-2.5 text-sm font-medium text-slate-200 transition hover:bg-slate-700"
-            >
-              <BookOpen class="h-4 w-4 text-slate-300" />
-              <span>{{ t("projOverview.quickKb") }}</span>
-            </router-link>
-            <router-link
               :to="workspacePath('settings', projectId)"
-              class="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800/80 px-3 py-2.5 text-sm font-medium text-slate-200 transition hover:bg-slate-700"
+              class="inline-flex items-center justify-center rounded-lg border border-slate-700 bg-slate-800/80 p-2 text-slate-300 transition hover:bg-slate-700 hover:text-white"
               :title="t('projOverview.quickSettings')"
             >
-              <Settings class="h-4 w-4 text-slate-300" />
+              <Settings class="h-4 w-4" />
             </router-link>
           </div>
+        </div>
+
+        <!-- Clean Full-Width Portal Bar (never squished!) -->
+        <div
+          v-if="portalTargetBadges.length > 0"
+          data-testid="overview-portal-targets"
+          class="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-800/70 pt-3.5"
+        >
+          <span
+            class="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full bg-indigo-500/20 px-2.5 py-1 text-[11px] font-semibold text-indigo-200 ring-1 ring-inset ring-indigo-400/30"
+          >
+            <Globe class="h-3 w-3 shrink-0" />
+            <span>{{ t("projOverview.portalsCount", { count: portalTargetBadges.length }) }}</span>
+          </span>
+          <a
+            v-for="portal in portalTargetBadges.slice(0, 4)"
+            :key="portal.id"
+            :href="portal.baseUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+            :title="portal.baseUrl"
+            class="inline-flex max-w-full items-center gap-1.5 whitespace-nowrap rounded-full bg-slate-800/90 px-3 py-1 text-xs text-slate-200 ring-1 ring-inset ring-slate-700/90 transition hover:border-sky-400/50 hover:bg-slate-800 hover:text-white"
+          >
+            <span v-if="portal.label" class="shrink-0 font-semibold text-white">{{ portal.label }}</span>
+            <span v-if="portal.label" class="text-slate-500">·</span>
+            <span class="max-w-[200px] truncate font-mono text-[11px] text-sky-300">
+              {{ portal.host }}
+            </span>
+          </a>
+          <router-link
+            v-if="portalTargetBadges.length > 4"
+            :to="{ path: workspacePath('settings', projectId), query: { tab: 'targets' } }"
+            class="inline-flex shrink-0 items-center whitespace-nowrap rounded-full bg-slate-800/70 px-2.5 py-1 text-[11px] font-medium text-indigo-300 ring-1 ring-inset ring-slate-700 hover:bg-slate-700"
+          >
+            {{ t("projOverview.morePortals", { count: portalTargetBadges.length - 4 }) }}
+          </router-link>
         </div>
 
         <!-- Visual User Journey: Input -> Hub -> 3 Core Capabilities -->

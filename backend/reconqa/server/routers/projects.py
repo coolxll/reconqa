@@ -39,6 +39,7 @@ from reconqa.models.schemas import (
     ReplayResponse,
     TargetCreate,
     TargetOut,
+    TargetUpdate,
 )
 from reconqa.models.tables import AuthProfile, KnowledgeDoc, Project, Run, Target
 from reconqa.modules.hub.inventory import build_project_inventory
@@ -179,6 +180,41 @@ async def list_targets(project_id: str, db: AsyncSession = Depends(get_db)) -> l
     await _get_project_or_404(db, project_id)
     res = await db.execute(select(Target).where(Target.project_id == project_id))
     return list(res.scalars().all())
+
+
+@router.patch("/projects/{project_id}/targets/{target_id}", response_model=TargetOut)
+async def update_target(
+    project_id: str,
+    target_id: str,
+    body: TargetUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> Target:
+    await _get_project_or_404(db, project_id)
+    target = await db.get(Target, target_id)
+    if target is None or target.project_id != project_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Target '{target_id}' not found in project '{project_id}'",
+        )
+    if body.root_domain is not None:
+        trimmed_dom = body.root_domain.strip()
+        if trimmed_dom:
+            target.root_domain = trimmed_dom
+    if body.base_url is not None:
+        trimmed_url = body.base_url.strip()
+        if trimmed_url:
+            target.base_url = trimmed_url
+            if body.root_domain is None and not (target.root_domain or "").strip():
+                host = urlparse(trimmed_url).hostname or ""
+                if host:
+                    target.root_domain = host
+    if body.scope_rules is not None:
+        merged_rules = dict(target.scope_rules or {})
+        merged_rules.update(body.scope_rules)
+        target.scope_rules = merged_rules
+    await db.commit()
+    await db.refresh(target)
+    return target
 
 
 @router.delete("/projects/{project_id}/targets/{target_id}")

@@ -82,6 +82,8 @@ registerMessages({
     "projOverview.quickScenarios": "业务场景",
     "projOverview.quickKb": "项目知识库",
     "projOverview.quickSettings": "项目设置",
+    "projOverview.portalsCount": "{count} 个门户",
+    "projOverview.morePortals": "+{count} 更多",
     "projOverview.toolchainCardTitle": "平台工具链状态",
     "projOverview.toolchainCardReady": "核心工具 {coreReady}/{coreTotal} 就绪 · 全部 {totalReady}/{total}",
     "projOverview.toolchainManageBtn": "进入工具链诊断 →",
@@ -232,6 +234,10 @@ registerMessages({
     "settings.auth.valueSupportHint": "支持直接填写请求头值（如 Bearer Token、Raw Token、Cookie 串）或 ENV:VAR_NAME 环境变量引用；列表中非 ENV 凭据将自动脱敏展示。",
     "settings.target.portalLabel": "门户名称（可选）",
     "settings.target.portalPlaceholder": "例如：管理后台 / 商户端 / 医生端 (PC)",
+    "settings.target.editBtn": "编辑",
+    "settings.target.saveBtn": "保存",
+    "settings.target.updatedToast": "已更新目标门户配置。",
+    "settings.target.errUpdate": "更新目标门户失败",
     "settings.auth.customRolePlaceholder": "如 admin / doctor / pharmacy / account_a",
     "settings.auth.rolePresetsHint": "点击快速预设或自由输入任意业务角色标识",
 
@@ -279,6 +285,12 @@ registerMessages({
     "extTool.toggleLogs": "查看终端输出 (stdout_tail)",
     "extTool.hideLogs": "收起终端输出",
     "extTool.errExec": "触发外部工具执行失败",
+
+    // Knowledge Base Markdown Preview
+    "kb.previewRendered": "渲染视图",
+    "kb.previewRaw": "源码",
+    "kb.copyMarkdown": "复制 Markdown",
+    "kb.copiedMarkdown": "已复制",
   },
   en: {
     // Workspace Switcher & Sidebar Navigation
@@ -373,6 +385,8 @@ registerMessages({
     "projOverview.quickScenarios": "Scenarios",
     "projOverview.quickKb": "Knowledge Base",
     "projOverview.quickSettings": "Settings",
+    "projOverview.portalsCount": "{count} Portals",
+    "projOverview.morePortals": "+{count} more",
     "projOverview.toolchainCardTitle": "Platform Toolchain Status",
     "projOverview.toolchainCardReady": "Core {coreReady}/{coreTotal} ready · Total {totalReady}/{total}",
     "projOverview.toolchainManageBtn": "Open Toolchain Doctor →",
@@ -526,6 +540,10 @@ registerMessages({
     "settings.auth.valueSupportHint": "Supports both direct header values (Bearer token, raw token, Cookie string) and ENV:VAR_NAME references; non-ENV values are automatically masked on display.",
     "settings.target.portalLabel": "Portal Name (optional)",
     "settings.target.portalPlaceholder": "e.g. Admin Console / Partner Portal / User Web",
+    "settings.target.editBtn": "Edit",
+    "settings.target.saveBtn": "Save",
+    "settings.target.updatedToast": "Target portal updated.",
+    "settings.target.errUpdate": "Failed to update target portal",
     "settings.auth.customRolePlaceholder": "e.g. admin / doctor / pharmacy / account_a",
     "settings.auth.rolePresetsHint": "Click a preset or type any custom business role tag",
 
@@ -577,5 +595,11 @@ registerMessages({
     "extTool.toggleLogs": "Show stdout_tail",
     "extTool.hideLogs": "Hide stdout_tail",
     "extTool.errExec": "Failed to execute external tool",
+
+    // Knowledge Base Markdown Preview
+    "kb.previewRendered": "Preview",
+    "kb.previewRaw": "Raw",
+    "kb.copyMarkdown": "Copy Markdown",
+    "kb.copiedMarkdown": "Copied",
   },
 });

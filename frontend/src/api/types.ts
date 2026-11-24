@@ -35,6 +35,12 @@ export interface TargetCreate {
   scope_rules?: Record<string, unknown>;
 }
 
+export interface TargetUpdate {
+  root_domain?: string;
+  base_url?: string;
+  scope_rules?: Record<string, unknown>;
+}
+
 export interface AuthProfile {
   id: string;
   project_id: string;

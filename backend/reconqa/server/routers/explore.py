@@ -22,6 +22,7 @@ from reconqa.models.db import get_db
 from reconqa.models.schemas import RunOut
 from reconqa.models.tables import Job, Project, Run, Target
 from reconqa.modules.discovery.seed_explorer import (
+    _collect_merged_hosts,
     _registrable_root_domain,
     explore_from_seed,
     extract_seed_root_domain,
@@ -40,12 +41,22 @@ _SYNTHETIC_RESP_TEXT = json.dumps({"code": 0, "msg": "ok", "data": {}})
 class ExploreRequest(BaseModel):
     seed_curl: str | None = None
     target_url: str | None = None
+    target_urls: list[str] | None = None
     mode: Literal["passive", "active"] = "passive"
     probe_openapi_docs: bool = True
     crawl_js: bool = True
     depth: int = 2
     merge: bool = True
     project_id: str | None = None
+
+
+class ExploreAllTargetsRequest(BaseModel):
+    target_ids: list[str] | None = None
+    mode: Literal["passive", "active"] = "passive"
+    probe_openapi_docs: bool = True
+    crawl_js: bool = True
+    depth: int = 2
+    merge: bool = True
 
 
 class PromoteToRunRequest(BaseModel):
@@ -331,21 +342,159 @@ async def find_project_explores(db: AsyncSession, project_id: str) -> list[dict[
     return matched
 
 
+def _parse_batch_target_urls(
+    target_url: str | None,
+    target_urls: list[str] | None,
+) -> list[str]:
+    """Extract deduplicated URLs from target_urls and newline/comma-separated target_url."""
+    raw_items: list[str] = []
+    if target_urls:
+        for item in target_urls:
+            if item and str(item).strip():
+                raw_items.extend(re.split(r"[\r\n,]+", str(item)))
+    if target_url and target_url.strip():
+        raw_items.extend(re.split(r"[\r\n,]+", target_url))
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        u = raw.strip()
+        if not u:
+            continue
+        if u not in seen:
+            seen.add(u)
+            cleaned.append(u)
+    return cleaned
+
+
+async def _run_batch_explore_urls(
+    urls: list[str],
+    *,
+    mode: str,
+    probe_openapi_docs: bool,
+    crawl_js: bool,
+    depth: int,
+    merge: bool,
+    project_id: str | None,
+) -> tuple[dict[str, Any], list[tuple[str, int]]]:
+    """Explore multiple portal URLs with bounded concurrency (2) and merge into root-domain inventory."""
+    sem = asyncio.Semaphore(2)
+    per_url_out: list[tuple[str, Path | None, dict[str, Any] | None, str | None]] = []
+
+    async def _explore_one(u: str) -> tuple[str, Path | None, dict[str, Any] | None, str | None]:
+        async with sem:
+            sid = uuid.uuid4().hex[:12]
+            tdir = ensure_dir(_explores_root() / f"_tmp_{sid}")
+            try:
+                res = await asyncio.to_thread(
+                    explore_from_seed,
+                    tdir,
+                    target_url=u,
+                    mode=mode,
+                    probe_openapi_docs=probe_openapi_docs,
+                    crawl_js=crawl_js,
+                    depth=depth,
+                    explore_id=sid,
+                )
+                if project_id:
+                    res["project_id"] = project_id
+                return u, tdir, res, None
+            except Exception as exc:
+                shutil.rmtree(tdir, ignore_errors=True)
+                return u, None, None, str(exc)
+
+    results = await asyncio.gather(*(_explore_one(u) for u in urls))
+    per_url_out.extend(results)
+
+    succeeded = [(u, tdir, res) for (u, tdir, res, err) in per_url_out if res is not None and tdir is not None]
+    failed_warnings = [f"Failed to explore {u}: {err}" for (u, _, res, err) in per_url_out if res is None and err]
+
+    if not succeeded:
+        raise HTTPException(
+            status_code=400,
+            detail="; ".join(failed_warnings) or "All target URLs failed to explore.",
+        )
+
+    # Determine canonical explore_id from first successful root domain
+    first_url, _, first_res = succeeded[0]
+    primary_domain = (
+        str((first_res.get("seed") or {}).get("root_domain") or "").strip().lower()
+        or extract_seed_root_domain(None, first_url)
+    )
+    batch_scan_id = uuid.uuid4().hex[:12]
+    final_id = _domain_explore_id(primary_domain) if (merge and primary_domain) else batch_scan_id
+    dest_dir = ensure_dir(_explores_root() / final_id)
+    existing_path = dest_dir / "explore_result.json"
+
+    merged_result: dict[str, Any] | None = None
+    if merge and existing_path.is_file():
+        try:
+            merged_result = read_json(existing_path)
+        except Exception:
+            merged_result = None
+
+    counts_by_url: list[tuple[str, int]] = []
+    for idx, (u, tdir, incoming) in enumerate(succeeded):
+        ep_count = len(incoming.get("discovered_endpoints") or [])
+        counts_by_url.append((u, ep_count))
+        ts_tag = datetime.now(UTC).strftime("%Y%m%d%H%M%S") + f"_{idx:02d}_" + str(incoming.get("explore_id") or "")[:6]
+        _copy_explore_supporting_files(tdir, dest_dir, ts_tag)
+        if merged_result is None:
+            merged_result = dict(incoming)
+            merged_result["explore_id"] = final_id
+        else:
+            merged_result = merge_explore_results(merged_result, incoming, explore_id=final_id)
+        shutil.rmtree(tdir, ignore_errors=True)
+
+    # Append zero counts for failed URLs in counts_by_url
+    succeeded_urls = {u for u, _, _ in succeeded}
+    for u in urls:
+        if u not in succeeded_urls:
+            counts_by_url.append((u, 0))
+
+    assert merged_result is not None
+    if project_id:
+        merged_result["project_id"] = project_id
+    if failed_warnings:
+        merged_result["warnings"] = list(
+            dict.fromkeys([*(merged_result.get("warnings") or []), *failed_warnings])
+        )[-30:]
+    merged_hosts = _collect_merged_hosts(merged_result)
+    merged_result["merged_hosts"] = merged_hosts
+    merged_result["seed_hosts"] = list(merged_hosts)
+    write_json(existing_path, merged_result)
+    return merged_result, counts_by_url
+
+
 @router.post("/explore", status_code=status.HTTP_201_CREATED)
 @router.post("/explore/seed", status_code=status.HTTP_201_CREATED)
 async def run_explore(body: ExploreRequest) -> dict[str, Any]:
-    """Run an Explore & Discovery scan, automatically merging assets by root domain when merge=True."""
+    """Run an Explore & Discovery scan (single or multi-URL batch), merging by root domain."""
     has_curl = bool(body.seed_curl and body.seed_curl.strip())
-    has_url = bool(body.target_url and body.target_url.strip())
-    if not has_curl and not has_url:
+    parsed_urls = _parse_batch_target_urls(body.target_url, body.target_urls)
+    if not has_curl and not parsed_urls:
         raise HTTPException(
             status_code=400,
-            detail="Either seed_curl or target_url must be provided.",
+            detail="Either seed_curl, target_url, or target_urls must be provided.",
         )
 
     if body.merge:
         _consolidate_legacy_explores()
 
+    # Multi-URL batch explore path (when >= 2 URLs provided via target_urls or multiline target_url)
+    if not has_curl and len(parsed_urls) >= 2:
+        merged_result, _ = await _run_batch_explore_urls(
+            parsed_urls,
+            mode=body.mode,
+            probe_openapi_docs=body.probe_openapi_docs,
+            crawl_js=body.crawl_js,
+            depth=body.depth,
+            merge=body.merge,
+            project_id=body.project_id,
+        )
+        return merged_result
+
+    single_url = parsed_urls[0] if parsed_urls else body.target_url
     scan_id = uuid.uuid4().hex[:12]
     tmp_dir = ensure_dir(_explores_root() / f"_tmp_{scan_id}")
     try:
@@ -353,7 +502,7 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
             explore_from_seed,
             tmp_dir,
             seed_curl=body.seed_curl,
-            target_url=body.target_url,
+            target_url=single_url,
             mode=body.mode,
             probe_openapi_docs=body.probe_openapi_docs,
             crawl_js=body.crawl_js,
@@ -369,7 +518,7 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
 
     resolved_domain = (
         str((incoming.get("seed") or {}).get("root_domain") or "").strip().lower()
-        or extract_seed_root_domain(body.seed_curl, body.target_url)
+        or extract_seed_root_domain(body.seed_curl, single_url)
     )
     final_id = _domain_explore_id(resolved_domain) if (body.merge and resolved_domain) else scan_id
     dest_dir = ensure_dir(_explores_root() / final_id)
@@ -385,9 +534,84 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
         final_result = dict(incoming)
         final_result["explore_id"] = final_id
 
+    merged_hosts = _collect_merged_hosts(final_result)
+    final_result["merged_hosts"] = merged_hosts
+    final_result["seed_hosts"] = list(merged_hosts)
     write_json(existing_path, final_result)
     shutil.rmtree(tmp_dir, ignore_errors=True)
     return final_result
+
+
+@router.post("/projects/{project_id}/explore-all", status_code=status.HTTP_201_CREATED)
+async def explore_all_project_targets(
+    project_id: str,
+    body: ExploreAllTargetsRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Run multi-portal batch explore across all (or selected) registered Targets of a project."""
+    project = await db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    t_res = await db.execute(select(Target).where(Target.project_id == project_id))
+    all_targets = list(t_res.scalars().all())
+    if not all_targets:
+        raise HTTPException(
+            status_code=400,
+            detail="No targets configured for this project. Add at least one portal Target first.",
+        )
+
+    if body.target_ids:
+        by_id = {t.id: t for t in all_targets}
+        selected_targets = [by_id[tid] for tid in body.target_ids if tid in by_id]
+        if not selected_targets:
+            raise HTTPException(
+                status_code=400,
+                detail="None of the requested target_ids belong to this project.",
+            )
+    else:
+        selected_targets = all_targets
+
+    if body.merge:
+        _consolidate_legacy_explores()
+
+    target_url_pairs: list[tuple[Target, str]] = []
+    urls: list[str] = []
+    for tgt in selected_targets:
+        u = (tgt.base_url or "").strip()
+        if not u and tgt.root_domain:
+            u = f"https://{tgt.root_domain.strip()}"
+        if u:
+            target_url_pairs.append((tgt, u))
+            urls.append(u)
+
+    if not urls:
+        raise HTTPException(status_code=400, detail="Selected targets have no valid URLs.")
+
+    merged_result, counts_by_url = await _run_batch_explore_urls(
+        urls,
+        mode=body.mode,
+        probe_openapi_docs=body.probe_openapi_docs,
+        crawl_js=body.crawl_js,
+        depth=body.depth,
+        merge=body.merge,
+        project_id=project_id,
+    )
+    count_map = dict(counts_by_url)
+    explored_targets = [
+        {
+            "id": tgt.id,
+            "portal_label": str((tgt.scope_rules or {}).get("portal_label") or ""),
+            "base_url": u,
+            "endpoints_found": int(count_map.get(u, 0)),
+        }
+        for tgt, u in target_url_pairs
+    ]
+    merged_result["explored_targets"] = explored_targets
+    dest_path = _explores_root() / str(merged_result["explore_id"]) / "explore_result.json"
+    if dest_path.parent.is_dir():
+        write_json(dest_path, merged_result)
+    return merged_result
 
 
 @router.get("/explore")
@@ -417,14 +641,19 @@ async def list_explores(
         summary["scans_count"] = scans_count
         created_at = str(data.get("created_at") or "")
         updated_at = str(data.get("updated_at") or created_at)
+        seed_info = data.get("seed") or {}
+        merged_hosts = _collect_merged_hosts(data)
         items.append(
             {
                 "explore_id": data.get("explore_id", res_file.parent.name),
                 "project_id": data.get("project_id"),
+                "root_domain": str(seed_info.get("root_domain") or ""),
+                "merged_hosts": merged_hosts,
+                "seed_hosts": list(merged_hosts),
                 "created_at": created_at,
                 "updated_at": updated_at,
                 "mode": data.get("mode", "passive"),
-                "seed": data.get("seed", {}),
+                "seed": seed_info,
                 "summary": summary,
                 "scans_count": scans_count,
             }
@@ -437,6 +666,9 @@ async def list_explores(
 async def get_explore(explore_id: str) -> dict[str, Any]:
     """Return full ExploreResult for a saved explore session."""
     _, data = _load_explore_or_404(explore_id)
+    merged_hosts = _collect_merged_hosts(data)
+    data.setdefault("merged_hosts", merged_hosts)
+    data.setdefault("seed_hosts", list(merged_hosts))
     return data
 
 

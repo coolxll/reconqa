@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   Activity,
@@ -22,6 +22,8 @@ import {
   Wrench,
   X,
 } from "lucide-vue-next";
+import { listTargets } from "@/api/projects";
+import type { Target } from "@/api/types";
 import { useI18n } from "@/i18n";
 import { useWorkspace, type WorkspaceSection } from "@/stores/workspace";
 
@@ -55,6 +57,41 @@ const apiOnline = ref<boolean | null>(null);
 const switcherOpen = ref(false);
 const switcherSearch = ref("");
 const switcherRef = ref<HTMLElement | null>(null);
+const activeProjectTargets = ref<Target[]>([]);
+
+async function refreshActiveTargets(pid: string): Promise<void> {
+  if (!pid) {
+    activeProjectTargets.value = [];
+    return;
+  }
+  try {
+    activeProjectTargets.value = await listTargets(pid);
+  } catch {
+    activeProjectTargets.value = [];
+  }
+}
+
+watch(
+  activeProjectId,
+  (pid) => {
+    void refreshActiveTargets(pid);
+  },
+  { immediate: true }
+);
+
+const activeProjectSubtitle = computed(() => {
+  const count = activeProjectTargets.value.length;
+  if (count > 1) {
+    const firstRoot = activeProjectTargets.value[0]?.root_domain || "";
+    return firstRoot
+      ? `${t("projOverview.portalsCount", { count })} · ${firstRoot}`
+      : t("projOverview.portalsCount", { count });
+  }
+  if (count === 1) {
+    return activeProjectTargets.value[0].root_domain || activeProject.value?.slug || "";
+  }
+  return activeProject.value?.slug || t("ws.allProjects");
+});
 
 // Quick Create Project modal
 const createModalOpen = ref(false);
@@ -286,7 +323,7 @@ onBeforeUnmount(() => {
               {{ activeProject?.name || t("ws.noProjectSelected") }}
             </div>
             <div class="truncate font-mono text-[10px] text-slate-400">
-              {{ activeProject?.slug || t("ws.allProjects") }}
+              {{ activeProjectSubtitle }}
             </div>
           </div>
         </div>
