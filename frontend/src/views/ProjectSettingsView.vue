@@ -178,7 +178,7 @@ function storageStateBasename(fullPath: string | null): string {
 function maskHeaderValue(val: string): string {
   const trimmed = (val ?? "").trim();
   if (!trimmed) return "—";
-  if (trimmed.startsWith("ENV:")) return trimmed;
+  if (/^env:/i.test(trimmed) || /^\$\{.+\}$/.test(trimmed)) return trimmed;
   if (trimmed.length > 10) {
     return `${trimmed.slice(0, 4)}•••${trimmed.slice(-4)}`;
   }

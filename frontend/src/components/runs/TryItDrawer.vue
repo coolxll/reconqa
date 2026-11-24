@@ -28,6 +28,7 @@ import {
 } from "@/api/projects";
 import type { AuthProfile, ReplayMatrixResponse, ReplayResponse, RoleTag } from "@/api/types";
 import { useI18n } from "@/i18n";
+import { copyToClipboard } from "@/utils/clipboard";
 
 export interface TryItEndpointInput {
   method: string;
@@ -468,15 +469,12 @@ async function handleRunRoleMatrix(): Promise<void> {
 
 async function copyResponseBody(): Promise<void> {
   if (!formattedResponseBody.value) return;
-  try {
-    await navigator.clipboard.writeText(formattedResponseBody.value);
-    copiedResp.value = true;
-    window.setTimeout(() => {
-      copiedResp.value = false;
-    }, 1800);
-  } catch {
-    copiedResp.value = true;
-  }
+  const ok = await copyToClipboard(formattedResponseBody.value);
+  if (!ok) return;
+  copiedResp.value = true;
+  window.setTimeout(() => {
+    copiedResp.value = false;
+  }, 1800);
 }
 </script>
 

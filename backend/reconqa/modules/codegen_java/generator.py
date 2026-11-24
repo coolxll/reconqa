@@ -88,13 +88,14 @@ _BRACKET_KEY_RE = re.compile(r"""\[(['"])(.*?)\1\]""")
 def escape_java_string(value: Any) -> str:
     """Escape a Python value for safe embedding inside a Java double-quoted string literal."""
     text = "" if value is None else str(value)
-    return (
+    escaped = (
         text.replace("\\", "\\\\")
         .replace('"', '\\"')
         .replace("\r", "\\r")
         .replace("\n", "\\n")
         .replace("\t", "\\t")
     )
+    return "".join(ch for ch in escaped if 32 <= ord(ch) != 127)
 
 
 def sanitize_java_identifier(raw: str, *, pascal: bool = False, default: str = "item") -> str:
@@ -503,8 +504,28 @@ def _build_l2_path_template(step: dict[str, Any]) -> str:
     return path_template
 
 
+_SAFE_JSONPATH_RE = re.compile(r"^[A-Za-z0-9_$.\[\]\-\s]{1,120}$")
+
+
+def _has_balanced_brackets(expr: str) -> bool:
+    depth = 0
+    for ch in expr:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
 def _sanitize_java_comment(text: Any) -> str:
-    return re.sub(r"[\r\n]+", " ", str(text or "")).replace("*/", "* /").strip()
+    """Sanitize text for single-line Java comments (neutralizing \\uXXXX lexical escapes & control chars)."""
+    raw = str(text or "")
+    cleaned = re.sub(r"[\r\n]+", " ", raw)
+    cleaned = cleaned.replace("*/", "* /").replace("\\", "/")
+    cleaned = "".join(ch for ch in cleaned if ord(ch) >= 32)
+    return cleaned.strip()
 
 
 def _parse_java_number_literal(raw: str) -> str | None:
@@ -527,6 +548,15 @@ def _compile_scenario_assertion_java(assertion: dict[str, Any]) -> dict[str, Any
     operator = str(assertion.get("operator") or "not_empty").strip().lower()
     expected = "" if assertion.get("expected") is None else str(assertion.get("expected"))
     raw_jsonpath = str(assertion.get("jsonpath") or "").strip()
+    if raw_jsonpath and (
+        not _SAFE_JSONPATH_RE.fullmatch(raw_jsonpath)
+        or not _has_balanced_brackets(raw_jsonpath)
+    ):
+        safe_jp = _sanitize_java_comment(raw_jsonpath)
+        return {
+            "comment": f"// Business Assertion [{priority}]: {title}",
+            "lines": [f"// Skipped unsafe jsonpath: {safe_jp}"],
+        }
     gpath = jsonpath_to_gpath(raw_jsonpath)
     gpath_esc = escape_java_string(gpath)
     expected_esc = escape_java_string(expected)

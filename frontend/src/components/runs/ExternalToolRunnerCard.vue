@@ -49,40 +49,51 @@ const result = ref<ExecuteExternalToolResponse | null>(null);
 const execError = ref<string | null>(null);
 const showLogs = ref(false);
 
+let profileLoadSeq = 0;
+
 async function loadProfiles(): Promise<void> {
-  if (!props.projectId) {
+  const targetPid = props.projectId;
+  const reqId = ++profileLoadSeq;
+  if (!targetPid) {
     authProfiles.value = [];
+    selectedCredentialId.value = "";
     return;
   }
   try {
-    const list = await listAuthProfiles(props.projectId);
+    const list = await listAuthProfiles(targetPid);
+    if (reqId !== profileLoadSeq || props.projectId !== targetPid) return;
     authProfiles.value = list;
     if (list.length > 0 && !selectedCredentialId.value) {
       selectedCredentialId.value = list[0].id;
     }
   } catch {
+    if (reqId !== profileLoadSeq || props.projectId !== targetPid) return;
     authProfiles.value = [];
   }
 }
 
 async function runTool(tool: ExternalToolName): Promise<void> {
   if (!props.projectId || !props.runId || runningTool.value) return;
+  const targetPid = props.projectId;
+  const targetRunId = props.runId;
   runningTool.value = tool;
   execError.value = null;
   result.value = null;
   showLogs.value = false;
   try {
-    const res = await executeRunExternalTool(props.projectId, props.runId, {
+    const res = await executeRunExternalTool(targetPid, targetRunId, {
       tool,
       credential_id: selectedCredentialId.value || null,
       sync_scenarios: syncScenarios.value,
       timeout_sec: 120,
     });
+    if (props.projectId !== targetPid || props.runId !== targetRunId) return;
     result.value = res;
     if (res.executed) {
       emit("executed");
     }
   } catch (err) {
+    if (props.projectId !== targetPid || props.runId !== targetRunId) return;
     execError.value = err instanceof Error ? err.message : t("extTool.errExec");
   } finally {
     runningTool.value = null;
@@ -107,7 +118,18 @@ function formatSummaryEntries(summary: Record<string, unknown>): Array<[string, 
 }
 
 watch(() => props.projectId, () => {
+  selectedCredentialId.value = "";
+  authProfiles.value = [];
+  result.value = null;
+  execError.value = null;
+  showLogs.value = false;
   void loadProfiles();
+});
+
+watch(() => props.runId, () => {
+  result.value = null;
+  execError.value = null;
+  showLogs.value = false;
 });
 
 onMounted(() => {

@@ -78,7 +78,7 @@ const javaZipUrl = computed(() => artifactDownloadUrl(props.runId, "java-tests")
 
 const mavenCommand = "mvn test && allure serve target/allure-results";
 const dockerRunnerCommand =
-  "docker compose --profile runners run --rm java-runner -Dbase.url=https://api.example.com";
+  "docker compose --profile runner run --rm -e RECONQA_BASE_URI=https://api.example.com java-runner";
 
 const normalizedTests = computed<NormalizedTestCase[]>(() => {
   const rep = report.value;
@@ -212,12 +212,17 @@ const schemathesisSummary = computed(() => {
   const sch = report.value?.schemathesis;
   if (!sch || typeof sch.summary !== "object" || sch.summary === null) return null;
   const s = sch.summary as Record<string, unknown>;
+  const passed = Number(s.passed ?? s.checks_passed ?? 0);
+  const failed = Number(s.failed ?? s.checks_failed ?? 0);
+  const errors = Number(s.errors ?? s.server_errors ?? 0);
+  const skipped = Number(s.skipped ?? 0);
+  const total = Number(s.total ?? passed + failed + errors + skipped);
   return {
-    total: Number(s.total ?? 0),
-    passed: Number(s.passed ?? 0),
-    failed: Number(s.failed ?? 0),
-    errors: Number(s.errors ?? 0),
-    skipped: Number(s.skipped ?? 0),
+    total,
+    passed,
+    failed,
+    errors,
+    skipped,
   };
 });
 

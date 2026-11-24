@@ -1046,15 +1046,12 @@ def create_mcp_server(
         if not clean_slug:
             raise ValueError("slug must not be empty.")
 
-        effective_name = (
-            (name or "").strip()
-            or clean_slug.replace("_", " ").replace("-", " ").title()
-        )
         payload: dict[str, Any] = {
             "slug": clean_slug,
-            "name": effective_name,
             "source": "ai-agent",
         }
+        if name is not None and name.strip():
+            payload["name"] = name.strip()
         if description is not None:
             payload["description"] = description
         if preconditions is not None:
@@ -1084,7 +1081,7 @@ def create_mcp_server(
             "id": data.get("id"),
             "project_id": data.get("project_id", project_id),
             "slug": data.get("slug", clean_slug),
-            "name": data.get("name", effective_name),
+            "name": data.get("name", (name or "").strip()),
             "priority": data.get("priority", "P2"),
             "status": data.get("status", "active"),
             "business_domain": data.get("business_domain", ""),

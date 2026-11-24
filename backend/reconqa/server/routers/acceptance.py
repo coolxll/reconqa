@@ -432,9 +432,6 @@ async def _sync_scenarios_after_tool(
     synced_negative_cases = 0
 
     if tool == "java_test":
-        suite_total = int(exec_summary.get("total") or 0)
-        suite_failed = int(exec_summary.get("failed") or 0)
-
         for row in rows:
             assertions = _parse_assertions(row)
             if not assertions:
@@ -458,8 +455,6 @@ async def _sync_scenarios_after_tool(
                         new_status = "failed"
                     elif "PASSED" in statuses:
                         new_status = "passed"
-                elif suite_total > 0 and suite_failed == 0 and a.target_endpoint:
-                    new_status = "passed"
 
                 if new_status is not None and a.status != new_status:
                     a.status = new_status
@@ -475,23 +470,31 @@ async def _sync_scenarios_after_tool(
 
     elif tool == "schemathesis":
         server_errors = int(exec_summary.get("server_errors") or 0)
-        target_nc_status: Literal["covered", "failed"] = "failed" if server_errors > 0 else "covered"
-        for row in rows:
-            neg_cases = _parse_negative_cases(row)
-            if not neg_cases:
-                continue
-            row_changed = False
-            for nc in neg_cases:
-                if nc.category in {"validation", "boundary"} and nc.status != target_nc_status:
-                    nc.status = target_nc_status
-                    row_changed = True
-                    synced_negative_cases += 1
-            if row_changed:
-                row.negative_cases_json = json.dumps(
-                    [nc.model_dump() for nc in neg_cases], ensure_ascii=False
-                )
-                row.updated_at = now
-                synced_scenarios += 1
+        checks_passed = int(exec_summary.get("checks_passed") or 0)
+        if server_errors > 0:
+            target_nc_status: Literal["covered", "failed"] | None = "failed"
+        elif checks_passed > 0:
+            target_nc_status = "covered"
+        else:
+            target_nc_status = None
+
+        if target_nc_status is not None:
+            for row in rows:
+                neg_cases = _parse_negative_cases(row)
+                if not neg_cases:
+                    continue
+                row_changed = False
+                for nc in neg_cases:
+                    if nc.category in {"validation", "boundary"} and nc.status != target_nc_status:
+                        nc.status = target_nc_status
+                        row_changed = True
+                        synced_negative_cases += 1
+                if row_changed:
+                    row.negative_cases_json = json.dumps(
+                        [nc.model_dump() for nc in neg_cases], ensure_ascii=False
+                    )
+                    row.updated_at = now
+                    synced_scenarios += 1
 
     elif tool == "nuclei":
         high_crit = int(exec_summary.get("high_or_critical") or 0)
@@ -669,13 +672,19 @@ async def execute_run_external_tool(
             cmd.append(f"-DbaseUrl={effective_base_url}")
             cmd.append(f"-Dbase.uri={effective_base_url}")
 
+        summary_path = java_dir / "target" / "reconqa-execution-summary.json"
+        if summary_path.is_file():
+            try:
+                summary_path.unlink()
+            except OSError:
+                pass
+
         rc, out, err, timed_out = await _run_exec(
             cmd, cwd=java_dir, env=env, timeout=clamped_timeout
         )
         combined = "\n".join(p for p in (out.strip(), err.strip()) if p)
         stdout_tail = _redact_secrets_from_text(combined[-4000:], secret_values)
 
-        summary_path = java_dir / "target" / "reconqa-execution-summary.json"
         total = passed = failed = skipped = 0
         summary_dur = 0.0
         if summary_path.is_file():
@@ -744,6 +753,12 @@ async def execute_run_external_tool(
         out_dir = ensure_dir(run_dir / "java-tests")
         junit_path = out_dir / "schemathesis_junit.xml"
         report_path = out_dir / "schemathesis_report.json"
+        for stale_file in (junit_path, report_path):
+            if stale_file.is_file():
+                try:
+                    stale_file.unlink()
+                except OSError:
+                    pass
 
         cmd = [
             bin_path,
@@ -783,11 +798,17 @@ async def execute_run_external_tool(
 
         checks_passed = int(st_summary.get("passed") or 0)
         checks_failed = int(st_summary.get("failed") or 0) + int(st_summary.get("errors") or 0)
+        skipped_cnt = int(st_summary.get("skipped") or 0)
+        total_cnt = int(st_summary.get("total") or (checks_passed + checks_failed + skipped_cnt))
         exec_summary = {
+            "passed": checks_passed,
+            "failed": int(st_summary.get("failed") or 0),
+            "errors": int(st_summary.get("errors") or server_errors),
+            "skipped": skipped_cnt,
             "checks_passed": checks_passed,
             "checks_failed": checks_failed,
             "server_errors": server_errors,
-            "total": int(st_summary.get("total") or (checks_passed + checks_failed)),
+            "total": total_cnt,
         }
         if timed_out:
             status_val = "timeout"
@@ -915,7 +936,11 @@ async def execute_run_external_tool(
             error_msg = f"k6 exited with code {rc}"
 
     synced_scenarios = synced_assertions = synced_negative_cases = 0
-    if body.sync_scenarios and tool in {"java_test", "schemathesis", "nuclei"}:
+    if (
+        body.sync_scenarios
+        and status_val not in {"error", "timeout", "timed_out", "tool_missing"}
+        and tool in {"java_test", "schemathesis", "nuclei"}
+    ):
         synced_scenarios, synced_assertions, synced_negative_cases = (
             await _sync_scenarios_after_tool(
                 db,

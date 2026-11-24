@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
+import DOMPurify from 'dompurify'
 import mermaid from 'mermaid'
 import {
   AlertTriangle,
@@ -90,9 +91,10 @@ function initMermaidOnce() {
     startOnLoad: false,
     theme: 'neutral',
     securityLevel: 'strict',
+    htmlLabels: false,
     flowchart: {
       useMaxWidth: true,
-      htmlLabels: true,
+      htmlLabels: false,
       curve: 'basis',
     },
   })
@@ -156,7 +158,9 @@ async function renderDiagram(definition: string) {
   const safeId = `reconqa-mermaid-${renderCounter}-${Date.now()}`
   try {
     const { svg } = await mermaid.render(safeId, trimmed)
-    renderedSvg.value = svg
+    renderedSvg.value = DOMPurify.sanitize(svg, {
+      USE_PROFILES: { svg: true, svgFilters: true },
+    })
   } catch (err) {
     mermaidError.value =
       err instanceof Error ? err.message : 'Unable to render Mermaid SVG diagram.'

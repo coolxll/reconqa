@@ -211,9 +211,9 @@ async def update_target(
                 if host:
                     target.root_domain = host
     if body.scope_rules is not None:
-        merged_rules = dict(target.scope_rules or {})
-        merged_rules.update(body.scope_rules)
-        target.scope_rules = merged_rules
+        target.scope_rules = {
+            k: v for k, v in body.scope_rules.items() if v is not None and v != ""
+        }
     await db.commit()
     await db.refresh(target)
     return target
@@ -306,7 +306,7 @@ async def create_auth_profile(
         project_id=project_id,
         name=body.name,
         role_tag=body.role_tag,
-        storage_state_path=body.storage_state_path,
+        storage_state_path=None,
         extra_headers_ref=body.extra_headers_ref,
     )
     db.add(profile)
@@ -372,8 +372,9 @@ async def delete_auth_profile(
     if profile is None or profile.project_id != project_id:
         raise HTTPException(status_code=404, detail=f"Auth profile '{profile_id}' not found")
     if profile.storage_state_path:
-        p = Path(profile.storage_state_path)
-        if p.is_file():
+        p = Path(profile.storage_state_path).resolve()
+        data_root = settings.data_dir.resolve()
+        if p.is_relative_to(data_root) and p.is_file():
             try:
                 p.unlink()
             except OSError:
@@ -707,13 +708,15 @@ def _should_bypass_env_proxy(host: str) -> bool:
 
 
 def _resolve_header_value(raw_val: str) -> str:
+    """Resolve ENV:RECONQA_* / ${RECONQA_*} references strictly within the RECONQA_ allowlist."""
     val = str(raw_val).strip()
     m = _ENV_REF_RE.match(val)
     if m:
-        return os.environ.get(m.group(1), val)
+        env_key = m.group(1)
+        return os.environ.get(env_key, "") if env_key.startswith("RECONQA_") else ""
     if val.lower().startswith("env:"):
         env_key = val[4:].strip()
-        return os.environ.get(env_key, val)
+        return os.environ.get(env_key, "") if env_key.startswith("RECONQA_") else ""
     return val
 
 

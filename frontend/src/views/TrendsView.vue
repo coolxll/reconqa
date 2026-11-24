@@ -375,7 +375,10 @@ function disposeCharts(): void {
   perfChainsChart = null;
 }
 
+let loadTrendsSeq = 0;
+
 async function loadTrends(projectId: string): Promise<void> {
+  const reqId = ++loadTrendsSeq;
   if (!projectId) {
     trendsData.value = null;
     disposeCharts();
@@ -386,6 +389,7 @@ async function loadTrends(projectId: string): Promise<void> {
   disposeCharts();
   try {
     const res = await getProjectTrends(projectId);
+    if (reqId !== loadTrendsSeq) return;
     trendsData.value = res;
     if (res.trends.length >= 2) {
       runAId.value = res.trends[res.trends.length - 2].run_id;
@@ -398,13 +402,16 @@ async function loadTrends(projectId: string): Promise<void> {
       runBId.value = "";
     }
   } catch (err) {
+    if (reqId !== loadTrendsSeq) return;
     trendsData.value = null;
     error.value = err instanceof Error ? err.message : t("trends.errorLoadTrends");
   } finally {
-    loadingTrends.value = false;
+    if (reqId === loadTrendsSeq) {
+      loadingTrends.value = false;
+    }
   }
 
-  if (points.value.length > 0 && !loadingProjects.value) {
+  if (reqId === loadTrendsSeq && points.value.length > 0 && !loadingProjects.value) {
     await nextTick();
     renderCharts();
   }
@@ -434,7 +441,17 @@ async function initProjects(): Promise<void> {
   }
 
   if (initialPid) {
-    selectedProjectId.value = initialPid;
+    if (selectedProjectId.value !== initialPid) {
+      selectedProjectId.value = initialPid;
+    } else if (points.value.length > 0 && !loadingTrends.value) {
+      await nextTick();
+      renderCharts();
+    } else if (!loadingTrends.value) {
+      await loadTrends(initialPid);
+    }
+  } else if (points.value.length > 0 && !loadingTrends.value) {
+    await nextTick();
+    renderCharts();
   }
 }
 

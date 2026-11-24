@@ -268,10 +268,39 @@ async def test_mcp_server_registers_all_tools_resources_and_executes_e2e(
             )
         )
         assert upserted["slug"] == "01_mcp_curl"
+        assert upserted["name"] == "Item Search Flow"
         assert upserted["source"] == "ai-agent"
         assert upserted["priority"] == "P0"
         assert upserted["assertion_count"] == 1
         assert upserted["negative_case_count"] == 1
+
+        # Partial upsert without `name` must preserve the existing custom scenario name
+        patched_without_name = _extract_json_result(
+            await mcp.call_tool(
+                "reconqa_upsert_scenario",
+                {
+                    "project_id": project_id,
+                    "slug": "01_mcp_curl",
+                    "assertions": [
+                        {
+                            "title": "Search returns items array",
+                            "target_endpoint": "GET /api/v1/items/search",
+                            "jsonpath": "$.data",
+                            "operator": "not_empty",
+                        },
+                        {
+                            "title": "Total count >= 0",
+                            "target_endpoint": "GET /api/v1/items/search",
+                            "jsonpath": "$.total",
+                            "operator": "gte",
+                            "expected": "0",
+                        },
+                    ],
+                },
+            )
+        )
+        assert patched_without_name["name"] == "Item Search Flow"
+        assert patched_without_name["assertion_count"] == 2
 
         sc_list = _extract_json_result(
             await mcp.call_tool(
@@ -673,3 +702,76 @@ async def test_mcp_external_acceptance_tools_mocked() -> None:
             "timeout_sec": 90,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_mcp_upsert_scenario_omits_name_when_unspecified() -> None:
+    """Regression: omitting name in reconqa_upsert_scenario omits 'name' and keeps custom name."""
+    sent_bodies: list[dict[str, Any]] = []
+    existing_custom_name = "核心结算主流程"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/v1/projects/proj_1/scenarios"
+        assert request.url.params.get("upsert") == "true"
+        body = json.loads(request.content.decode("utf-8"))
+        sent_bodies.append(body)
+        return httpx.Response(
+            201,
+            json={
+                "id": "sc_1",
+                "project_id": "proj_1",
+                "slug": body["slug"],
+                "name": body.get("name", existing_custom_name),
+                "priority": body.get("priority", "P0"),
+                "status": "active",
+                "business_domain": "commerce",
+                "owner": "qa-team",
+                "source": body["source"],
+                "tags": [],
+                "endpoint_count": 3,
+                "assertion_count": len(body.get("assertions", [])),
+                "negative_case_count": 0,
+                "effectiveness_level": "L3",
+            },
+        )
+
+    mcp = create_mcp_server("http://127.0.0.1:8000", transport=httpx.MockTransport(handler))
+
+    res = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_upsert_scenario",
+            {
+                "project_id": "proj_1",
+                "slug": "01_checkout",
+                "assertions": [
+                    {
+                        "title": "Order created",
+                        "target_endpoint": "POST /api/v1/orders/submit",
+                        "jsonpath": "$.data.order_id",
+                        "operator": "not_empty",
+                    }
+                ],
+            },
+        )
+    )
+    assert "name" not in sent_bodies[0]
+    assert sent_bodies[0]["slug"] == "01_checkout"
+    assert sent_bodies[0]["source"] == "ai-agent"
+    assert res["name"] == existing_custom_name
+    assert res["assertion_count"] == 1
+
+    # Blank/whitespace-only name is also omitted rather than overwriting custom name
+    res_blank = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_upsert_scenario",
+            {
+                "project_id": "proj_1",
+                "slug": "01_checkout",
+                "name": "   ",
+                "priority": "P0",
+            },
+        )
+    )
+    assert "name" not in sent_bodies[1]
+    assert res_blank["name"] == existing_custom_name

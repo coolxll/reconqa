@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -89,7 +90,7 @@ async def _upsert_har_artifacts(db: AsyncSession, run: Run) -> None:
     existing_by_path = {a.rel_path: a for a in existing_res.scalars().all()}
     for har_file in sorted(har_dir.glob("*.har")):
         rel = har_file.relative_to(run_dir).as_posix()
-        digest = sha256_file(har_file)
+        digest = await asyncio.to_thread(sha256_file, har_file)
         size = har_file.stat().st_size
         if rel in existing_by_path:
             existing_by_path[rel].sha256 = digest
@@ -162,6 +163,29 @@ async def _sync_run_target_url_from_hars(
         await db.commit()
 
 
+def _validate_run_config_paths(cfg: dict[str, Any]) -> None:
+    """Reject any caller-supplied har_sources outside settings.data_dir."""
+    har_sources = cfg.get("har_sources")
+    if har_sources is None:
+        return
+    if not isinstance(har_sources, list):
+        raise HTTPException(status_code=400, detail="config.har_sources must be a list of paths")
+    data_root = settings.data_dir.resolve()
+    validated: list[str] = []
+    for raw_p in har_sources:
+        try:
+            resolved = Path(str(raw_p)).resolve()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid har_sources path: {raw_p}") from exc
+        if not resolved.is_relative_to(data_root):
+            raise HTTPException(
+                status_code=400,
+                detail="har_sources paths must reside within the ReconQA data directory",
+            )
+        validated.append(str(resolved))
+    cfg["har_sources"] = validated
+
+
 @router.post(
     "/projects/{project_id}/runs",
     response_model=RunOut,
@@ -187,6 +211,7 @@ async def create_run(
 
     modules = list(body.modules or DEFAULT_MODULES)
     config_snapshot: dict[str, Any] = dict(body.config or {})
+    _validate_run_config_paths(config_snapshot)
     config_snapshot["modules"] = modules
     if body.name and body.name.strip():
         config_snapshot["run_name"] = body.name.strip()
@@ -276,11 +301,12 @@ async def upload_run_hars(
                 raw_name = f"{raw_name}.har"
             dest = tmp_dir / raw_name
             content = await upload.read()
-            dest.write_bytes(content)
+            await asyncio.to_thread(dest.write_bytes, content)
             saved_paths.append(dest)
 
         scenario_override = scenario if (scenario and len(saved_paths) == 1) else None
-        import_res = import_hars(
+        import_res = await asyncio.to_thread(
+            import_hars,
             saved_paths,
             har_dir,
             scenario_name=scenario_override,
@@ -301,13 +327,13 @@ async def upload_run_hars(
     if slim:
         js_bundles_dir = har_dir / "js_bundles"
         imported_files = [
-            Path(f["dest"])
-            for f in (import_res.get("imported") or [])
-            if isinstance(f, dict) and f.get("dest")
+            Path(f["output_path"])
+            for f in (import_res.get("hars") or [])
+            if isinstance(f, dict) and f.get("output_path")
         ]
-        target_har_paths = [p for p in imported_files if p.is_file()] or sorted(har_dir.glob("*.har"))
+        target_har_paths = [p for p in imported_files if p.is_file()]
         for hp in target_har_paths:
-            st = slim_har_file(hp, js_bundles_dir=js_bundles_dir)
+            st = await asyncio.to_thread(slim_har_file, hp, js_bundles_dir=js_bundles_dir)
             if st.get("slimmed"):
                 slim_stats["files_slimmed"] += 1
                 slim_stats["original_bytes"] += int(st.get("original_bytes") or 0)
@@ -423,7 +449,9 @@ async def reuse_run_hars(
         raise HTTPException(status_code=404, detail="Source run has no HAR directory")
 
     dst_har_dir = ensure_dir(Path(target_run.workspace_dir) / "har")
-    existing_hashes = {sha256_file(p) for p in dst_har_dir.glob("*.har")}
+    existing_hashes = {
+        await asyncio.to_thread(sha256_file, p) for p in dst_har_dir.glob("*.har")
+    }
 
     reused: list[str] = []
     skipped_duplicates: list[str] = []
@@ -432,7 +460,7 @@ async def reuse_run_hars(
     for src_har in sorted(src_har_dir.glob("*.har")):
         if allowed_scenarios is not None and src_har.stem not in allowed_scenarios:
             continue
-        digest = sha256_file(src_har)
+        digest = await asyncio.to_thread(sha256_file, src_har)
         if digest in existing_hashes:
             skipped_duplicates.append(src_har.name)
             continue
@@ -523,6 +551,7 @@ async def execute_run_modules(
     if body.config:
         for k, v in body.config.items():
             cfg[k] = v
+    _validate_run_config_paths(cfg)
 
     existing_mods = list(cfg.get("modules") or [])
     cfg["modules"] = list(dict.fromkeys([*existing_mods, *requested]))

@@ -633,29 +633,42 @@ async function loadSecurityData(): Promise<void> {
   loading.value = false;
 }
 
+let authProfileLoadSeq = 0;
+
 async function loadProjectAuthProfiles(): Promise<void> {
+  const reqId = ++authProfileLoadSeq;
   let pid = props.projectId || "";
-  if (!pid && props.runId) {
+  const targetRunId = props.runId;
+  if (!pid && targetRunId) {
     try {
-      const run = await getRun(props.runId);
+      const run = await getRun(targetRunId);
+      if (reqId !== authProfileLoadSeq || isUnmounted || props.runId !== targetRunId) return;
       pid = run.project_id;
     } catch {
       return;
     }
   }
-  if (!pid) return;
+  if (!pid) {
+    authProfiles.value = [];
+    authAProfileId.value = "";
+    authBProfileId.value = "";
+    return;
+  }
   try {
     const profiles = await listAuthProfiles(pid);
+    if (reqId !== authProfileLoadSeq || isUnmounted) return;
+    if (props.projectId && props.projectId !== pid) return;
     authProfiles.value = profiles;
-    if (!authAProfileId.value) {
+    if (!authAProfileId.value || !profiles.some((p) => p.id === authAProfileId.value)) {
       const a = profiles.find((p) => p.role_tag === "account_a");
-      if (a) authAProfileId.value = a.id;
+      authAProfileId.value = a ? a.id : "";
     }
-    if (!authBProfileId.value) {
+    if (!authBProfileId.value || !profiles.some((p) => p.id === authBProfileId.value)) {
       const b = profiles.find((p) => p.role_tag === "account_b");
-      if (b) authBProfileId.value = b.id;
+      authBProfileId.value = b ? b.id : "";
     }
   } catch {
+    if (reqId !== authProfileLoadSeq || isUnmounted) return;
     authProfiles.value = [];
   }
 }
@@ -713,6 +726,9 @@ watch(
 watch(
   () => props.projectId,
   () => {
+    authAProfileId.value = "";
+    authBProfileId.value = "";
+    authProfiles.value = [];
     void loadProjectAuthProfiles();
   }
 );

@@ -30,8 +30,8 @@ COPY pyproject.toml README.md LICENSE ./
 COPY backend ./backend
 COPY scripts/install-tools.sh ./scripts/install-tools.sh
 
-# Install ReconQA with recorder + fuzz extras
-RUN pip install --no-cache-dir ".[recorder,fuzz]" \
+# Install ReconQA with recorder + fuzz + postgres extras
+RUN pip install --no-cache-dir ".[recorder,fuzz,postgres]" \
     && playwright install --with-deps chromium
 
 # Install ProjectDiscovery binaries into /opt/reconqa/bin

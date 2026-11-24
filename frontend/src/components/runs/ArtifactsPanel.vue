@@ -14,7 +14,7 @@ import {
 } from 'lucide-vue-next'
 import type { Artifact } from '@/api/types'
 import { artifactDownloadUrl } from '@/api/client'
-import { listRunArtifacts } from '@/api/runs'
+import { artifactDownloadByIdUrl, listRunArtifacts } from '@/api/runs'
 import EmptyState from '@/components/layout/EmptyState.vue'
 import '@/i18n/locales/runs'
 import { useI18n } from '@/i18n'
@@ -308,7 +308,7 @@ onMounted(loadArtifacts)
                 </td>
                 <td class="px-5 py-3 text-right">
                   <a
-                    :href="artifactDownloadUrl(runId, art.kind)"
+                    :href="artifactDownloadByIdUrl(runId, art.id)"
                     download
                     class="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-indigo-700 transition hover:border-indigo-300 hover:bg-indigo-50"
                   >

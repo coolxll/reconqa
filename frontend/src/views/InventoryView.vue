@@ -29,6 +29,7 @@ import EmptyState from "@/components/layout/EmptyState.vue";
 import TryItDrawer, { type TryItEndpointInput } from "@/components/runs/TryItDrawer.vue";
 import { useWorkspace } from "@/stores/workspace";
 import { useI18n } from "@/i18n";
+import { copyToClipboard } from "@/utils/clipboard";
 
 const route = useRoute();
 const { t } = useI18n();
@@ -310,15 +311,12 @@ function prettyJson(val: unknown): string {
 
 async function copyJson(key: string, payload: unknown): Promise<void> {
   if (payload === null || payload === undefined) return;
-  try {
-    await navigator.clipboard.writeText(prettyJson(payload));
-    copiedKey.value = key;
-    window.setTimeout(() => {
-      if (copiedKey.value === key) copiedKey.value = null;
-    }, 1800);
-  } catch {
-    copiedKey.value = key;
-  }
+  const ok = await copyToClipboard(prettyJson(payload));
+  if (!ok) return;
+  copiedKey.value = key;
+  window.setTimeout(() => {
+    if (copiedKey.value === key) copiedKey.value = null;
+  }, 1800);
 }
 
 function openTryIt(ep: InventoryEndpoint): void {

@@ -437,6 +437,16 @@ def _find_high_frequency_constants(entries: list[HarEntry]) -> list[str]:
     return constants
 
 
+def _escape_mermaid_label(raw: str) -> str:
+    cleaned = re.sub(r"[\r\n]+", " ", str(raw or ""))
+    return (
+        cleaned.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "'")
+    )
+
+
 def _build_mermaid(
     entries_by_step: dict[int, HarEntry],
     variables: list[CorrelationVariable],
@@ -457,7 +467,7 @@ def _build_mermaid(
     lines = ["flowchart LR"]
     for step in sorted(involved_steps):
         entry = entries_by_step[step]
-        label = f"{entry.method} {entry.normalized_path}".replace('"', "'")
+        label = _escape_mermaid_label(f"{entry.method} {entry.normalized_path}")
         lines.append(f'    S{step}["{label}"]')
 
     seen_edges: set[tuple[int, int, str]] = set()
@@ -471,11 +481,11 @@ def _build_mermaid(
                 continue
             seen_edges.add(edge_key)
             if c_step in cleanup_steps:
-                edge_label = f"cleanup: {var.var_name}".replace('"', "'")
+                edge_label = _escape_mermaid_label(f"cleanup: {var.var_name}")
                 lines.append(f'    S{p_step} -.->|"{edge_label}"| S{c_step}')
             else:
                 edge_label = f"{var.var_name} ({jp})" if jp else var.var_name
-                edge_label = edge_label.replace('"', "'")
+                edge_label = _escape_mermaid_label(edge_label)
                 lines.append(f'    S{p_step} -->|"{edge_label}"| S{c_step}')
 
     return "\n".join(lines) + "\n"

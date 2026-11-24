@@ -13,6 +13,7 @@ import {
 import { getAcceptancePrompt } from "@/api/projects";
 import type { AcceptancePromptAgent, AcceptancePromptResponse } from "@/api/types";
 import { useI18n } from "@/i18n";
+import { copyToClipboard } from "@/utils/clipboard";
 
 const props = defineProps<{
   open: boolean;
@@ -53,15 +54,12 @@ async function fetchPrompt(): Promise<void> {
 async function copyPrompt(): Promise<void> {
   const text = data.value?.prompt_markdown;
   if (!text) return;
-  try {
-    await navigator.clipboard.writeText(text);
-    copied.value = true;
-    window.setTimeout(() => {
-      copied.value = false;
-    }, 2000);
-  } catch {
-    copied.value = true;
-  }
+  const ok = await copyToClipboard(text);
+  if (!ok) return;
+  copied.value = true;
+  window.setTimeout(() => {
+    copied.value = false;
+  }, 2000);
 }
 
 watch(

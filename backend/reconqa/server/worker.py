@@ -13,6 +13,7 @@ from typing import Any, Protocol, runtime_checkable
 from sqlalchemy import delete, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from reconqa.config import settings
 from reconqa.models.db import get_session_factory
 from reconqa.models.tables import Artifact, AuthProfile, Finding, Job, Run, Target
 from reconqa.pipeline import DEFAULT_MODULES, run_pipeline
@@ -404,7 +405,18 @@ class InProcessTaskRunner:
             pending_updates.append(fut)
 
         har_sources_raw = cfg.get("har_sources")
-        har_sources = [Path(p) for p in har_sources_raw] if har_sources_raw else None
+        har_sources: list[Path] | None = None
+        if isinstance(har_sources_raw, list) and har_sources_raw:
+            data_root = settings.data_dir.resolve()
+            safe_sources: list[Path] = []
+            for p in har_sources_raw:
+                try:
+                    resolved = Path(str(p)).resolve()
+                    if resolved.is_relative_to(data_root):
+                        safe_sources.append(resolved)
+                except Exception:
+                    continue
+            har_sources = safe_sources or None
         config_path_raw = cfg.get("config_path")
         config_path = Path(config_path_raw) if config_path_raw else None
 
@@ -508,6 +520,12 @@ class InProcessTaskRunner:
                         )
                     )
 
+            all_job_statuses = {m: j.status for m, j in existing_jobs.items()}
+            for m, (st, _) in seen_final.items():
+                all_job_statuses[m] = st
+            failed_modules = [m for m, st in all_job_statuses.items() if st == "failed"]
+            terminal_status = "failed" if failed_modules else "completed"
+
             run = await session.get(Run, run_id)
             merged_metrics: dict[str, Any] = {}
             if run is not None:
@@ -516,19 +534,22 @@ class InProcessTaskRunner:
                 prev_mods = list(prev_metrics.get("modules_executed") or [])
                 merged_mods = list(dict.fromkeys([*prev_mods, *modules]))
                 merged_metrics = {**prev_metrics, **new_metrics, "modules_executed": merged_mods}
-                merged_metrics.pop("error", None)
+                if failed_modules:
+                    merged_metrics["error"] = f"Module(s) failed: {', '.join(failed_modules)}"
+                else:
+                    merged_metrics.pop("error", None)
 
                 cfg_snap = dict(run.config_snapshot or {})
                 cfg_snap.pop("pending_modules", None)
                 run.config_snapshot = cfg_snap
-                run.status = "completed"
+                run.status = terminal_status
                 run.summary_metrics = merged_metrics
                 run.finished_at = _utcnow()
 
             await session.commit()
 
             # Best-effort non-fatal auto-hydration of Scenario entities after merge completes
-            if "merge" in modules:
+            if "merge" in modules and "merge" not in failed_modules:
                 try:
                     from reconqa.server.routers.scenarios import sync_project_scenarios
 
@@ -536,13 +557,14 @@ class InProcessTaskRunner:
                 except Exception:
                     pass
 
-        self._publish(
-            run_id,
-            {
-                "event": "run_completed",
-                "run_id": run_id,
-                "status": "completed",
-                "summary_metrics": merged_metrics,
-                "timestamp": _utcnow().isoformat(),
-            },
-        )
+        terminal_event = "run_failed" if terminal_status == "failed" else "run_completed"
+        payload: dict[str, Any] = {
+            "event": terminal_event,
+            "run_id": run_id,
+            "status": terminal_status,
+            "summary_metrics": merged_metrics,
+            "timestamp": _utcnow().isoformat(),
+        }
+        if failed_modules:
+            payload["error"] = f"Module(s) failed: {', '.join(failed_modules)}"
+        self._publish(run_id, payload)

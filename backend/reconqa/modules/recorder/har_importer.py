@@ -6,12 +6,14 @@ import base64
 import copy
 import hashlib
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from reconqa.utils.io import ensure_dir, sha256_file, write_json
+from reconqa.utils.io import ensure_dir, sha256_file
 
 TIMING_KEYS = ("blocked", "dns", "connect", "send", "wait", "receive", "ssl")
 
@@ -273,7 +275,18 @@ def import_hars(
             }
         }
         dest_har = out_dir / f"{scenario}.har"
-        write_json(dest_har, out_har_obj, indent=2)
+        # Atomic temp-file + os.replace breaks any existing hardlink inode cleanly
+        fd, tmp_name = tempfile.mkstemp(prefix=".har_import_", suffix=".har", dir=str(out_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(out_har_obj, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp_name, dest_har)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         total_entries += len(normalized_entries)
         imported_records.append(
             {

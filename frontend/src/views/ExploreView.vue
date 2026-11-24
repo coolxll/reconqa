@@ -443,12 +443,14 @@ async function fetchHistoryAndProjects(resetSelection = false): Promise<void> {
     listProjects(),
     pid ? listTargets(pid) : Promise.resolve([] as Target[]),
   ]);
+  if ((projectId.value || null) !== pid) return;
   if (histRes.status === "fulfilled") {
     historyItems.value = histRes.value;
     if (!result.value && histRes.value.length > 0) {
       const firstId = histRes.value[0].explore_id;
       try {
         const full = await getExplore(firstId);
+        if ((projectId.value || null) !== pid) return;
         applyResult(full);
       } catch {
         // Ignore initial history auto-load failure
@@ -627,6 +629,9 @@ async function handlePromoteToRun(): Promise<void> {
 }
 
 watch(projectId, () => {
+  discoveredPortals.value = null;
+  discoveredRootDomain.value = "";
+  portalNotice.value = null;
   void fetchHistoryAndProjects(true);
 });
 

@@ -150,6 +150,37 @@ async def list_run_artifacts(
     return list(res.scalars().all())
 
 
+@router.get("/runs/{run_id}/artifacts/by-id/{artifact_id}")
+async def download_run_artifact_by_id(
+    run_id: str,
+    artifact_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Download a specific Artifact row by its unique ID (supports multi-HAR runs accurately)."""
+    run = await _get_run_or_404(db, run_id)
+    run_dir = Path(run.workspace_dir)
+    artifact_row = await db.get(Artifact, artifact_id)
+    if artifact_row is None or artifact_row.run_id != run_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artifact '{artifact_id}' not found for run '{run_id}'",
+        )
+    target_path = _safe_resolve(run_dir, artifact_row.rel_path)
+    if not target_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artifact file for '{artifact_id}' not found on disk",
+        )
+    if target_path.is_dir():
+        zip_buf = _zip_directory(target_path)
+        return StreamingResponse(
+            zip_buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{artifact_row.kind}.zip"'},
+        )
+    return FileResponse(path=target_path, filename=target_path.name)
+
+
 @router.get("/runs/{run_id}/artifacts/{kind}")
 async def download_run_artifact(
     run_id: str,

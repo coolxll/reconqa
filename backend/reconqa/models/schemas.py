@@ -113,6 +113,17 @@ class AuthProfileCreate(BaseModel):
         return text
 
 
+def _mask_header_ref_value(raw_val: str) -> str:
+    val = str(raw_val or "").strip()
+    if not val:
+        return ""
+    if val.startswith(("ENV:", "env:")) or (val.startswith("${") and val.endswith("}")):
+        return val
+    if len(val) <= 8:
+        return "***"
+    return f"{val[:4]}•••{val[-4:]}"
+
+
 class AuthProfileOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -122,6 +133,11 @@ class AuthProfileOut(BaseModel):
     role_tag: str
     storage_state_path: str | None
     extra_headers_ref: dict[str, str]
+
+    @field_validator("extra_headers_ref", mode="after")
+    @classmethod
+    def _mask_extra_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        return {str(k): _mask_header_ref_value(str(v)) for k, v in (value or {}).items()}
 
 
 KnowledgeDocType = Literal[

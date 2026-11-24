@@ -1,4 +1,4 @@
-import { apiFetch, apiText, apiUpload } from "./client";
+import { API_BASE, apiFetch, apiText, apiUpload } from "./client";
 import type {
   Artifact,
   BurpExportRequest,
@@ -172,6 +172,10 @@ export function getRunCoverage(runId: string): Promise<CoverageDiffReport> {
 
 export function listRunArtifacts(runId: string): Promise<Artifact[]> {
   return apiFetch<Artifact[]>(`/runs/${encodeURIComponent(runId)}/artifacts`);
+}
+
+export function artifactDownloadByIdUrl(runId: string, artifactId: string): string {
+  return `${API_BASE}/runs/${encodeURIComponent(runId)}/artifacts/by-id/${encodeURIComponent(artifactId)}`;
 }
 
 export function triggerBurpExport(

@@ -878,6 +878,48 @@ def _probe_portals_with_cli(
     return rows
 
 
+_BLOCKED_REDIRECT_HOSTS = {
+    "169.254.169.254",
+    "169.254.170.2",
+    "metadata.google.internal",
+    "metadata.goog",
+}
+_LINK_LOCAL_V4 = ipaddress.ip_network("169.254.0.0/16")
+
+
+def _is_unsafe_redirect_url(location_url: str, base_url: str) -> bool:
+    try:
+        resolved = urljoin(base_url, (location_url or "").strip())
+        parsed = urlparse(resolved)
+    except ValueError:
+        return True
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return True
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return True
+    if host in _BLOCKED_REDIRECT_HOSTS:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        if isinstance(ip, ipaddress.IPv4Address) and ip in _LINK_LOCAL_V4:
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def _safe_redirect_hook(response: httpx.Response) -> None:
+    """Block HTTP redirects pivoting to cloud metadata endpoints or non-http(s) schemes."""
+    if 300 <= response.status_code < 400:
+        location = response.headers.get("location")
+        if location and _is_unsafe_redirect_url(location, str(response.url)):
+            raise httpx.RequestError(
+                f"Blocked unsafe redirect target: {location[:120]}",
+                request=response.request,
+            )
+
+
 def _probe_portals_with_python(
     candidate_urls: list[str],
     *,
@@ -887,7 +929,12 @@ def _probe_portals_with_python(
 
     def _check_one(u: str) -> dict[str, Any] | None:
         try:
-            with httpx.Client(timeout=per_req_timeout, follow_redirects=True, verify=False) as client:
+            with httpx.Client(
+                timeout=per_req_timeout,
+                follow_redirects=True,
+                verify=False,
+                event_hooks={"response": [_safe_redirect_hook]},
+            ) as client:
                 resp = client.get(u)
                 title = ""
                 ctype = (resp.headers.get("content-type") or "").lower()
@@ -1022,6 +1069,7 @@ def _probe_openapi_on_origin(
         follow_redirects=True,
         trust_env=not _is_loopback(host),
         verify=False,
+        event_hooks={"response": [_safe_redirect_hook]},
     ) as client:
         while q_idx < len(probe_queue) and len(seen_doc_urls) < 25:
             cand_path = probe_queue[q_idx]
@@ -1282,6 +1330,7 @@ def explore_from_seed(
             follow_redirects=True,
             trust_env=not loopback,
             verify=False,
+            event_hooks={"response": [_safe_redirect_hook]},
         ) as client:
             for page_idx, page_url in enumerate(pages_to_fetch):
                 try:
@@ -1322,6 +1371,7 @@ def explore_from_seed(
                     follow_redirects=True,
                     trust_env=not _is_loopback(h),
                     verify=False,
+                    event_hooks={"response": [_safe_redirect_hook]},
                 ) as c:
                     r = c.get(js_url, headers=probe_headers)
                     if r.status_code == 200 and r.text.strip():

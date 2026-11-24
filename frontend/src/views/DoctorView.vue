@@ -19,6 +19,7 @@ import { getDoctorStatus, installDoctorTool } from "@/api/reports";
 import type { DoctorInstallResult, DoctorToolStatus } from "@/api/types";
 import StatusBadge from "@/components/layout/StatusBadge.vue";
 import { useI18n } from "@/i18n";
+import { copyToClipboard } from "@/utils/clipboard";
 
 interface DoctorEntry extends DoctorToolStatus {
   name: string;
@@ -118,15 +119,12 @@ function closeToolModal(): void {
 
 async function copyCommand(text: string, field: "install" | "docker"): Promise<void> {
   if (!text) return;
-  try {
-    await navigator.clipboard.writeText(text);
-    copiedField.value = field;
-    window.setTimeout(() => {
-      if (copiedField.value === field) copiedField.value = null;
-    }, 2000);
-  } catch {
-    copiedField.value = field;
-  }
+  const ok = await copyToClipboard(text);
+  if (!ok) return;
+  copiedField.value = field;
+  window.setTimeout(() => {
+    if (copiedField.value === field) copiedField.value = null;
+  }, 2000);
 }
 
 async function handleAutoInstall(): Promise<void> {

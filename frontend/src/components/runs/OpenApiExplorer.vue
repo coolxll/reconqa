@@ -21,6 +21,7 @@ import EmptyState from '@/components/layout/EmptyState.vue'
 import TryItDrawer, { type TryItEndpointInput } from '@/components/runs/TryItDrawer.vue'
 import '@/i18n/locales/runs'
 import { useI18n } from '@/i18n'
+import { copyToClipboard } from '@/utils/clipboard'
 
 const { t } = useI18n()
 const { activeProjectId } = useWorkspace()
@@ -413,17 +414,14 @@ function setPanelMode(epKey: string, section: 'req' | 'resp', mode: 'example' | 
 
 async function copyJsonPayload(copyKey: string, payload: unknown) {
   if (payload === null || payload === undefined) return
-  try {
-    await navigator.clipboard.writeText(prettyJson(payload))
-    copiedJsonKey.value = copyKey
-    window.setTimeout(() => {
-      if (copiedJsonKey.value === copyKey) {
-        copiedJsonKey.value = null
-      }
-    }, 1800)
-  } catch {
-    copiedJsonKey.value = copyKey
-  }
+  const ok = await copyToClipboard(prettyJson(payload))
+  if (!ok) return
+  copiedJsonKey.value = copyKey
+  window.setTimeout(() => {
+    if (copiedJsonKey.value === copyKey) {
+      copiedJsonKey.value = null
+    }
+  }, 1800)
 }
 
 function getPrimaryResponse(responses: Record<string, Record<string, unknown>>): {

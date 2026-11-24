@@ -29,6 +29,7 @@ import {
   updateKnowledgeDoc,
   uploadKnowledgeDoc,
 } from "@/api/projects";
+import { copyToClipboard } from "@/utils/clipboard";
 import type {
   KnowledgeDoc,
   KnowledgeDocSourceKind,
@@ -92,15 +93,12 @@ function openPreview(doc: KnowledgeDoc): void {
 async function copyPreviewMarkdown(): Promise<void> {
   const text = previewDoc.value?.content;
   if (!text) return;
-  try {
-    await navigator.clipboard.writeText(text);
-    copiedMarkdown.value = true;
-    window.setTimeout(() => {
-      copiedMarkdown.value = false;
-    }, 1800);
-  } catch {
-    copiedMarkdown.value = true;
-  }
+  const ok = await copyToClipboard(text);
+  if (!ok) return;
+  copiedMarkdown.value = true;
+  window.setTimeout(() => {
+    copiedMarkdown.value = false;
+  }, 1800);
 }
 
 function stripMarkdown(raw: string): string {
