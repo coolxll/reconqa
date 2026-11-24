@@ -451,6 +451,7 @@ def build_capability_map(
                 "role": role,
                 "discovery_source": source,
                 "host": host,
+                "custom_headers": dict(ep.get("custom_headers") or {}),
             }
         )
 

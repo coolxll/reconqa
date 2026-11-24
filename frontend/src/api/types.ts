@@ -276,6 +276,8 @@ export interface OpenApiOperation {
   "x-perf-baseline"?: Record<string, unknown>;
   "x-custom-headers"?: Record<string, string> | string[];
   "x-js-snippet"?: string;
+  "x-host"?: string;
+  "x-origin"?: string;
   [key: string]: unknown;
 }
 
@@ -580,6 +582,7 @@ export interface InventoryEndpoint {
   summary?: string;
   discovery_source: "har-live" | "js-static-inferred" | "js-static" | "openapi-doc" | string;
   host?: string;
+  custom_headers?: Record<string, string>;
   tags?: string[];
   scenarios: string[];
   seen_in_runs: InventorySeenInRun[];
@@ -893,6 +896,7 @@ export interface CapabilityEndpointRef {
   role: string;
   discovery_source: string;
   host?: string | null;
+  custom_headers?: Record<string, string>;
 }
 
 export interface CapabilityScenarioRef {

@@ -50,6 +50,8 @@ interface FlattenedEndpoint {
   key: string
   method: string
   path: string
+  host: string
+  origin: string
   operationId: string
   summary: string
   tags: string[]
@@ -77,10 +79,12 @@ function openTryIt(ep: FlattenedEndpoint) {
   tryItEndpoint.value = {
     method: ep.method,
     path: ep.path,
-    baseUrl: specInfo.value.serverUrl || undefined,
+    baseUrl: ep.origin || (ep.host ? undefined : specInfo.value.serverUrl || undefined),
+    host: ep.host || undefined,
     summary: ep.summary,
     parameters: ep.parameters as unknown as Array<Record<string, unknown>>,
     requestExample: extractJsonExample(ep.requestBody),
+    customHeaders: ep.customHeaders,
   }
   tryItOpen.value = true
 }
@@ -153,12 +157,24 @@ const endpoints = computed<FlattenedEndpoint[]>(() => {
       const rawCustomHeaders = op['x-custom-headers']
       const normalizedCustomHeaders: Record<string, string> = Array.isArray(rawCustomHeaders)
         ? Object.fromEntries(rawCustomHeaders.map((h) => [String(h), '(present)']))
-        : ((rawCustomHeaders as Record<string, string>) ?? {})
+        : rawCustomHeaders && typeof rawCustomHeaders === 'object'
+          ? Object.fromEntries(
+              Object.entries(rawCustomHeaders as Record<string, unknown>).map(([k, v]) => [
+                String(k),
+                v !== undefined && v !== null ? String(v) : '',
+              ]),
+            )
+          : {}
+
+      const opHost = typeof op['x-host'] === 'string' ? op['x-host'].trim() : ''
+      const opOrigin = typeof op['x-origin'] === 'string' ? op['x-origin'].trim() : ''
 
       rows.push({
         key: `${upper} ${pathStr}`,
         method: upper,
         path: pathStr,
+        host: opHost,
+        origin: opOrigin,
         operationId: String(op.operationId ?? ''),
         summary: String(op.summary ?? `${upper} ${pathStr}`),
         tags: Array.isArray(op.tags) ? op.tags.map(String) : [],

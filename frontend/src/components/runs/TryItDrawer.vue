@@ -38,6 +38,7 @@ export interface TryItEndpointInput {
   summary?: string;
   parameters?: Array<Record<string, unknown>>;
   requestExample?: unknown;
+  customHeaders?: Record<string, string>;
 }
 
 interface KvRow {
@@ -59,6 +60,52 @@ const { t } = useI18n();
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
 const ROLE_PRESETS = ["admin", "pharmacy", "doctor", "assistant", "account_a", "account_b", "guest"] as const;
+
+const SKIP_AUTH_HEADERS = new Set([
+  "authorization",
+  "cookie",
+  "x-auth-token",
+  "x-api-key",
+  "x-access-token",
+  "token",
+  "access-token",
+  "set-cookie",
+]);
+
+const SKIP_EPHEMERAL_HEADERS = new Set([
+  "b3",
+  "traceparent",
+  "tracestate",
+  "x-b3-traceid",
+  "x-b3-spanid",
+  "x-b3-parentspanid",
+  "x-b3-sampled",
+  "sentry-trace",
+  "baggage",
+  "x-request-id",
+  "x-correlation-id",
+  "host",
+  "content-length",
+  "origin",
+  "referer",
+  "user-agent",
+  "connection",
+]);
+
+function isRedactedHeaderValue(value: string): boolean {
+  const lower = value.toLowerCase();
+  return lower.includes("***") || lower.includes("<redacted>") || lower.includes("(present)");
+}
+
+function shouldSkipPrefillHeader(key: string, value: string, allowEmptyValue = false): boolean {
+  const cleanKey = key.trim();
+  const cleanVal = value.trim();
+  if (!cleanKey) return true;
+  if (!allowEmptyValue && !cleanVal) return true;
+  if (cleanVal && isRedactedHeaderValue(cleanVal)) return true;
+  const lowerKey = cleanKey.toLowerCase();
+  return SKIP_AUTH_HEADERS.has(lowerKey) || SKIP_EPHEMERAL_HEADERS.has(lowerKey);
+}
 
 const method = ref("GET");
 const targetUrl = ref("");
@@ -211,6 +258,14 @@ const formattedResponseBody = computed(() => {
   return raw;
 });
 
+const isHtmlResponse = computed(() => {
+  if (!response.value) return false;
+  const ct = (response.value.content_type || "").toLowerCase();
+  if (ct.includes("text/html")) return true;
+  const bodyStart = (response.value.body_text || "").trimStart().toLowerCase();
+  return bodyStart.startsWith("<!doctype html") || bodyStart.startsWith("<html");
+});
+
 function statusColorClass(code: number): string {
   if (code >= 200 && code < 300) return "bg-emerald-50 text-emerald-700 ring-emerald-600/20";
   if (code >= 300 && code < 400) return "bg-sky-50 text-sky-700 ring-sky-600/20";
@@ -228,8 +283,12 @@ function buildPrefilledUrl(ep: TryItEndpointInput | null, fallbackBase: string):
   if (ep.baseUrl && /^https?:\/\//i.test(ep.baseUrl)) {
     return `${ep.baseUrl.replace(/\/+$/, "")}${normalizedPath}`;
   }
-  if (ep.host) {
-    const cleanHost = ep.host.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+  const rawHost = (ep.host || "").trim();
+  if (rawHost) {
+    if (/^https?:\/\//i.test(rawHost)) {
+      return `${rawHost.replace(/\/+$/, "")}${normalizedPath}`;
+    }
+    const cleanHost = rawHost.replace(/\/+$/, "");
     const scheme =
       cleanHost.startsWith("127.0.0.1") || cleanHost.startsWith("localhost") ? "http" : "https";
     return `${scheme}://${cleanHost}${normalizedPath}`;
@@ -295,20 +354,48 @@ async function hydrateFromEndpoint(): Promise<void> {
   method.value = (ep.method || "GET").toUpperCase();
   targetUrl.value = buildPrefilledUrl(ep, defaultBaseUrl.value);
 
-  // Extract query parameters from OpenAPI parameters list
+  // Extract query parameters and headers from OpenAPI parameters list & captured customHeaders
   const qRows: KvRow[] = [];
-  const hRows: KvRow[] = [{ key: "Accept", value: "application/json" }];
+  const hRows: KvRow[] = [];
+  const seenHeaders = new Map<string, number>();
+
   for (const param of ep.parameters ?? []) {
     const pIn = String(param.in ?? "").toLowerCase();
-    const pName = String(param.name ?? "");
-    const pVal = param.example !== undefined && param.example !== null ? String(param.example) : "";
+    const pName = String(param.name ?? "").trim();
+    const pVal = param.example !== undefined && param.example !== null ? String(param.example).trim() : "";
     if (!pName) continue;
     if (pIn === "query") {
       qRows.push({ key: pName, value: pVal });
-    } else if (pIn === "header" && pName.toLowerCase() !== "accept") {
-      hRows.push({ key: pName, value: pVal });
+    } else if (pIn === "header") {
+      const lowerKey = pName.toLowerCase();
+      if (shouldSkipPrefillHeader(pName, pVal, lowerKey !== "accept")) continue;
+      if (!seenHeaders.has(lowerKey)) {
+        seenHeaders.set(lowerKey, hRows.length);
+        hRows.push({ key: pName, value: pVal });
+      }
     }
   }
+
+  for (const [rawKey, rawVal] of Object.entries(ep.customHeaders ?? {})) {
+    const cleanKey = rawKey.trim();
+    const cleanVal = rawVal !== undefined && rawVal !== null ? String(rawVal).trim() : "";
+    if (shouldSkipPrefillHeader(cleanKey, cleanVal, false)) continue;
+    const lowerKey = cleanKey.toLowerCase();
+    const existingIdx = seenHeaders.get(lowerKey);
+    if (existingIdx !== undefined) {
+      if (!hRows[existingIdx].value) {
+        hRows[existingIdx].value = cleanVal;
+      }
+    } else {
+      seenHeaders.set(lowerKey, hRows.length);
+      hRows.push({ key: cleanKey, value: cleanVal });
+    }
+  }
+
+  if (!seenHeaders.has("accept")) {
+    hRows.unshift({ key: "Accept", value: "application/json" });
+  }
+
   queryRows.value = qRows;
   headerRows.value = hRows;
 
@@ -1085,6 +1172,14 @@ async function copyResponseBody(): Promise<void> {
                 class="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-800"
               >
                 {{ t("tryit.truncatedWarn") }}
+              </div>
+              <div
+                v-if="isHtmlResponse"
+                data-testid="try-it-html-hint"
+                class="mb-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900"
+              >
+                <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                <span>{{ t("tryit.htmlResponseHint") }}</span>
               </div>
 
               <pre

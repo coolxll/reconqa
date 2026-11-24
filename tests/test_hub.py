@@ -15,7 +15,12 @@ from reconqa.config import (
 )
 from reconqa.modules.hub.correlation import analyze_correlations
 from reconqa.modules.hub.coverage_diff import compute_coverage_diff
-from reconqa.modules.hub.har_parser import normalize_path, parse_har_dir, parse_har_file
+from reconqa.modules.hub.har_parser import (
+    _is_static_asset,
+    normalize_path,
+    parse_har_dir,
+    parse_har_file,
+)
 from reconqa.modules.hub.openapi_merger import merge_to_openapi
 from reconqa.modules.recorder.har_importer import import_hars
 from reconqa.modules.recorder.js_extractor import extract_js_endpoints
@@ -283,3 +288,231 @@ def test_correlation_filters_preexisting_session_auth_token_but_keeps_real_login
     assert fresh_login_tok in var_samples or "fresh_minted_login_token" in corr_json, (
         f"Expected real newly-minted login token to correlate: {report}"
     )
+
+
+def test_har_parser_filters_spa_html_routes_and_keeps_json_apis(tmp_path: Path) -> None:
+    """Verify extensionless SPA text/html routes are filtered while real JSON APIs & non-nav errors survive."""
+    # Backwards-compatible 4-arg call signature on _is_static_asset
+    assert _is_static_asset("/merchant/orders", "text/html", None, []) is True
+    assert _is_static_asset("/api/v1/orders", "text/html", {"code": 0}, []) is False
+
+    def _har_entry(
+        method: str,
+        url: str,
+        status: int,
+        resp_mime: str,
+        resp_text: str,
+        req_headers: list[dict[str, str]] | None = None,
+    ) -> dict:
+        return {
+            "startedDateTime": "2026-11-24T01:00:00.000Z",
+            "time": 12.0,
+            "request": {
+                "method": method,
+                "url": url,
+                "httpVersion": "HTTP/2",
+                "headers": req_headers or [],
+                "queryString": [],
+                "cookies": [],
+            },
+            "response": {
+                "status": status,
+                "statusText": "OK",
+                "httpVersion": "HTTP/2",
+                "headers": [{"name": "Content-Type", "value": resp_mime}],
+                "cookies": [],
+                "content": {"size": len(resp_text), "mimeType": resp_mime, "text": resp_text},
+            },
+            "timings": {"send": 1, "wait": 8, "receive": 3},
+        }
+
+    har_payload = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                # Extensionless SPA navigation routes -> MUST be dropped
+                _har_entry(
+                    "GET",
+                    "https://app.example.com/merchant/orders",
+                    200,
+                    "text/html; charset=utf-8",
+                    "<!doctype html><html><body>SPA</body></html>",
+                    req_headers=[
+                        {"name": "sec-fetch-dest", "value": "document"},
+                        {"name": "sec-fetch-mode", "value": "navigate"},
+                    ],
+                ),
+                _har_entry(
+                    "GET",
+                    "https://app.example.com/merchant/finance",
+                    200,
+                    "text/html",
+                    "<html>Finance Shell</html>",
+                ),
+                _har_entry(
+                    "GET",
+                    "https://app.example.com/login",
+                    302,
+                    "text/html",
+                    "<html>Redirect</html>",
+                ),
+                _har_entry(
+                    "GET",
+                    "https://app.example.com/market",
+                    404,
+                    "application/xhtml+xml",
+                    "<html>Not Found</html>",
+                    req_headers=[{"name": "Sec-Fetch-Mode", "value": "navigate"}],
+                ),
+                # Non-navigation 502 HTML gateway error on an API path -> KEPT
+                _har_entry(
+                    "GET",
+                    "https://app.example.com/api/v1/broken",
+                    502,
+                    "text/html",
+                    "<html>502 Bad Gateway</html>",
+                    req_headers=[
+                        {"name": "sec-fetch-dest", "value": "empty"},
+                        {"name": "sec-fetch-mode", "value": "cors"},
+                    ],
+                ),
+                # JSON payload mislabelled as text/html -> MUST be kept (response_json is not None)
+                _har_entry(
+                    "GET",
+                    "https://app.example.com/api/v1/legacy-json",
+                    200,
+                    "text/html",
+                    json.dumps({"code": 0, "data": {"ok": True}}),
+                ),
+                # Normal JSON API -> KEPT
+                _har_entry(
+                    "POST",
+                    "https://app.example.com/api/v1/orders/list",
+                    200,
+                    "application/json",
+                    json.dumps({"code": 0, "data": []}),
+                ),
+            ],
+        }
+    }
+    har_file = tmp_path / "spa_routes.har"
+    har_file.write_text(json.dumps(har_payload), encoding="utf-8")
+
+    entries = parse_har_file(har_file)
+    paths = [e.normalized_path for e in entries]
+    assert "/merchant/orders" not in paths
+    assert "/merchant/finance" not in paths
+    assert "/login" not in paths
+    assert "/market" not in paths
+    assert set(paths) == {"/api/v1/broken", "/api/v1/legacy-json", "/api/v1/orders/list"}
+
+
+def test_openapi_merger_multihost_origins_and_clean_custom_headers(tmp_path: Path) -> None:
+    """Verify per-operation x-host/x-origin, frequency-ordered servers, and trace header filtering."""
+    har_dir = tmp_path / "multihost_har"
+    har_dir.mkdir(parents=True, exist_ok=True)
+
+    def _entry(ts: str, method: str, url: str, headers: list[dict[str, str]]) -> dict:
+        body = json.dumps({"code": 0, "data": {"ok": True}})
+        return {
+            "startedDateTime": ts,
+            "time": 20.0,
+            "request": {
+                "method": method,
+                "url": url,
+                "httpVersion": "HTTP/2",
+                "headers": headers,
+                "queryString": [],
+                "cookies": [],
+            },
+            "response": {
+                "status": 200,
+                "statusText": "OK",
+                "httpVersion": "HTTP/2",
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "cookies": [],
+                "content": {"size": len(body), "mimeType": "application/json", "text": body},
+            },
+            "timings": {"send": 1, "wait": 15, "receive": 4},
+        }
+
+    har_payload = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                _entry(
+                    "2026-11-24T02:00:01.000Z",
+                    "GET",
+                    "https://pc-api.example.com/api/v1/orders",
+                    [
+                        {"name": "App-Version", "value": "3.2.1"},
+                        {"name": "platform", "value": "web"},
+                        {"name": "b3", "value": "80f198ee56343ba864fe8b2a57d3eff7-e457b5a2e4d86bd1-1"},
+                        {"name": "traceparent", "value": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+                        {"name": "tracestate", "value": "rojo=00f067aa0ba902b7"},
+                        {"name": "x-b3-traceid", "value": "deadbeef"},
+                        {"name": "x-b3-spanid", "value": "cafebabe"},
+                        {"name": "x-b3-sampled", "value": "1"},
+                        {"name": "sentry-trace", "value": "1234-5678-1"},
+                        {"name": "baggage", "value": "sentry-environment=prod"},
+                    ],
+                ),
+                _entry(
+                    "2026-11-24T02:00:02.000Z",
+                    "GET",
+                    "https://pc-api.example.com/api/v1/orders",
+                    [
+                        {"name": "App-Version", "value": "3.2.1"},
+                        {"name": "platform", "value": "web"},
+                    ],
+                ),
+                _entry(
+                    "2026-11-24T02:00:03.000Z",
+                    "POST",
+                    "https://acctrade-api.example.com/api/v1/settlement/list",
+                    [
+                        {"name": "AppVersion", "value": "2.0.0"},
+                        {"name": "appType", "value": "merchant"},
+                        {"name": "secret-v", "value": "v2"},
+                        {"name": "deviceId", "value": "dev-42"},
+                        {"name": "x-b3-parentspanid", "value": "9999"},
+                    ],
+                ),
+            ],
+        }
+    }
+    (har_dir / "01_multihost.har").write_text(json.dumps(har_payload), encoding="utf-8")
+
+    out_dir = tmp_path / "hub_out"
+    spec = merge_to_openapi(har_dir, out_dir, target_domain="example.com")
+
+    assert [s["url"] for s in spec["servers"]] == [
+        "https://pc-api.example.com",
+        "https://acctrade-api.example.com",
+    ]
+
+    orders_op = spec["paths"]["/api/v1/orders"]["get"]
+    assert orders_op["x-host"] == "pc-api.example.com"
+    assert orders_op["x-origin"] == "https://pc-api.example.com"
+    assert orders_op["x-custom-headers"] == {"App-Version": "3.2.1", "platform": "web"}
+
+    settle_op = spec["paths"]["/api/v1/settlement/list"]["post"]
+    assert settle_op["x-host"] == "acctrade-api.example.com"
+    assert settle_op["x-origin"] == "https://acctrade-api.example.com"
+    assert settle_op["x-custom-headers"] == {
+        "AppVersion": "2.0.0",
+        "appType": "merchant",
+        "secret-v": "v2",
+        "deviceId": "dev-42",
+    }
+
+    # With configured project base_url, configured URL comes first without dropping observed origins
+    cfg = ProjectConfig.model_validate(
+        {"project_name": "MultiHost", "target": {"domain": "example.com", "base_url": "https://gw.example.com/"}}
+    )
+    spec_cfg = merge_to_openapi(har_dir, tmp_path / "hub_cfg", project_config=cfg)
+    assert [s["url"] for s in spec_cfg["servers"]] == [
+        "https://gw.example.com",
+        "https://pc-api.example.com",
+        "https://acctrade-api.example.com",
+    ]

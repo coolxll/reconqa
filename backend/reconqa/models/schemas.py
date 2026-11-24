@@ -203,6 +203,7 @@ class InventoryEndpoint(BaseModel):
     summary: str = ""
     discovery_source: str = "js-static"
     host: str = ""
+    custom_headers: dict[str, str] = Field(default_factory=dict)
     tags: list[str] = Field(default_factory=list)
     scenarios: list[str] = Field(default_factory=list)
     seen_in_runs: list[InventoryRunRef] = Field(default_factory=list)
@@ -413,6 +414,7 @@ class CapabilityEndpointRef(BaseModel):
     role: str
     discovery_source: str
     host: str = ""
+    custom_headers: dict[str, str] = Field(default_factory=dict)
 
 
 class CapabilityScenarioRef(BaseModel):

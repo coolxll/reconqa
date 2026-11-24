@@ -21,6 +21,154 @@ _SOURCE_PRIORITY = {
     "js-static": 1,
 }
 
+_NON_API_EXTENSIONS = frozenset(
+    {
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".css",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".ico",
+        ".webp",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".map",
+        ".mp4",
+        ".mp3",
+        ".wasm",
+        ".pdf",
+        ".zip",
+        ".gz",
+        ".tar",
+        ".rar",
+        ".7z",
+        ".exe",
+        ".dmg",
+        ".pkg",
+        ".msi",
+        ".apk",
+        ".ipa",
+        ".html",
+        ".htm",
+        ".xhtml",
+        ".xml",
+        ".txt",
+        ".md",
+    }
+)
+
+_CRAWLER_SOURCES = frozenset({"katana", "urlfinder"})
+
+_API_PATH_PREFIXES = (
+    "/api/",
+    "/v1/",
+    "/v2/",
+    "/v3/",
+    "/v4/",
+    "/v5/",
+    "/v6/",
+    "/v7/",
+    "/v8/",
+    "/v9/",
+    "/rest/",
+    "/graphql",
+    "/rpc/",
+    "/gateway/",
+    "/gw/",
+    "/bff/",
+    "/oauth/",
+    "/auth/",
+    "/openapi/",
+    "/swagger/",
+    "/service/",
+    "/services/",
+    "/open-api/",
+    "/cgi-bin/",
+    "/backend/",
+    "/server/",
+    "/admin-api/",
+    "/app-api/",
+    "/web-api/",
+    "/pc-api/",
+    "/h5-api/",
+    "/mobile-api/",
+)
+
+_API_HOST_LABELS = frozenset({"api", "gateway", "gw", "bff", "rpc", "graphql"})
+
+
+def _clean_filter_path(path: str) -> str:
+    raw = str(path or "").split("?", 1)[0].split("#", 1)[0].strip()
+    if not raw:
+        return ""
+    if not raw.startswith("/"):
+        raw = f"/{raw}"
+    raw = re.sub(r"/{2,}", "/", raw)
+    if len(raw) > 1 and raw.endswith("/"):
+        raw = raw.rstrip("/")
+    return raw
+
+
+def is_non_api_noise_path(path: str) -> bool:
+    """Return True if a discovered explore path is static/binary/regex noise rather than an API."""
+    clean = _clean_filter_path(path)
+    if not clean or len(clean) <= 2:
+        # Reject empty path, "/", or single-char paths like "/g"
+        return True
+
+    suffix = Path(clean.lower()).suffix
+    if suffix in _NON_API_EXTENSIONS:
+        return True
+
+    for seg in clean.split("/")[1:]:
+        if seg.startswith(".") and seg.lower() != ".well-known":
+            return True
+
+    return False
+
+
+def is_likely_api_endpoint(path: str, host: str = "") -> bool:
+    """Return True if a crawler URL looks like an API endpoint based on path prefix or API host."""
+    clean = _clean_filter_path(path)
+    if not clean:
+        return False
+    low = clean.lower()
+    for prefix in _API_PATH_PREFIXES:
+        if prefix.endswith("/"):
+            if low.startswith(prefix):
+                return True
+        elif low == prefix or low.startswith(f"{prefix}/"):
+            return True
+
+    norm_host = _extract_host_from_url(host).split(":", 1)[0]
+    if norm_host:
+        first_label = norm_host.split(".", 1)[0]
+        if first_label in _API_HOST_LABELS or first_label.endswith(("-api", "_api")):
+            return True
+
+    return False
+
+
+def classify_explore_endpoint(
+    path: str,
+    *,
+    host: str = "",
+    source: str = "",
+) -> str:
+    """Classify an explore endpoint as 'api', 'spa_route', or 'noise'."""
+    if is_non_api_noise_path(path):
+        return "noise"
+    norm_src = (source or "").strip().lower().replace("-", "_")
+    if norm_src in _CRAWLER_SOURCES:
+        return "api" if is_likely_api_endpoint(path, host=host) else "spa_route"
+    return "api"
+
 
 def _natural_sort_key(value: str) -> list[Any]:
     return [int(tok) if tok.isdigit() else tok.lower() for tok in re.split(r"(\d+)", value)]
@@ -125,6 +273,92 @@ def _load_run_openapi(workspace_dir: Path) -> dict[str, Any] | None:
     return None
 
 
+def _extract_host_from_url(url_or_host: str) -> str:
+    raw = str(url_or_host or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        return (urlparse(raw).netloc or "").strip().lower()
+    return raw.split("/", 1)[0].strip().lower()
+
+
+def _extract_op_host(op: dict[str, Any], fallback_host: str) -> str:
+    x_host = _extract_host_from_url(str(op.get("x-host") or ""))
+    if x_host:
+        return x_host
+    x_origin = _extract_host_from_url(str(op.get("x-origin") or ""))
+    if x_origin:
+        return x_origin
+    op_servers = op.get("servers")
+    if isinstance(op_servers, list):
+        for srv in op_servers:
+            if isinstance(srv, dict) and srv.get("url"):
+                srv_host = _extract_host_from_url(str(srv["url"]))
+                if srv_host:
+                    return srv_host
+    return fallback_host
+
+
+def _normalize_custom_headers(raw: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            key = str(k).strip()
+            if not key:
+                continue
+            out[key] = "" if v is None else str(v)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                key = item.strip()
+                if key:
+                    out[key] = ""
+            elif isinstance(item, dict) and item.get("name"):
+                key = str(item["name"]).strip()
+                if key:
+                    val = item.get("value")
+                    out[key] = "" if val is None else str(val)
+    return out
+
+
+def _merge_custom_headers(
+    existing: dict[str, str],
+    incoming: dict[str, str],
+    *,
+    prefer_incoming: bool,
+) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    lower_to_key: dict[str, str] = {}
+    for k, v in (existing or {}).items():
+        key = str(k).strip()
+        if not key:
+            continue
+        merged[key] = "" if v is None else str(v)
+        lower_to_key[key.lower()] = key
+
+    for k, v in (incoming or {}).items():
+        key = str(k).strip()
+        if not key:
+            continue
+        val = "" if v is None else str(v)
+        k_low = key.lower()
+        if k_low not in lower_to_key:
+            merged[key] = val
+            lower_to_key[k_low] = key
+        else:
+            old_key = lower_to_key[k_low]
+            old_val = merged[old_key]
+            if prefer_incoming:
+                if val or not old_val:
+                    if old_key != key:
+                        del merged[old_key]
+                        lower_to_key[k_low] = key
+                    merged[key] = val
+            elif not old_val and val:
+                merged[old_key] = val
+    return merged
+
+
 def _merge_parameters(
     existing: list[dict[str, Any]],
     incoming: list[dict[str, Any]],
@@ -169,6 +403,7 @@ def build_project_inventory(
         source: str,
         summary: str = "",
         host: str = "",
+        custom_headers: dict[str, str] | None = None,
         tags: list[str] | None = None,
         scenarios: list[str] | None = None,
         run_ref: dict[str, str] | None = None,
@@ -186,6 +421,7 @@ def build_project_inventory(
         key = (m, norm_path)
         norm_src = _normalize_source(source)
         src_prio = _SOURCE_PRIORITY.get(norm_src, 1)
+        norm_custom_headers = _normalize_custom_headers(custom_headers)
 
         cur = bucket.get(key)
         if cur is None:
@@ -195,6 +431,7 @@ def build_project_inventory(
                 "summary": summary,
                 "discovery_source": norm_src,
                 "host": host,
+                "custom_headers": norm_custom_headers,
                 "tags": list(dict.fromkeys(str(t) for t in (tags or []) if str(t).strip())),
                 "scenarios": list(dict.fromkeys(str(s) for s in (scenarios or []) if str(s).strip())),
                 "seen_in_runs": [run_ref] if run_ref else [],
@@ -216,6 +453,10 @@ def build_project_inventory(
             cur["summary"] = summary
         if host and (prefer_new or not cur["host"]):
             cur["host"] = host
+        if norm_custom_headers:
+            cur["custom_headers"] = _merge_custom_headers(
+                cur["custom_headers"], norm_custom_headers, prefer_incoming=prefer_new
+            )
 
         for t in tags or []:
             ts = str(t).strip()
@@ -250,12 +491,29 @@ def build_project_inventory(
         if base_url and base_url not in servers_seen:
             servers_seen.append(base_url)
         default_host = (urlparse(base_url).netloc or str(seed.get("root_domain") or "")).lower()
+        exp_spa_routes = {
+            _clean_filter_path(str(r)).lower()
+            for r in (exp.get("spa_routes") or [])
+            if str(r).strip()
+        }
 
         for ep in exp.get("discovered_endpoints") or []:
             if not isinstance(ep, dict):
                 continue
+            ep_path = str(ep.get("path") or "")
             ep_url = str(ep.get("url") or "")
             ep_host = (urlparse(ep_url).netloc if ep_url else "") or default_host
+            ep_source = str(ep.get("source") or "js-static")
+
+            if classify_explore_endpoint(ep_path, host=ep_host, source=ep_source) != "api":
+                continue
+
+            clean_ep_path = _clean_filter_path(ep_path).lower()
+            if clean_ep_path in exp_spa_routes and not is_likely_api_endpoint(
+                ep_path, host=ep_host
+            ):
+                continue
+
             inferred_params = [
                 {"name": str(p), "in": "query", "required": False, "schema": {"type": "string"}}
                 for p in (ep.get("inferred_params") or [])
@@ -263,10 +521,10 @@ def build_project_inventory(
             ]
             _upsert(
                 method=str(ep.get("method") or "GET"),
-                raw_path=str(ep.get("path") or "/"),
-                source=str(ep.get("source") or "js-static"),
+                raw_path=ep_path or "/",
+                source=ep_source,
                 summary=str(ep.get("snippet") or "")[:140]
-                if str(ep.get("source") or "") == "openapi_probe"
+                if ep_source == "openapi_probe"
                 else "",
                 host=ep_host,
                 parameters=inferred_params,
@@ -310,12 +568,18 @@ def build_project_inventory(
                 op_scenarios = [str(s) for s in (op.get("x-scenarios") or []) if str(s).strip()]
                 op_tags = [str(t) for t in (op.get("tags") or []) if str(t).strip()]
                 op_params = [p for p in (op.get("parameters") or []) if isinstance(p, dict)]
+                op_host = _extract_op_host(op, run_host)
+                op_origin = str(op.get("x-origin") or "").strip().rstrip("/")
+                if op_origin and op_origin not in servers_seen:
+                    servers_seen.append(op_origin)
+                op_custom_headers = _normalize_custom_headers(op.get("x-custom-headers"))
                 _upsert(
                     method=str(m_key).upper(),
                     raw_path=str(raw_path),
                     source=str(op.get("x-discovery-source") or "har-live"),
                     summary=str(op.get("summary") or ""),
-                    host=run_host,
+                    host=op_host,
+                    custom_headers=op_custom_headers,
                     tags=op_tags,
                     scenarios=op_scenarios,
                     run_ref=run_ref,
@@ -396,6 +660,10 @@ def build_project_inventory(
             "x-scenarios": ep["scenarios"],
             "x-seen-in-runs": [r["run_id"] for r in ep["seen_in_runs"]],
         }
+        if ep["host"]:
+            op_obj["x-host"] = ep["host"]
+        if ep["custom_headers"]:
+            op_obj["x-custom-headers"] = dict(ep["custom_headers"])
         if ep["tags"]:
             op_obj["tags"] = ep["tags"]
         if ep["parameters"]:

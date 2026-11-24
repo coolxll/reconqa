@@ -881,3 +881,75 @@ async def test_async_explore_job_progress_and_listing(
             if db_mod._engine is not None:
                 await db_mod._engine.dispose()
 
+
+def test_seed_explorer_separates_katana_spa_routes_and_drops_noise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify seed_explorer routes non-API katana/urlfinder paths to spa_routes and drops noise."""
+    from reconqa.modules.discovery import seed_explorer
+    from reconqa.modules.hub.inventory import classify_explore_endpoint
+
+    # Unit check on shared classifier helper
+    assert classify_explore_endpoint("/merchant/orders", host="www.example.test", source="katana") == "spa_route"
+    assert classify_explore_endpoint("/.exec", host="www.example.test", source="katana") == "noise"
+    assert classify_explore_endpoint("/v3/prod/Client-Setup.exe", host="www.example.test", source="js_static") == "noise"
+    assert classify_explore_endpoint("/api/v1/orders", host="www.example.test", source="katana") == "api"
+    assert classify_explore_endpoint("/settlement/list", host="pc-api.example.test", source="urlfinder") == "api"
+
+    def fake_run_discovery(target: str, out_dir: Path, **kwargs: Any) -> dict[str, Any]:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "katana_urls.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"request": {"method": "GET", "endpoint": "https://www.example.test/merchant/orders"}}),
+                    json.dumps({"request": {"method": "GET", "endpoint": "https://www.example.test/login"}}),
+                    json.dumps({"request": {"method": "GET", "endpoint": "https://www.example.test/.exec"}}),
+                    json.dumps({"request": {"method": "GET", "endpoint": "https://www.example.test/g"}}),
+                    json.dumps(
+                        {"request": {"method": "GET", "endpoint": "https://www.example.test/v3/prod/Client-Setup.exe"}}
+                    ),
+                    json.dumps(
+                        {"request": {"method": "GET", "endpoint": "https://www.example.test/api/v1/orders/list"}}
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (out_dir / "historical_urls.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"url": "https://www.example.test/agreement"}),
+                    json.dumps({"url": "https://pc-api.example.test/settlement/query"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {"warnings": []}
+
+    monkeypatch.setattr(seed_explorer, "run_discovery", fake_run_discovery)
+
+    res = seed_explorer.explore_from_seed(
+        seed_curl="curl 'https://api.example.test/api/v1/ping'",
+        out_dir=tmp_path / "exp_katana_filter",
+        mode="active",
+        probe_openapi_docs=False,
+        crawl_js=False,
+        discover_portals=False,
+    )
+
+    ep_paths = {ep["path"] for ep in res["discovered_endpoints"]}
+    spa_routes = set(res["spa_routes"])
+
+    assert "/api/v1/orders/list" in ep_paths
+    assert "/settlement/query" in ep_paths
+    assert "/api/v1/ping" in ep_paths
+
+    for non_api in ("/merchant/orders", "/login", "/agreement", "/.exec", "/g", "/v3/prod/Client-Setup.exe"):
+        assert non_api not in ep_paths, f"Non-API path leaked into discovered_endpoints: {non_api}"
+
+    assert {"/merchant/orders", "/login", "/agreement"}.issubset(spa_routes)
+    for noise in ("/.exec", "/g", "/v3/prod/Client-Setup.exe"):
+        assert noise not in spa_routes, f"Noise leaked into spa_routes: {noise}"
+

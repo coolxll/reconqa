@@ -327,6 +327,7 @@ function openTryIt(ep: InventoryEndpoint): void {
     summary: ep.summary,
     parameters: ep.parameters,
     requestExample: ep.request_example,
+    customHeaders: ep.custom_headers,
   };
   tryItOpen.value = true;
 }

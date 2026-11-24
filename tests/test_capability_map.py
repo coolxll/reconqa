@@ -5,14 +5,20 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 import reconqa.models.db as db_mod
 from reconqa.config import Settings, settings
+from reconqa.models.schemas import (
+    InventoryEndpoint,
+    ProjectCapabilityMapResponse,
+)
 from reconqa.models.tables import Run
 from reconqa.modules.hub.capability_map import build_capability_map
+from reconqa.modules.hub.inventory import build_project_inventory
 
 
 def test_capability_map_normalization_roles_actions_and_state_mining() -> None:
@@ -381,3 +387,286 @@ async def test_capabilities_api_filtering_and_idempotent_5case_promotion(
 
     if db_mod._engine is not None:
         await db_mod._engine.dispose()
+
+
+def test_inventory_and_capability_map_preserve_per_endpoint_host_and_custom_headers(
+    tmp_path: Path,
+) -> None:
+    """Verify per-endpoint x-host/x-origin and x-custom-headers survive inventory, OpenAPI, and capability map."""
+    run1_ws = tmp_path / "run1"
+    run2_ws = tmp_path / "run2"
+    (run1_ws / "hub").mkdir(parents=True, exist_ok=True)
+    (run2_ws / "hub").mkdir(parents=True, exist_ok=True)
+
+    (run1_ws / "hub" / "openapi.json").write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.3",
+                "servers": [{"url": "https://pc-api.example.com"}],
+                "paths": {
+                    "/shopstore/plf/order/list": {
+                        "get": {
+                            "summary": "List orders v1",
+                            "x-discovery-source": "har-live",
+                            "x-host": "pc-api.example.com",
+                            "x-origin": "https://pc-api.example.com",
+                            "x-custom-headers": {
+                                "App-Version": "1.0.0",
+                                "platform": "web",
+                                "": "ignored-empty-key",
+                            },
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                    "/shopstore/seller/order/settle": {
+                        "post": {
+                            "summary": "Settle order v1",
+                            "x-discovery-source": "har-live",
+                            "x-origin": "https://acctrade-api.example.com",
+                            "x-custom-headers": ["appType"],
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    (run2_ws / "hub" / "openapi.json").write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.3",
+                "servers": [{"url": "https://pc-api.example.com"}],
+                "paths": {
+                    "/shopstore/plf/order/list": {
+                        "get": {
+                            "summary": "List orders v2",
+                            "x-discovery-source": "har-live",
+                            "x-host": "pc-api.example.com",
+                            "x-custom-headers": {
+                                "App-Version": "2.0.0",
+                                "deviceId": "dev-9",
+                            },
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                    "/shopstore/seller/order/settle": {
+                        "post": {
+                            "summary": "Settle order v2",
+                            "x-discovery-source": "har-live",
+                            "servers": [{"url": "https://acctrade-api.example.com"}],
+                            "x-custom-headers": {
+                                "appType": "merchant",
+                                "secret-v": "v3",
+                            },
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runs = [
+        SimpleNamespace(id="run-001", workspace_dir=str(run1_ws), config_snapshot={"run_name": "Run 1"}),
+        SimpleNamespace(id="run-002", workspace_dir=str(run2_ws), config_snapshot={"run_name": "Run 2"}),
+    ]
+
+    inventory, openapi_doc = build_project_inventory(
+        project_id="proj-mh",
+        project_name="MultiHost Platform",
+        runs=runs,
+        explore_results=[],
+    )
+
+    # Validate InventoryEndpoint schema and merged fields
+    eps_by_key = {(ep["method"], ep["path"]): InventoryEndpoint.model_validate(ep) for ep in inventory["endpoints"]}
+    list_ep = eps_by_key[("GET", "/shopstore/plf/order/list")]
+    assert list_ep.host == "pc-api.example.com"
+    assert list_ep.custom_headers == {
+        "App-Version": "2.0.0",
+        "platform": "web",
+        "deviceId": "dev-9",
+    }
+
+    settle_ep = eps_by_key[("POST", "/shopstore/seller/order/settle")]
+    assert settle_ep.host == "acctrade-api.example.com"
+    assert settle_ep.custom_headers == {"appType": "merchant", "secret-v": "v3"}
+
+    # Validate merged OpenAPI spec emits x-host and x-custom-headers per operation
+    oa_settle = openapi_doc["paths"]["/shopstore/seller/order/settle"]["post"]
+    assert oa_settle["x-host"] == "acctrade-api.example.com"
+    assert oa_settle["x-custom-headers"] == {"appType": "merchant", "secret-v": "v3"}
+
+    oa_list = openapi_doc["paths"]["/shopstore/plf/order/list"]["get"]
+    assert oa_list["x-host"] == "pc-api.example.com"
+    assert oa_list["x-custom-headers"] == {
+        "App-Version": "2.0.0",
+        "platform": "web",
+        "deviceId": "dev-9",
+    }
+
+    # Validate CapabilityEndpointRef propagation through build_capability_map & Pydantic schema
+    cap_map = build_capability_map(
+        inventory=inventory,
+        scenarios=[],
+        project_id="proj-mh",
+        project_name="MultiHost Platform",
+    )
+    validated_map = ProjectCapabilityMapResponse.model_validate(cap_map)
+    order_cap = next(c for c in validated_map.capabilities if c.key == "shopstore/order")
+    cap_eps = {(e.method, e.path): e for e in order_cap.endpoints}
+    assert cap_eps[("GET", "/shopstore/plf/order/list")].host == "pc-api.example.com"
+    assert cap_eps[("GET", "/shopstore/plf/order/list")].custom_headers == {
+        "App-Version": "2.0.0",
+        "platform": "web",
+        "deviceId": "dev-9",
+    }
+    assert cap_eps[("POST", "/shopstore/seller/order/settle")].host == "acctrade-api.example.com"
+    assert cap_eps[("POST", "/shopstore/seller/order/settle")].custom_headers == {
+        "appType": "merchant",
+        "secret-v": "v3",
+    }
+
+
+def test_inventory_filters_explore_spa_crawler_and_noise_but_keeps_apis_and_har_live(
+    tmp_path: Path,
+) -> None:
+    """Verify inventory.py strips katana SPA routes, regex noise, and binary downloads from explore results."""
+    run_ws = tmp_path / "run_live"
+    (run_ws / "hub").mkdir(parents=True, exist_ok=True)
+    (run_ws / "hub" / "openapi.json").write_text(
+        json.dumps(
+            {
+                "openapi": "3.0.3",
+                "servers": [{"url": "https://pc-api.example.test"}],
+                "paths": {
+                    "/merchant/live-rpc": {
+                        "post": {
+                            "summary": "Live HAR endpoint",
+                            "x-discovery-source": "har-live",
+                            "x-host": "pc-api.example.test",
+                            "responses": {"200": {"description": "OK"}},
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    explore_results = [
+        {
+            "seed": {
+                "base_url": "https://www.example.test",
+                "root_domain": "example.test",
+            },
+            "spa_routes": ["/merchant/finance", "/api/shop/health"],
+            "discovered_endpoints": [
+                # Katana / urlfinder SPA routes -> filtered out
+                {
+                    "method": "GET",
+                    "path": "/merchant/orders",
+                    "url": "https://www.example.test/merchant/orders",
+                    "source": "katana",
+                },
+                {
+                    "method": "GET",
+                    "path": "/login",
+                    "url": "https://www.example.test/login",
+                    "source": "katana",
+                },
+                {
+                    "method": "GET",
+                    "path": "/agreement",
+                    "url": "https://www.example.test/agreement",
+                    "source": "urlfinder",
+                },
+                # JS regex / dot-property / single-char / root noise -> filtered out
+                {"method": "GET", "path": "/.exec", "url": "https://www.example.test/.exec", "source": "katana"},
+                {
+                    "method": "GET",
+                    "path": "/.exec.apply",
+                    "url": "https://www.example.test/.exec.apply",
+                    "source": "js_static",
+                },
+                {"method": "GET", "path": "/.test", "url": "https://www.example.test/.test", "source": "js_static"},
+                {"method": "GET", "path": "/g", "url": "https://www.example.test/g", "source": "katana"},
+                {"method": "GET", "path": "/", "url": "https://www.example.test/", "source": "katana"},
+                # Binary installer download -> filtered out
+                {
+                    "method": "GET",
+                    "path": "/v3/prod/Client-Setup.exe",
+                    "url": "https://www.example.test/v3/prod/Client-Setup.exe",
+                    "source": "js_static",
+                },
+                # js_static path that is in spa_routes and not API-like -> filtered out
+                {
+                    "method": "GET",
+                    "path": "/merchant/finance",
+                    "url": "https://www.example.test/merchant/finance",
+                    "source": "js_static",
+                },
+                # Real API endpoints -> MUST be kept
+                {
+                    "method": "GET",
+                    "path": "/api/shop/orders/list",
+                    "url": "https://www.example.test/api/shop/orders/list",
+                    "source": "katana",
+                },
+                {
+                    "method": "GET",
+                    "path": "/users",
+                    "url": "https://api.example.com/users",
+                    "source": "katana",
+                },
+                {
+                    "method": "GET",
+                    "path": "/api/shop/health",
+                    "url": "https://www.example.test/api/shop/health",
+                    "source": "js_static",
+                },
+                {
+                    "method": "GET",
+                    "path": "/.well-known/openid-configuration",
+                    "url": "https://www.example.test/.well-known/openid-configuration",
+                    "source": "js_static",
+                },
+            ],
+        }
+    ]
+
+    runs = [
+        SimpleNamespace(id="run-live-1", workspace_dir=str(run_ws), config_snapshot={"run_name": "Live Run"}),
+    ]
+    inventory, _ = build_project_inventory(
+        project_id="proj-clean",
+        project_name="Clean Inventory",
+        runs=runs,
+        explore_results=explore_results,
+    )
+
+    kept_paths = {ep["path"] for ep in inventory["endpoints"]}
+    for dropped in (
+        "/merchant/orders",
+        "/login",
+        "/agreement",
+        "/.exec",
+        "/.exec.apply",
+        "/.test",
+        "/g",
+        "/",
+        "/v3/prod/Client-Setup.exe",
+        "/merchant/finance",
+    ):
+        assert dropped not in kept_paths, f"Expected noise/SPA path {dropped} to be filtered, got {kept_paths}"
+
+    assert {
+        "/merchant/live-rpc",
+        "/api/shop/orders/list",
+        "/users",
+        "/api/shop/health",
+        "/.well-known/openid-configuration",
+    } == kept_paths

@@ -434,6 +434,8 @@ def _is_static_asset(
     response_mime: str,
     response_json: Any,
     ignore_prefixes: list[str],
+    request_headers: dict[str, str] | None = None,
+    status: int = 200,
 ) -> bool:
     if response_json is not None:
         return False
@@ -453,9 +455,20 @@ def _is_static_asset(
     if any(sub in mime_lower for sub in STATIC_MIME_SUBSTRINGS):
         return True
 
-    return mime_lower == "text/html" and (
-        path_lower == "/" or suffix in {".html", ".htm", ".xhtml"}
-    )
+    if mime_lower in {"text/html", "application/xhtml+xml"}:
+        if path_lower == "/" or suffix in {".html", ".htm", ".xhtml"}:
+            return True
+        if request_headers:
+            lower_hdrs = {k.lower(): str(v).strip().lower() for k, v in request_headers.items()}
+            if (
+                lower_hdrs.get("sec-fetch-dest") == "document"
+                or lower_hdrs.get("sec-fetch-mode") == "navigate"
+            ):
+                return True
+        if 200 <= status < 400:
+            return True
+
+    return False
 
 
 def parse_har_file(
@@ -513,8 +526,18 @@ def parse_har_file(
         resp_body_raw, resp_size = _decode_har_content(resp_content)
         resp_json = _try_parse_json(resp_body_raw, resp_mime)
 
+        try:
+            status_code = int(resp.get("status", 0))
+        except (TypeError, ValueError):
+            status_code = 0
+
         if not include_static and _is_static_asset(
-            raw_path, resp_mime, resp_json, ignore_prefixes
+            raw_path,
+            resp_mime,
+            resp_json,
+            ignore_prefixes,
+            request_headers=req_headers,
+            status=status_code,
         ):
             continue
 
@@ -561,11 +584,6 @@ def parse_har_file(
 
         lower_req_headers = {k.lower() for k in req_headers}
         has_auth = bool(lower_req_headers & AUTH_HEADER_NAMES) or bool(req_cookies)
-
-        try:
-            status_code = int(resp.get("status", 0))
-        except (TypeError, ValueError):
-            status_code = 0
 
         entry = HarEntry(
             index=raw_idx,

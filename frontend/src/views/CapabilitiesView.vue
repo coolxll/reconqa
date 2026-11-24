@@ -191,6 +191,7 @@ function openTryIt(ep: CapabilityEndpointRef): void {
     path: ep.path,
     host: ep.host || undefined,
     summary: `${roleLabel(ep.role)} · ${ep.action}`,
+    customHeaders: ep.custom_headers,
   };
   tryItOpen.value = true;
 }

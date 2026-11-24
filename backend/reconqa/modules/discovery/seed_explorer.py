@@ -21,6 +21,7 @@ import httpx
 from reconqa.config import settings
 from reconqa.modules.discovery.runner import run_discovery
 from reconqa.modules.discovery.spa_parser import extract_spa_routes
+from reconqa.modules.hub.inventory import classify_explore_endpoint, is_non_api_noise_path
 from reconqa.modules.recorder.js_extractor import extract_js_endpoints
 from reconqa.modules.recorder.text_importer import import_traffic_text
 from reconqa.utils.io import ensure_dir, read_json, read_jsonl, slugify, write_json
@@ -1469,6 +1470,9 @@ def explore_from_seed(
             for ep in js_res.get("endpoints") or []:
                 if not isinstance(ep, dict) or not ep.get("path"):
                     continue
+                ep_path_str = str(ep["path"])
+                if is_non_api_noise_path(ep_path_str):
+                    continue
                 ep_full_url = str(ep.get("url") or "") or None
                 ep_origin = base_url
                 if ep_full_url:
@@ -1478,7 +1482,7 @@ def explore_from_seed(
                 _add_endpoint(
                     endpoints_bucket,
                     method=str(ep.get("method") or "GET"),
-                    path=str(ep["path"]),
+                    path=ep_path_str,
                     base_url=ep_origin,
                     url=ep_full_url,
                     source=_normalize_js_source(str(ep.get("discovery_source") or "js_static")),
@@ -1538,6 +1542,7 @@ def explore_from_seed(
                     }
                 )
 
+            spa_routes_set = set(spa_routes)
             for fname, src_label in (
                 ("katana_urls.jsonl", "katana"),
                 ("historical_urls.jsonl", "urlfinder"),
@@ -1551,15 +1556,26 @@ def explore_from_seed(
                     h = (pu.hostname or "").lower()
                     if _registrable_root_domain(h) != root_domain:
                         continue
-                    if any(
-                        (pu.path or "").lower().endswith(ext)
-                        for ext in (".js", ".css", ".png", ".jpg", ".svg", ".ico", ".woff", ".woff2")
-                    ):
+                    clean_p = (pu.path or "/").strip() or "/"
+                    if not clean_p.startswith("/"):
+                        clean_p = f"/{clean_p}"
+                    kind = classify_explore_endpoint(
+                        clean_p,
+                        host=pu.netloc or h,
+                        source=src_label,
+                    )
+                    if kind == "noise":
+                        continue
+                    if kind == "spa_route":
+                        norm_spa = clean_p.rstrip("/") or "/"
+                        if norm_spa not in spa_routes_set:
+                            spa_routes_set.add(norm_spa)
+                            spa_routes.append(norm_spa)
                         continue
                     _add_endpoint(
                         endpoints_bucket,
                         method=str(req_obj.get("method") or "GET"),
-                        path=pu.path or "/",
+                        path=clean_p,
                         base_url=f"{pu.scheme}://{pu.netloc}",
                         url=raw_u,
                         source=src_label,
