@@ -11,6 +11,7 @@ export interface ExploreRequest {
   crawl_js?: boolean;
   depth?: number;
   merge?: boolean;
+  project_id?: string | null;
 }
 
 export interface ExploreSeedInfo {
@@ -61,6 +62,7 @@ export interface ExploreScanRecord {
 
 export interface ExploreResult {
   explore_id: string;
+  project_id?: string | null;
   created_at: string;
   updated_at?: string;
   mode: string;
@@ -79,6 +81,7 @@ export interface ExploreResult {
 
 export interface ExploreListItem {
   explore_id: string;
+  project_id?: string | null;
   created_at: string;
   updated_at?: string;
   mode: string;
@@ -105,8 +108,9 @@ export function runExplore(body: ExploreRequest): Promise<ExploreResult> {
   });
 }
 
-export async function listExplores(): Promise<ExploreListItem[]> {
-  const raw = await apiFetch<ExploreListItem[] | { items?: ExploreListItem[] }>("/explore");
+export async function listExplores(projectId?: string | null): Promise<ExploreListItem[]> {
+  const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+  const raw = await apiFetch<ExploreListItem[] | { items?: ExploreListItem[] }>(`/explore${qs}`);
   if (Array.isArray(raw)) {
     return raw;
   }

@@ -530,6 +530,214 @@ export interface ProjectTrendsResponse {
   trends: TrendPoint[];
 }
 
+// --- Project Master API Inventory & Inline Replay ---
+
+export interface InventorySeenInRun {
+  run_id: string;
+  run_name: string;
+}
+
+export interface InventoryEndpoint {
+  method: string;
+  path: string;
+  summary?: string;
+  discovery_source: "har-live" | "js-static-inferred" | "js-static" | "openapi-doc" | string;
+  host?: string;
+  tags?: string[];
+  scenarios: string[];
+  seen_in_runs: InventorySeenInRun[];
+  status_codes: number[];
+  parameters?: Array<Record<string, unknown>>;
+  request_schema?: Record<string, unknown> | null;
+  response_schema?: Record<string, unknown> | null;
+  request_example?: unknown;
+  response_example?: unknown;
+}
+
+export interface InventoryPrefixStats {
+  prefix: string;
+  total: number;
+  covered: number;
+  coverage_pct: number;
+}
+
+export interface InventoryScenarioMeta {
+  id: string;
+  slug: string;
+  name: string;
+  priority: string;
+  business_domain: string;
+  effectiveness_level: string;
+  description: string;
+}
+
+export interface ProjectInventoryResponse {
+  project_id: string;
+  project_name: string;
+  runs_merged_count: number;
+  explore_sessions_count: number;
+  total_endpoints: number;
+  har_live_count: number;
+  js_static_count: number;
+  coverage_pct: number;
+  scenarios: string[];
+  scenario_meta?: Record<string, InventoryScenarioMeta>;
+  by_prefix: InventoryPrefixStats[];
+  endpoints: InventoryEndpoint[];
+}
+
+// --- First-Class Business Scenarios & Effectiveness Model ---
+
+export type ScenarioPriority = "P0" | "P1" | "P2" | "P3";
+export type ScenarioStatus = "draft" | "active" | "verified" | "archived";
+export type ScenarioSource = "har-auto" | "manual" | "ai-agent";
+export type ScenarioEffectivenessLevel = "L0" | "L1" | "L2" | "L3" | "L4";
+
+export type ScenarioAssertionOperator =
+  | "equals"
+  | "not_equals"
+  | "not_empty"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "contains"
+  | "matches"
+  | "custom";
+
+export type ScenarioAssertionStatus = "pending" | "passed" | "failed";
+
+export type ScenarioNegativeCategory =
+  | "auth"
+  | "validation"
+  | "boundary"
+  | "idempotency"
+  | "state_machine"
+  | "security";
+
+export type ScenarioNegativeStatus = "pending" | "covered" | "failed";
+
+export interface ScenarioAssertion {
+  id: string;
+  title: string;
+  target_endpoint: string;
+  jsonpath: string;
+  operator: ScenarioAssertionOperator;
+  expected: string;
+  note: string;
+  status: ScenarioAssertionStatus;
+}
+
+export interface ScenarioNegativeCase {
+  id: string;
+  title: string;
+  category: ScenarioNegativeCategory;
+  expected_behavior: string;
+  status: ScenarioNegativeStatus;
+  note: string;
+}
+
+export interface ScenarioItem {
+  id: string;
+  project_id: string;
+  slug: string;
+  name: string;
+  description: string;
+  preconditions: string;
+  business_domain: string;
+  priority: ScenarioPriority;
+  status: ScenarioStatus;
+  owner: string;
+  source: ScenarioSource;
+  tags: string[];
+  assertions: ScenarioAssertion[];
+  negative_cases: ScenarioNegativeCase[];
+  endpoint_count: number;
+  run_count: number;
+  last_run_id: string | null;
+  last_run_name: string | null;
+  assertion_count: number;
+  assertions_passed_count: number;
+  negative_case_count: number;
+  negative_cases_covered_count: number;
+  effectiveness_level: ScenarioEffectivenessLevel;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScenarioLinkedRun {
+  run_id: string;
+  run_name: string;
+  status: string;
+  created_at: string;
+}
+
+export interface ScenarioDetail extends ScenarioItem {
+  endpoints: InventoryEndpoint[];
+  runs: ScenarioLinkedRun[];
+}
+
+export interface ScenarioListResponse {
+  project_id: string;
+  total: number;
+  by_priority: Record<string, number>;
+  by_effectiveness: Record<string, number>;
+  p0_p1_total: number;
+  p0_p1_effective_count: number;
+  p0_p1_effective_pct: number;
+  scenarios: ScenarioItem[];
+}
+
+export interface ScenarioCreate {
+  slug?: string;
+  name: string;
+  description?: string;
+  preconditions?: string;
+  business_domain?: string;
+  priority?: ScenarioPriority;
+  status?: ScenarioStatus;
+  owner?: string;
+  source?: ScenarioSource;
+  tags?: string[];
+  assertions?: Array<Partial<ScenarioAssertion> & { title: string }>;
+  negative_cases?: Array<Partial<ScenarioNegativeCase> & { title: string }>;
+}
+
+export interface ScenarioUpdate {
+  name?: string;
+  description?: string;
+  preconditions?: string;
+  business_domain?: string;
+  priority?: ScenarioPriority;
+  status?: ScenarioStatus;
+  owner?: string;
+  tags?: string[];
+  assertions?: ScenarioAssertion[];
+  negative_cases?: ScenarioNegativeCase[];
+}
+
+export interface ReplayRequest {
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  query_params?: Record<string, string>;
+  body?: unknown;
+  credential_id?: string | null;
+  timeout_sec?: number;
+}
+
+export interface ReplayResponse {
+  status_code: number;
+  status_text: string;
+  duration_ms: number;
+  response_headers: Record<string, string>;
+  body_text: string;
+  body_json?: unknown;
+  content_type: string;
+  truncated: boolean;
+  error?: string | null;
+}
+
 // --- SSE Events ---
 
 export interface SseRunEvent {

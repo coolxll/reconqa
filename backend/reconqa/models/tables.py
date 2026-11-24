@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -37,6 +37,9 @@ class Project(Base):
     )
     runs: Mapped[list[Run]] = relationship(back_populates="project", cascade="all, delete-orphan")
     knowledge_docs: Mapped[list[KnowledgeDoc]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    scenarios: Mapped[list[ScenarioModel]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
 
@@ -153,3 +156,31 @@ class KnowledgeDoc(Base):
     )
 
     project: Mapped[Project] = relationship(back_populates="knowledge_docs")
+
+
+class ScenarioModel(Base):
+    __tablename__ = "scenarios"
+    __table_args__ = (UniqueConstraint("project_id", "slug", name="uq_scenarios_project_slug"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    slug: Mapped[str] = mapped_column(String(160), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text, default="")
+    preconditions: Mapped[str] = mapped_column(Text, default="")
+    business_domain: Mapped[str] = mapped_column(String(128), default="")
+    priority: Mapped[str] = mapped_column(String(8), default="P2", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    owner: Mapped[str] = mapped_column(String(128), default="")
+    source: Mapped[str] = mapped_column(String(32), default="manual")
+    tags_json: Mapped[str] = mapped_column(Text, default="[]")
+    assertions_json: Mapped[str] = mapped_column(Text, default="[]")
+    negative_cases_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    project: Mapped[Project] = relationship(back_populates="scenarios")

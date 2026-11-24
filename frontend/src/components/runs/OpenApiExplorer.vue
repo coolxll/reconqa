@@ -10,16 +10,20 @@ import {
   Layers,
   List,
   Lock,
+  Play,
   Search,
 } from 'lucide-vue-next'
 import { artifactDownloadUrl } from '@/api/client'
 import { getRunOpenApi } from '@/api/runs'
+import { useWorkspace } from '@/stores/workspace'
 import StatusBadge from '@/components/layout/StatusBadge.vue'
 import EmptyState from '@/components/layout/EmptyState.vue'
+import TryItDrawer, { type TryItEndpointInput } from '@/components/runs/TryItDrawer.vue'
 import '@/i18n/locales/runs'
 import { useI18n } from '@/i18n'
 
 const { t } = useI18n()
+const { activeProjectId } = useWorkspace()
 
 interface OpenApiParameter {
   name: string
@@ -61,7 +65,24 @@ interface FlattenedEndpoint {
 
 const props = defineProps<{
   runId: string
+  projectId?: string
 }>()
+
+const resolvedProjectId = computed(() => props.projectId || activeProjectId.value || '')
+const tryItOpen = ref(false)
+const tryItEndpoint = ref<TryItEndpointInput | null>(null)
+
+function openTryIt(ep: FlattenedEndpoint) {
+  tryItEndpoint.value = {
+    method: ep.method,
+    path: ep.path,
+    baseUrl: specInfo.value.serverUrl || undefined,
+    summary: ep.summary,
+    parameters: ep.parameters as unknown as Array<Record<string, unknown>>,
+    requestExample: extractJsonExample(ep.requestBody),
+  }
+  tryItOpen.value = true
+}
 
 const loading = ref(true)
 const errorMessage = ref('')
@@ -729,6 +750,7 @@ onMounted(loadSpec)
                   <th class="px-3 py-3">{{ t('openapi.col.scenarios') }}</th>
                   <th class="px-3 py-3 text-right">{{ t('openapi.col.perf') }}</th>
                   <th class="w-16 px-3 py-3 text-center">{{ t('openapi.col.auth') }}</th>
+                  <th class="w-24 px-3 py-3 text-right">{{ t('inv.colAction') }}</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-100">
@@ -790,11 +812,22 @@ onMounted(loadSpec)
                       />
                       <span v-else class="text-xs text-slate-300">—</span>
                     </td>
+                    <td class="px-3 py-3 text-right" @click.stop>
+                      <button
+                        type="button"
+                        data-testid="openapi-try-it-btn"
+                        class="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-semibold text-indigo-700 transition hover:bg-indigo-100"
+                        @click="openTryIt(ep)"
+                      >
+                        <Play class="h-3 w-3" />
+                        <span>{{ t('inv.tryItBtn') }}</span>
+                      </button>
+                    </td>
                   </tr>
 
                   <!-- Expanded Operation Drawer -->
                   <tr v-if="expandedKeys.has(`${group.id}::${ep.key}`)" class="bg-slate-50/70">
-                  <td colspan="7" class="px-6 py-4">
+                  <td colspan="8" class="px-6 py-4">
                     <div class="space-y-4">
                       <!-- Metadata strip -->
                       <div class="flex flex-wrap items-center gap-3 text-xs">
@@ -1127,7 +1160,7 @@ onMounted(loadSpec)
               </template>
 
                 <tr v-if="group.endpoints.length === 0">
-                  <td colspan="7" class="px-6 py-10 text-center text-sm text-slate-500">
+                  <td colspan="8" class="px-6 py-10 text-center text-sm text-slate-500">
                     {{ t('openapi.noMatches') }}
                   </td>
                 </tr>
@@ -1137,5 +1170,13 @@ onMounted(loadSpec)
         </div>
       </div>
     </template>
+
+    <!-- Reusable Inline Try It Drawer -->
+    <TryItDrawer
+      :open="tryItOpen"
+      :project-id="resolvedProjectId"
+      :endpoint="tryItEndpoint"
+      @close="tryItOpen = false"
+    />
   </div>
 </template>

@@ -155,7 +155,7 @@ If your team runs ReconQA on an internal QA server (e.g. `http://qa-reconqa.exam
 
 ## 4. MCP Tools & Resources Reference
 
-### Tools (11)
+### Tools (14)
 
 | Tool | Key Parameters | Purpose |
 |---|---|---|
@@ -170,6 +170,9 @@ If your team runs ReconQA on an internal QA server (e.g. `http://qa-reconqa.exam
 | `reconqa_execute_run_modules` | `run_id`, `modules`, `config=None`, `wait=True` | Incrementally run `java_gen`, `perf`, `security`, or `merge` on an existing run and optionally poll up to 30s until complete. |
 | `reconqa_get_run_summary` | `run_id` | Return run status, jobs, `summary_metrics`, coverage %, correlation chain count, available artifacts, and resource URIs. |
 | `reconqa_list_findings` | `run_id`, `category=None`, `severity=None`, `limit=30` | Return severity-sorted findings with bounded evidence payloads (max 100 per call). |
+| `reconqa_get_project_inventory` | `project_id`, `source=None`, `prefix=None`, `limit=80` | Fetch the project's cumulative Master API Inventory (`total_endpoints`, `har_live_count`, `js_static_count`, `coverage_pct`, `by_prefix`, `scenarios`, and filtered endpoints). |
+| `reconqa_list_scenarios` | `project_id`, `priority=None`, `effectiveness_level=None` | List first-class business scenarios with `p0_p1_effective_pct`, `by_priority`, `by_effectiveness`, and per-scenario `L0`–`L4` effectiveness status. |
+| `reconqa_upsert_scenario` | `project_id`, `slug`, `name=None`, `description=None`, `preconditions=None`, `business_domain=None`, `priority=None`, `status=None`, `owner=None`, `tags=None`, `assertions=None`, `negative_cases=None` | Upsert a business scenario (`source="ai-agent"`) with priority, business description, structured JSONPath assertions, and negative/edge test checklists. |
 
 ### Resources (3)
 
@@ -203,6 +206,9 @@ Pair a browser-capable AI agent with ReconQA's scenario proxy (or browser HAR re
    Call `reconqa_upload_har_files(har_paths=["./roam_hars"], wait=True)`.
    - ReconQA automatically detects the primary host (e.g. `shop.example.com`), links or creates the project, extracts embedded JS bundles, merges all scenarios into **OpenAPI 3.0.3 + Data-Flow Correlations**, and computes **Coverage Diff** (`har-live` vs. static JS endpoints).
    - The new run appears immediately in the Vue 3 Web Console, ready for on-demand **Java TestNG+Allure (`java_gen`)**, **Performance & k6 (`perf`)**, or **Security & IDOR (`security`)** via `reconqa_execute_run_modules` or the Web UI tabs.
+5. **Effectiveness Loop (Beyond HTTP 200)**:
+   - Read Project Knowledge Base PRDs (`reconqa://projects/{project_id}/knowledge`), inspect the cumulative Master API Inventory (`reconqa_get_project_inventory`), and call `reconqa_list_scenarios(project_id)` to spot `P0`/`P1` business scenarios stuck at `L1`/`L2`.
+   - Call `reconqa_upsert_scenario(project_id, slug=..., priority="P0", assertions=[...], negative_cases=[...])` to enrich those scenarios with structured JSONPath business assertions and negative/edge test checklists—ReconQA then compiles real business checks directly into generated Java RestAssured tests!
 
 ---
 

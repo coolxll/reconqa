@@ -26,6 +26,7 @@ import {
 import type { Job, Run } from '@/api/types'
 import { artifactDownloadUrl } from '@/api/client'
 import { deleteRun, getRun, getRunTitle, listProjectRuns, shortRunId, startRun } from '@/api/runs'
+import { useWorkspace } from '@/stores/workspace'
 import StatusBadge from '@/components/layout/StatusBadge.vue'
 import MetricCard from '@/components/layout/MetricCard.vue'
 import EmptyState from '@/components/layout/EmptyState.vue'
@@ -82,8 +83,16 @@ const TABS = computed(() => [
 
 const route = useRoute()
 const router = useRouter()
+const { activeProjectId, setActiveProject } = useWorkspace()
 
 const runId = computed(() => String(route.params.runId ?? ''))
+const runsBackPath = computed(() => {
+  const pid =
+    run.value?.project_id ||
+    (typeof route.params.projectId === 'string' && route.params.projectId) ||
+    activeProjectId.value
+  return pid ? `/p/${pid}/runs` : '/runs'
+})
 
 function resolveValidTab(raw: unknown): TabId {
   const str = typeof raw === 'string' ? raw : ''
@@ -122,6 +131,7 @@ async function reloadRun() {
     run.value = data
     errorMessage.value = ''
     if (data.project_id) {
+      setActiveProject(data.project_id)
       try {
         siblingRuns.value = await listProjectRuns(data.project_id)
       } catch {
@@ -156,7 +166,7 @@ async function handleDeleteRun() {
   errorMessage.value = ''
   try {
     await deleteRun(runId.value)
-    await router.push('/runs')
+    await router.push(runsBackPath.value)
   } catch (err) {
     errorMessage.value =
       err instanceof Error ? err.message : t('runDetail.deleteError')
@@ -395,7 +405,7 @@ onMounted(() => {
       :description="errorMessage || t('runDetail.notFoundDesc', { runId })"
     >
       <router-link
-        to="/runs"
+        :to="runsBackPath"
         class="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700"
       >
         <ArrowLeft class="h-4 w-4" />
@@ -410,7 +420,7 @@ onMounted(() => {
           <div class="space-y-1.5">
             <div class="flex flex-wrap items-center gap-2.5">
               <router-link
-                to="/runs"
+                :to="runsBackPath"
                 class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
               >
                 <ArrowLeft class="h-3.5 w-3.5" />
@@ -722,7 +732,11 @@ onMounted(() => {
         />
       </div>
 
-      <OpenApiExplorer v-else-if="activeTab === 'openapi'" :run-id="run.id" />
+      <OpenApiExplorer
+        v-else-if="activeTab === 'openapi'"
+        :run-id="run.id"
+        :project-id="run.project_id"
+      />
 
       <CorrelationPanel v-else-if="activeTab === 'correlation'" :run-id="run.id" />
 

@@ -8,6 +8,9 @@ import type {
   KnowledgeDocUpdate,
   Project,
   ProjectCreate,
+  ProjectInventoryResponse,
+  ReplayRequest,
+  ReplayResponse,
   Target,
   TargetCreate,
 } from "./types";
@@ -175,4 +178,26 @@ export function deleteKnowledgeDoc(
 
 export function knowledgeDownloadUrl(projectId: string, docId: string): string {
   return `${API_BASE}/projects/${encodeURIComponent(projectId)}/knowledge/${encodeURIComponent(docId)}/download`;
+}
+
+// --- Project Master API Inventory & Inline Replay ---
+
+export function getProjectInventory(projectId: string): Promise<ProjectInventoryResponse> {
+  return apiFetch<ProjectInventoryResponse>(
+    `/projects/${encodeURIComponent(projectId)}/inventory`
+  );
+}
+
+export function getProjectInventoryOpenApiUrl(projectId: string): string {
+  return `${API_BASE}/projects/${encodeURIComponent(projectId)}/inventory/openapi.json`;
+}
+
+export function replayEndpoint(
+  projectId: string,
+  payload: ReplayRequest
+): Promise<ReplayResponse> {
+  return apiFetch<ReplayResponse>(`/projects/${encodeURIComponent(projectId)}/replay`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }

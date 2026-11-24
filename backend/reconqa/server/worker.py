@@ -288,6 +288,20 @@ class InProcessTaskRunner:
                                 str(k): str(v) for k, v in prof.extra_headers_ref.items()
                             }
 
+            project_id = run.project_id
+            scenario_assertions: list[dict[str, Any]] = []
+            if "java_gen" in modules:
+                try:
+                    from reconqa.server.routers.scenarios import (
+                        collect_project_scenario_assertions,
+                    )
+
+                    scenario_assertions = await collect_project_scenario_assertions(
+                        session, project_id
+                    )
+                except Exception:
+                    scenario_assertions = []
+
         self._publish(
             run_id,
             {
@@ -357,6 +371,7 @@ class InProcessTaskRunner:
                 module_cb=on_module,
                 java_package=cfg.get("java_package"),
                 java_version=str(cfg["java_version"]) if cfg.get("java_version") else None,
+                scenario_assertions=scenario_assertions or None,
             )
         finally:
             if pending_updates:
@@ -453,6 +468,15 @@ class InProcessTaskRunner:
                 run.finished_at = _utcnow()
 
             await session.commit()
+
+            # Best-effort non-fatal auto-hydration of Scenario entities after merge completes
+            if "merge" in modules:
+                try:
+                    from reconqa.server.routers.scenarios import sync_project_scenarios
+
+                    await sync_project_scenarios(session, project_id)
+                except Exception:
+                    pass
 
         self._publish(
             run_id,

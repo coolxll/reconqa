@@ -16,6 +16,7 @@ import {
 import { listProjects } from "@/api/projects";
 import { getProjectTrends } from "@/api/reports";
 import type { Project, ProjectTrendsResponse, TrendPoint } from "@/api/types";
+import { useWorkspace } from "@/stores/workspace";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import StatusBadge from "@/components/layout/StatusBadge.vue";
 import { useI18n } from "@/i18n";
@@ -24,6 +25,11 @@ import "@/i18n/locales/dashboards";
 const route = useRoute();
 const router = useRouter();
 const { locale, t } = useI18n();
+const { activeProjectId, ensureLoaded: ensureWorkspaceLoaded } = useWorkspace();
+
+const routeProjectId = computed(() =>
+  typeof route.params.projectId === "string" ? route.params.projectId : ""
+);
 
 const projects = ref<Project[]>([]);
 const selectedProjectId = ref<string>("");
@@ -409,11 +415,15 @@ async function initProjects(): Promise<void> {
   error.value = null;
   let initialPid = "";
   try {
+    await ensureWorkspaceLoaded();
     const list = await listProjects();
     projects.value = list;
-    const queryPid = typeof route.query.projectId === "string" ? route.query.projectId : "";
-    if (queryPid && list.some((p) => p.id === queryPid)) {
-      initialPid = queryPid;
+    const preferredPid =
+      routeProjectId.value ||
+      (typeof route.query.projectId === "string" ? route.query.projectId : "") ||
+      activeProjectId.value;
+    if (preferredPid && list.some((p) => p.id === preferredPid)) {
+      initialPid = preferredPid;
     } else if (list.length > 0) {
       initialPid = list[0].id;
     }
@@ -427,6 +437,12 @@ async function initProjects(): Promise<void> {
     selectedProjectId.value = initialPid;
   }
 }
+
+watch(routeProjectId, (pid) => {
+  if (pid && pid !== selectedProjectId.value) {
+    selectedProjectId.value = pid;
+  }
+});
 
 watch(selectedProjectId, (pid) => {
   if (pid) {
@@ -468,6 +484,7 @@ onBeforeUnmount(() => {
 
       <div class="flex flex-wrap items-center gap-2.5">
         <select
+          v-if="!routeProjectId"
           v-model="selectedProjectId"
           class="input-field w-60 text-sm"
           :disabled="loadingProjects || projects.length === 0"
@@ -531,7 +548,11 @@ onBeforeUnmount(() => {
         <TrendingUp class="h-5 w-5 text-indigo-500" />
       </template>
       <template #action>
-        <button type="button" class="btn-primary text-xs" @click="router.push('/runs')">
+        <button
+          type="button"
+          class="btn-primary text-xs"
+          @click="router.push(selectedProjectId ? `/p/${selectedProjectId}/runs?new=1` : '/runs')"
+        >
           {{ t("trends.launchRun") }}
         </button>
       </template>
@@ -643,14 +664,14 @@ onBeforeUnmount(() => {
             </div>
             <div class="flex items-center gap-3">
               <router-link
-                :to="`/runs/${runA.run_id}`"
+                :to="selectedProjectId ? `/p/${selectedProjectId}/runs/${runA.run_id}` : `/runs/${runA.run_id}`"
                 class="inline-flex items-center gap-1 font-medium text-indigo-600 hover:text-indigo-800"
               >
                 <span>{{ t("trends.openRunA") }}</span>
                 <ExternalLink class="h-3 w-3" />
               </router-link>
               <router-link
-                :to="`/runs/${runB.run_id}`"
+                :to="selectedProjectId ? `/p/${selectedProjectId}/runs/${runB.run_id}` : `/runs/${runB.run_id}`"
                 class="inline-flex items-center gap-1 font-medium text-indigo-600 hover:text-indigo-800"
               >
                 <span>{{ t("trends.openRunB") }}</span>

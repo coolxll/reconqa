@@ -742,7 +742,7 @@ onBeforeUnmount(() => {
         <div v-if="authProfiles.length < 2" class="flex items-center gap-2 text-[11px] text-slate-500">
           <span>{{ t("sec.noDualAccountsHint") }}</span>
           <router-link
-            to="/projects?tab=auth"
+            :to="projectId ? `/p/${projectId}/settings?tab=credentials` : '/projects'"
             class="font-medium text-indigo-600 hover:text-indigo-800"
           >
             {{ t("sec.configureAuthLink") }}

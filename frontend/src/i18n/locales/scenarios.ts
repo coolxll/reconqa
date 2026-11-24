@@ -1,0 +1,303 @@
+import { registerMessages } from "../index";
+
+registerMessages({
+  zh: {
+    "scen.title": "业务场景与测试有效性",
+    "scen.subtitle": "以业务流为核心管理 P0–P3 优先级、结构化业务断言与异常边界清单，驱动 Java RestAssured 编译真实业务校验。",
+    "scen.syncBtn": "从运行同步场景",
+    "scen.syncingBtn": "同步中…",
+    "scen.newBtn": "新建场景",
+    "scen.refreshBtn": "刷新",
+    "scen.loading": "正在加载项目业务场景…",
+    "scen.loadError": "加载业务场景失败",
+    "scen.syncSuccess": "已从运行记录同步场景，当前共 {count} 个业务场景。",
+    "scen.savedSuccess": "场景已保存（当前有效性等级：{level}）。",
+    "scen.createdSuccess": "已创建业务场景「{name}」。",
+    "scen.deletedSuccess": "已删除业务场景。",
+    "scen.emptyTitle": "暂无业务场景",
+    "scen.emptyDesc": "点击「从运行同步场景」自动提取已导入 HAR 流量中的业务场景，或手动规划 P0/P1 核心场景。",
+
+    // KPIs
+    "scen.kpiTotal": "业务场景总数",
+    "scen.kpiTotalSub": "覆盖 {domains} 个业务域",
+    "scen.kpiEffectiveness": "P0/P1 有效性达标率",
+    "scen.kpiEffectivenessSub": "{effective}/{total} 个核心场景达到 L3/L4（超越仅验 HTTP 200）",
+    "scen.kpiEffectivenessNone": "尚未标记 P0/P1 场景，请为关键业务流设定优先级",
+    "scen.kpiPriorityTitle": "优先级分布 (P0–P3)",
+    "scen.kpiLadderTitle": "有效性阶梯 (L0–L4)",
+
+    // Effectiveness Levels
+    "scen.level.L0": "L0 已规划",
+    "scen.level.L1": "L1 已录制",
+    "scen.level.L2": "L2 冒烟契约",
+    "scen.level.L3": "L3 业务校验",
+    "scen.level.L4": "L4 健壮加固",
+    "scen.levelDesc.L0": "尚未关联接口流量",
+    "scen.levelDesc.L1": "已录制真实接口流量",
+    "scen.levelDesc.L2": "已完成冒烟 / 契约检查",
+    "scen.levelDesc.L3": "含 ≥1 条结构化业务断言",
+    "scen.levelDesc.L4": "业务断言 + 异常边界双覆盖",
+
+    // Statuses & Sources
+    "scen.status.draft": "草稿",
+    "scen.status.active": "进行中",
+    "scen.status.verified": "已验证",
+    "scen.status.archived": "已归档",
+    "scen.source.har-auto": "HAR 自动提取",
+    "scen.source.manual": "人工规划",
+    "scen.source.ai-agent": "AI Agent 沉淀",
+
+    // Filters
+    "scen.searchPlaceholder": "搜索场景名称、标识、业务域、负责人或标签…",
+    "scen.filterPriorityAll": "全部优先级",
+    "scen.filterLevelAll": "全部有效性",
+    "scen.filterStatusAll": "全部状态",
+    "scen.filterDomainAll": "全部业务域",
+    "scen.noMatches": "没有符合当前筛选条件的业务场景。",
+
+    // Card metrics
+    "scen.metricEndpoints": "{count} 个接口",
+    "scen.metricAssertions": "{count} 条断言",
+    "scen.metricNegatives": "{covered}/{total} 异常边界",
+    "scen.metricRuns": "{count} 轮运行",
+    "scen.noDescription": "暂无业务流说明，点击补充业务背景、断言规则与边界用例。",
+    "scen.unassignedOwner": "未指派",
+    "scen.unassignedDomain": "未分类业务域",
+
+    // Detail Drawer
+    "scen.drawer.loading": "正在加载场景详情与关联接口…",
+    "scen.drawer.save": "保存修改",
+    "scen.drawer.saving": "保存中…",
+    "scen.drawer.delete": "删除",
+    "scen.drawer.deleteConfirm": "确认删除",
+    "scen.drawer.tabSpec": "业务规范",
+    "scen.drawer.tabAssertions": "业务断言 ({count})",
+    "scen.drawer.tabNegatives": "异常与边界 ({count})",
+    "scen.drawer.tabEndpoints": "关联接口 ({count})",
+
+    // Spec Form
+    "scen.form.name": "场景名称 *",
+    "scen.form.namePlaceholder": "例如：订单创建与库存扣减",
+    "scen.form.slug": "场景标识 (Slug)",
+    "scen.form.slugPlaceholder": "例如：01_order_checkout（留空自动生成）",
+    "scen.form.priority": "优先级",
+    "scen.form.status": "状态",
+    "scen.form.domain": "所属业务域",
+    "scen.form.domainPlaceholder": "例如：交易结算 / 用户中心 / 审批流",
+    "scen.form.owner": "负责人",
+    "scen.form.ownerPlaceholder": "例如：qa-checkout",
+    "scen.form.tags": "标签（逗号分隔）",
+    "scen.form.tagsPlaceholder": "核心链路, 回归必测, 支付",
+    "scen.form.description": "业务流说明 (Markdown)",
+    "scen.form.descriptionPlaceholder": "描述该场景的业务目标、核心状态流转及预期结果…",
+    "scen.form.preconditions": "前置条件 / 测试数据要求",
+    "scen.form.preconditionsPlaceholder": "例如：需要已实名认证的 Account A，且 SKU-1001 库存 ≥ 5",
+
+    // Assertions Panel
+    "scen.assert.compileHint":
+      "此处维护的结构化业务断言会自动编译进生成的 Java RestAssured 测试代码中（不再停留在 HTTP 200 浅层冒烟），并使该场景晋升至 L3 业务校验等级。",
+    "scen.assert.addTitle": "新增业务断言",
+    "scen.assert.titleLabel": "断言标题 *",
+    "scen.assert.titlePlaceholder": "例如：订单总金额必须大于 0 且返回有效订单号",
+    "scen.assert.endpointLabel": "目标接口",
+    "scen.assert.endpointAny": "自定义 / 任意关联接口",
+    "scen.assert.jsonpathLabel": "JSONPath 路径",
+    "scen.assert.jsonpathPlaceholder": "例如：$.data.totalAmount",
+    "scen.assert.operatorLabel": "断言运算符",
+    "scen.assert.expectedLabel": "期望值",
+    "scen.assert.expectedPlaceholder": "例如：0 或 SUCCESS",
+    "scen.assert.noteLabel": "业务口径说明",
+    "scen.assert.notePlaceholder": "补充业务背景或校验说明…",
+    "scen.assert.addBtn": "添加断言",
+    "scen.assert.empty": "暂未配置业务断言。添加至少 1 条断言即可从 L1/L2 提升至 L3 业务校验！",
+    "scen.assert.status.pending": "待验证",
+    "scen.assert.status.passed": "已通过",
+    "scen.assert.status.failed": "失败",
+
+    // Negative Cases Panel
+    "scen.neg.hint":
+      "覆盖权限越权、参数校验、边界值、幂等防重与状态机非法跳转等异常用例，标记为「已覆盖」后与业务断言共同将场景提升至 L4 健壮加固等级。",
+    "scen.neg.addTitle": "新增异常 / 边界用例",
+    "scen.neg.titleLabel": "用例标题 *",
+    "scen.neg.titlePlaceholder": "例如：重复提交相同幂等键应返回 409 或原单号",
+    "scen.neg.categoryLabel": "异常分类",
+    "scen.neg.expectedLabel": "期望系统行为",
+    "scen.neg.expectedPlaceholder": "例如：返回 HTTP 400 且错误码为 INVALID_QUANTITY，库存不扣减",
+    "scen.neg.noteLabel": "备注",
+    "scen.neg.addBtn": "添加异常用例",
+    "scen.neg.empty": "暂未登记异常与边界测试点。",
+    "scen.neg.cat.auth": "权限 / 认证",
+    "scen.neg.cat.validation": "参数校验",
+    "scen.neg.cat.boundary": "边界极值",
+    "scen.neg.cat.idempotency": "幂等防重",
+    "scen.neg.cat.state_machine": "状态机流转",
+    "scen.neg.cat.security": "安全防绕过",
+    "scen.neg.status.pending": "待覆盖",
+    "scen.neg.status.covered": "已覆盖",
+    "scen.neg.status.failed": "存在缺陷",
+
+    // Endpoints & Runs Tab
+    "scen.ep.empty": "该场景暂未关联已录制的 API 接口。导入包含该场景的 HAR 后会自动关联。",
+    "scen.ep.exampleToggle": "响应样本",
+    "scen.ep.linkedRuns": "关联运行记录 ({count})",
+    "scen.ep.noRuns": "暂无关联运行记录。",
+
+    // Create Modal
+    "scen.modal.title": "新建业务场景",
+    "scen.modal.subtitle": "提前规划核心业务场景与优先级，后续导入 HAR 同名场景将自动合并接口且保留此处配置。",
+    "scen.modal.submit": "创建场景",
+    "scen.modal.creating": "创建中…",
+  },
+  en: {
+    "scen.title": "Business Scenarios & Testing Effectiveness",
+    "scen.subtitle":
+      "Manage P0–P3 priorities, structured business assertions, and negative edge cases — compiled directly into Java RestAssured tests.",
+    "scen.syncBtn": "Sync from Runs",
+    "scen.syncingBtn": "Syncing…",
+    "scen.newBtn": "New Scenario",
+    "scen.refreshBtn": "Refresh",
+    "scen.loading": "Loading business scenarios…",
+    "scen.loadError": "Failed to load scenarios",
+    "scen.syncSuccess": "Synced scenarios from runs ({count} total scenarios).",
+    "scen.savedSuccess": "Scenario saved (effectiveness level: {level}).",
+    "scen.createdSuccess": 'Created scenario "{name}".',
+    "scen.deletedSuccess": "Scenario deleted.",
+    "scen.emptyTitle": "No business scenarios yet",
+    "scen.emptyDesc":
+      'Click "Sync from Runs" to auto-hydrate scenarios from captured HAR runs, or create a planned P0/P1 scenario manually.',
+
+    // KPIs
+    "scen.kpiTotal": "Total Scenarios",
+    "scen.kpiTotalSub": "Across {domains} business domains",
+    "scen.kpiEffectiveness": "P0/P1 Effectiveness Rate",
+    "scen.kpiEffectivenessSub": "{effective}/{total} critical scenarios at L3/L4 (beyond HTTP 200 smoke)",
+    "scen.kpiEffectivenessNone": "No P0/P1 scenarios tagged yet — prioritize key flows",
+    "scen.kpiPriorityTitle": "Priority Breakdown (P0–P3)",
+    "scen.kpiLadderTitle": "Effectiveness Ladder (L0–L4)",
+
+    // Effectiveness Levels
+    "scen.level.L0": "L0 Planned",
+    "scen.level.L1": "L1 Captured",
+    "scen.level.L2": "L2 Smoke/Contract",
+    "scen.level.L3": "L3 Business Validated",
+    "scen.level.L4": "L4 Hardened",
+    "scen.levelDesc.L0": "No captured API traffic yet",
+    "scen.levelDesc.L1": "Backed by captured endpoints",
+    "scen.levelDesc.L2": "Smoke / contract verified",
+    "scen.levelDesc.L3": ">= 1 structured business assertion",
+    "scen.levelDesc.L4": "Business assertions + negative cases covered",
+
+    // Statuses & Sources
+    "scen.status.draft": "Draft",
+    "scen.status.active": "Active",
+    "scen.status.verified": "Verified",
+    "scen.status.archived": "Archived",
+    "scen.source.har-auto": "HAR Auto",
+    "scen.source.manual": "Manual",
+    "scen.source.ai-agent": "AI Agent",
+
+    // Filters
+    "scen.searchPlaceholder": "Search scenario name, slug, domain, owner, or tag…",
+    "scen.filterPriorityAll": "All Priorities",
+    "scen.filterLevelAll": "All Levels",
+    "scen.filterStatusAll": "All Statuses",
+    "scen.filterDomainAll": "All Domains",
+    "scen.noMatches": "No scenarios match the active filters.",
+
+    // Card metrics
+    "scen.metricEndpoints": "{count} APIs",
+    "scen.metricAssertions": "{count} Assertions",
+    "scen.metricNegatives": "{covered}/{total} Negative",
+    "scen.metricRuns": "{count} Runs",
+    "scen.noDescription": "No business description yet. Click to add flow context, assertions, and edge cases.",
+    "scen.unassignedOwner": "Unassigned",
+    "scen.unassignedDomain": "General",
+
+    // Detail Drawer
+    "scen.drawer.loading": "Loading scenario details and linked endpoints…",
+    "scen.drawer.save": "Save Changes",
+    "scen.drawer.saving": "Saving…",
+    "scen.drawer.delete": "Delete",
+    "scen.drawer.deleteConfirm": "Confirm Delete",
+    "scen.drawer.tabSpec": "Business Spec",
+    "scen.drawer.tabAssertions": "Assertions ({count})",
+    "scen.drawer.tabNegatives": "Negative Cases ({count})",
+    "scen.drawer.tabEndpoints": "Endpoints ({count})",
+
+    // Spec Form
+    "scen.form.name": "Scenario Name *",
+    "scen.form.namePlaceholder": "e.g., Order Checkout & Inventory Deduction",
+    "scen.form.slug": "Slug",
+    "scen.form.slugPlaceholder": "e.g., 01_order_checkout (auto-generated if blank)",
+    "scen.form.priority": "Priority",
+    "scen.form.status": "Status",
+    "scen.form.domain": "Business Domain",
+    "scen.form.domainPlaceholder": "e.g., Checkout / Account / Approval",
+    "scen.form.owner": "Owner",
+    "scen.form.ownerPlaceholder": "e.g., qa-checkout",
+    "scen.form.tags": "Tags (comma-separated)",
+    "scen.form.tagsPlaceholder": "core-flow, regression, billing",
+    "scen.form.description": "Business Flow Description (Markdown)",
+    "scen.form.descriptionPlaceholder": "Describe the business workflow, state transitions, and expected outcome…",
+    "scen.form.preconditions": "Preconditions & Test Data Setup",
+    "scen.form.preconditionsPlaceholder": "e.g., Verified Account A logged in, SKU-1001 stock >= 5",
+
+    // Assertions Panel
+    "scen.assert.compileHint":
+      "Structured business assertions defined here compile directly into generated Java RestAssured test methods (going beyond HTTP 200 smoke checks) and elevate this scenario to L3 Business Validated.",
+    "scen.assert.addTitle": "Add Business Assertion",
+    "scen.assert.titleLabel": "Assertion Title *",
+    "scen.assert.titlePlaceholder": "e.g., Order total must be > 0 and return orderId",
+    "scen.assert.endpointLabel": "Target Endpoint",
+    "scen.assert.endpointAny": "Custom / Any linked endpoint",
+    "scen.assert.jsonpathLabel": "JSONPath",
+    "scen.assert.jsonpathPlaceholder": "e.g., $.data.totalAmount",
+    "scen.assert.operatorLabel": "Operator",
+    "scen.assert.expectedLabel": "Expected Value",
+    "scen.assert.expectedPlaceholder": "e.g., 0 or SUCCESS",
+    "scen.assert.noteLabel": "Business Note",
+    "scen.assert.notePlaceholder": "Optional rule explanation…",
+    "scen.assert.addBtn": "Add Assertion",
+    "scen.assert.empty":
+      "No business assertions yet. Add at least 1 structured assertion to upgrade this scenario to L3!",
+    "scen.assert.status.pending": "Pending",
+    "scen.assert.status.passed": "Passed",
+    "scen.assert.status.failed": "Failed",
+
+    // Negative Cases Panel
+    "scen.neg.hint":
+      "Track auth/IDOR, validation, boundary, idempotency, and state-machine negative tests. Covering >= 1 negative case alongside assertions promotes this scenario to L4 Hardened.",
+    "scen.neg.addTitle": "Add Negative / Edge Case",
+    "scen.neg.titleLabel": "Case Title *",
+    "scen.neg.titlePlaceholder": "e.g., Duplicate idempotency key returns 409 or existing order",
+    "scen.neg.categoryLabel": "Category",
+    "scen.neg.expectedLabel": "Expected Behavior",
+    "scen.neg.expectedPlaceholder": "e.g., HTTP 400 INVALID_QUANTITY without stock mutation",
+    "scen.neg.noteLabel": "Note",
+    "scen.neg.addBtn": "Add Negative Case",
+    "scen.neg.empty": "No negative or boundary test cases tracked yet.",
+    "scen.neg.cat.auth": "Auth / Access",
+    "scen.neg.cat.validation": "Validation",
+    "scen.neg.cat.boundary": "Boundary",
+    "scen.neg.cat.idempotency": "Idempotency",
+    "scen.neg.cat.state_machine": "State Machine",
+    "scen.neg.cat.security": "Security",
+    "scen.neg.status.pending": "Pending",
+    "scen.neg.status.covered": "Covered",
+    "scen.neg.status.failed": "Failed",
+
+    // Endpoints & Runs Tab
+    "scen.ep.empty":
+      "No captured API endpoints linked to this scenario yet. Import a HAR for this scenario slug to link endpoints automatically.",
+    "scen.ep.exampleToggle": "Response Example",
+    "scen.ep.linkedRuns": "Linked Runs ({count})",
+    "scen.ep.noRuns": "No linked runs yet.",
+
+    // Create Modal
+    "scen.modal.title": "Create Business Scenario",
+    "scen.modal.subtitle":
+      "Plan a core business scenario and priority up front; future HAR imports with the same slug merge endpoints while preserving your spec.",
+    "scen.modal.submit": "Create Scenario",
+    "scen.modal.creating": "Creating…",
+  },
+});

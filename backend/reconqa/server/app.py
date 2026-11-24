@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from reconqa.config import settings
 from reconqa.models.db import init_db
-from reconqa.server.routers import artifacts, explore, projects, reports, runs
+from reconqa.server.routers import artifacts, explore, projects, reports, runs, scenarios
 from reconqa.server.worker import InProcessTaskRunner
 
 
@@ -48,6 +48,7 @@ def create_app() -> FastAPI:
         return {"status": "ok", "service": "reconqa"}
 
     application.include_router(projects.router, prefix="/api/v1")
+    application.include_router(scenarios.router, prefix="/api/v1")
     application.include_router(explore.router, prefix="/api/v1")
     application.include_router(runs.router, prefix="/api/v1")
     application.include_router(artifacts.router, prefix="/api/v1")

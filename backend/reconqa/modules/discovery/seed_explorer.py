@@ -625,8 +625,9 @@ def merge_explore_results(
 
     created_at = str(existing.get("created_at") or incoming.get("created_at") or datetime.now(UTC).isoformat())
     updated_at = str(incoming.get("updated_at") or incoming.get("created_at") or datetime.now(UTC).isoformat())
+    merged_project_id = incoming.get("project_id") or existing.get("project_id")
 
-    return {
+    merged_out: dict[str, Any] = {
         "explore_id": merged_id,
         "created_at": created_at,
         "updated_at": updated_at,
@@ -650,6 +651,9 @@ def merge_explore_results(
         "live_hosts": merged_live_hosts,
         "warnings": merged_warnings,
     }
+    if merged_project_id:
+        merged_out["project_id"] = str(merged_project_id)
+    return merged_out
 
 
 def _probe_openapi_on_origin(

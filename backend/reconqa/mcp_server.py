@@ -360,7 +360,7 @@ def create_mcp_server(
         ),
     )
 
-    # --- 11 Token-Efficient MCP Tools ---
+    # --- 14 Token-Efficient MCP Tools ---
 
     async def _resolve_or_create_project(
         project_id: str | None,
@@ -908,6 +908,193 @@ def create_mcp_server(
             "returned": len(compact_rows),
             "by_severity": severity_counts,
             "findings": compact_rows,
+        }
+
+    @mcp.tool()
+    async def reconqa_get_project_inventory(
+        project_id: str,
+        source: str | None = None,
+        prefix: str | None = None,
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        """Fetch a project's cumulative Master API Inventory (merged Explore + Runs) with optional source/prefix filters."""
+        clamped_limit = max(1, min(int(limit or 80), 200))
+        data = await client.request_json("GET", f"/projects/{project_id}/inventory")
+        raw_endpoints = list(data.get("endpoints") or [])
+
+        norm_source = source.strip().lower() if source and source.strip() else None
+        norm_prefix = prefix.strip() if prefix and prefix.strip() else None
+        if norm_prefix and not norm_prefix.startswith("/"):
+            norm_prefix = f"/{norm_prefix}"
+
+        filtered: list[dict[str, Any]] = []
+        for ep in raw_endpoints:
+            ep_source = str(ep.get("discovery_source") or "").lower()
+            ep_path = str(ep.get("path") or "")
+            if norm_source and ep_source != norm_source:
+                continue
+            if norm_prefix and not ep_path.startswith(norm_prefix):
+                continue
+            filtered.append(ep)
+
+        compact_endpoints = [
+            {
+                "method": ep.get("method", "GET"),
+                "path": ep.get("path", "/"),
+                "summary": _truncate_str(str(ep.get("summary") or ""), 160),
+                "discovery_source": ep.get("discovery_source", "js-static"),
+                "host": ep.get("host", ""),
+                "scenarios": list(ep.get("scenarios") or []),
+                "status_codes": list(ep.get("status_codes") or []),
+                "parameters": [
+                    {"name": p.get("name"), "in": p.get("in")}
+                    for p in (ep.get("parameters") or [])[:12]
+                    if isinstance(p, dict) and p.get("name")
+                ],
+                "seen_in_runs_count": len(ep.get("seen_in_runs") or []),
+            }
+            for ep in filtered[:clamped_limit]
+        ]
+        return {
+            "project_id": data.get("project_id", project_id),
+            "project_name": data.get("project_name", ""),
+            "runs_merged_count": data.get("runs_merged_count", 0),
+            "explore_sessions_count": data.get("explore_sessions_count", 0),
+            "total_endpoints": data.get("total_endpoints", len(raw_endpoints)),
+            "har_live_count": data.get("har_live_count", 0),
+            "js_static_count": data.get("js_static_count", 0),
+            "coverage_pct": data.get("coverage_pct", 0.0),
+            "by_prefix": list(data.get("by_prefix") or []),
+            "scenarios": list(data.get("scenarios") or []),
+            "matched_endpoints_count": len(filtered),
+            "endpoints_truncated": max(0, len(filtered) - len(compact_endpoints)),
+            "endpoints": compact_endpoints,
+        }
+
+    @mcp.tool()
+    async def reconqa_list_scenarios(
+        project_id: str,
+        priority: str | None = None,
+        effectiveness_level: str | None = None,
+    ) -> dict[str, Any]:
+        """List first-class business scenarios with P0-P3 priority and L0-L4 testing effectiveness metrics."""
+        data = await client.request_json(
+            "GET",
+            f"/projects/{project_id}/scenarios",
+            params={
+                "priority": priority.strip().upper() if priority and priority.strip() else None,
+                "effectiveness_level": (
+                    effectiveness_level.strip().upper()
+                    if effectiveness_level and effectiveness_level.strip()
+                    else None
+                ),
+            },
+        )
+        compact_scenarios = [
+            {
+                "id": sc.get("id"),
+                "slug": sc.get("slug"),
+                "name": sc.get("name"),
+                "priority": sc.get("priority", "P2"),
+                "status": sc.get("status", "active"),
+                "business_domain": sc.get("business_domain", ""),
+                "owner": sc.get("owner", ""),
+                "source": sc.get("source", "manual"),
+                "effectiveness_level": sc.get("effectiveness_level", "L0"),
+                "description": _truncate_str(str(sc.get("description") or ""), 240),
+                "tags": list(sc.get("tags") or []),
+                "endpoint_count": sc.get("endpoint_count", 0),
+                "run_count": sc.get("run_count", 0),
+                "last_run_id": sc.get("last_run_id"),
+                "assertion_count": sc.get("assertion_count", 0),
+                "assertions_passed_count": sc.get("assertions_passed_count", 0),
+                "negative_case_count": sc.get("negative_case_count", 0),
+                "negative_cases_covered_count": sc.get("negative_cases_covered_count", 0),
+            }
+            for sc in (data.get("scenarios") or [])
+        ]
+        return {
+            "project_id": data.get("project_id", project_id),
+            "total": data.get("total", len(compact_scenarios)),
+            "p0_p1_total": data.get("p0_p1_total", 0),
+            "p0_p1_effective_count": data.get("p0_p1_effective_count", 0),
+            "p0_p1_effective_pct": data.get("p0_p1_effective_pct", 0.0),
+            "by_priority": data.get("by_priority") or {},
+            "by_effectiveness": data.get("by_effectiveness") or {},
+            "scenarios": compact_scenarios,
+        }
+
+    @mcp.tool()
+    async def reconqa_upsert_scenario(
+        project_id: str,
+        slug: str,
+        name: str | None = None,
+        description: str | None = None,
+        preconditions: str | None = None,
+        business_domain: str | None = None,
+        priority: str | None = None,
+        status: str | None = None,
+        owner: str | None = None,
+        tags: list[str] | None = None,
+        assertions: list[dict[str, Any]] | None = None,
+        negative_cases: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Create or update a first-class business scenario by slug (source='ai-agent') with assertions and negative cases."""
+        clean_slug = slug.strip()
+        if not clean_slug:
+            raise ValueError("slug must not be empty.")
+
+        effective_name = (
+            (name or "").strip()
+            or clean_slug.replace("_", " ").replace("-", " ").title()
+        )
+        payload: dict[str, Any] = {
+            "slug": clean_slug,
+            "name": effective_name,
+            "source": "ai-agent",
+        }
+        if description is not None:
+            payload["description"] = description
+        if preconditions is not None:
+            payload["preconditions"] = preconditions
+        if business_domain is not None:
+            payload["business_domain"] = business_domain
+        if priority is not None:
+            payload["priority"] = priority.strip().upper()
+        if status is not None:
+            payload["status"] = status.strip().lower()
+        if owner is not None:
+            payload["owner"] = owner
+        if tags is not None:
+            payload["tags"] = tags
+        if assertions is not None:
+            payload["assertions"] = assertions
+        if negative_cases is not None:
+            payload["negative_cases"] = negative_cases
+
+        data = await client.request_json(
+            "POST",
+            f"/projects/{project_id}/scenarios",
+            params={"upsert": "true"},
+            json_body=payload,
+        )
+        return {
+            "id": data.get("id"),
+            "project_id": data.get("project_id", project_id),
+            "slug": data.get("slug", clean_slug),
+            "name": data.get("name", effective_name),
+            "priority": data.get("priority", "P2"),
+            "status": data.get("status", "active"),
+            "business_domain": data.get("business_domain", ""),
+            "owner": data.get("owner", ""),
+            "source": data.get("source", "ai-agent"),
+            "tags": list(data.get("tags") or []),
+            "endpoint_count": data.get("endpoint_count", 0),
+            "assertion_count": data.get("assertion_count", len(data.get("assertions") or [])),
+            "negative_case_count": data.get(
+                "negative_case_count", len(data.get("negative_cases") or [])
+            ),
+            "effectiveness_level": data.get("effectiveness_level", "L0"),
         }
 
     # --- 3 MCP Resources ---

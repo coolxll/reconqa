@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # --- API / Persistence DTOs ---
 
@@ -107,6 +108,227 @@ class KnowledgeDocOut(BaseModel):
     size_bytes: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+# --- Project Master API Inventory & Inline Replay DTOs ---
+
+
+class InventoryRunRef(BaseModel):
+    run_id: str
+    run_name: str
+
+
+class InventoryEndpoint(BaseModel):
+    method: str
+    path: str
+    summary: str = ""
+    discovery_source: str = "js-static"
+    host: str = ""
+    tags: list[str] = Field(default_factory=list)
+    scenarios: list[str] = Field(default_factory=list)
+    seen_in_runs: list[InventoryRunRef] = Field(default_factory=list)
+    status_codes: list[int] = Field(default_factory=list)
+    parameters: list[dict[str, Any]] = Field(default_factory=list)
+    request_schema: dict[str, Any] | None = None
+    response_schema: dict[str, Any] | None = None
+    request_example: Any = None
+    response_example: Any = None
+
+
+class InventoryPrefixStat(BaseModel):
+    prefix: str
+    total: int
+    covered: int
+    coverage_pct: float
+
+
+class ScenarioMetaSummary(BaseModel):
+    id: str
+    slug: str
+    name: str
+    priority: str = "P2"
+    business_domain: str = ""
+    effectiveness_level: Literal["L0", "L1", "L2", "L3", "L4"] = "L0"
+    description: str = ""
+
+
+class ProjectInventoryResponse(BaseModel):
+    project_id: str
+    project_name: str
+    runs_merged_count: int
+    explore_sessions_count: int
+    total_endpoints: int
+    har_live_count: int
+    js_static_count: int
+    coverage_pct: float
+    scenarios: list[str] = Field(default_factory=list)
+    scenario_meta: dict[str, ScenarioMetaSummary] = Field(default_factory=dict)
+    by_prefix: list[InventoryPrefixStat] = Field(default_factory=list)
+    endpoints: list[InventoryEndpoint] = Field(default_factory=list)
+
+
+# --- First-Class Scenario Entity & Testing Effectiveness DTOs ---
+
+ScenarioAssertionOperator = Literal[
+    "equals",
+    "not_equals",
+    "not_empty",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "contains",
+    "matches",
+    "custom",
+]
+ScenarioAssertionStatus = Literal["pending", "passed", "failed"]
+ScenarioNegativeCategory = Literal[
+    "auth",
+    "validation",
+    "boundary",
+    "idempotency",
+    "state_machine",
+    "security",
+]
+ScenarioNegativeStatus = Literal["pending", "covered", "failed"]
+ScenarioPriority = Literal["P0", "P1", "P2", "P3"]
+ScenarioLifecycleStatus = Literal["draft", "active", "verified", "archived"]
+ScenarioSource = Literal["har-auto", "manual", "ai-agent"]
+ScenarioEffectivenessLevel = Literal["L0", "L1", "L2", "L3", "L4"]
+
+
+class ScenarioAssertion(BaseModel):
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    title: str
+    target_endpoint: str = ""
+    jsonpath: str = ""
+    operator: ScenarioAssertionOperator = "not_empty"
+    expected: str = ""
+    note: str = ""
+    status: ScenarioAssertionStatus = "pending"
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _ensure_id(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        return text or uuid.uuid4().hex[:12]
+
+
+class ScenarioNegativeCase(BaseModel):
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
+    title: str
+    category: ScenarioNegativeCategory = "validation"
+    expected_behavior: str = ""
+    status: ScenarioNegativeStatus = "pending"
+    note: str = ""
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _ensure_id(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        return text or uuid.uuid4().hex[:12]
+
+
+class ScenarioCreateRequest(BaseModel):
+    slug: str | None = Field(default=None, max_length=160)
+    name: str | None = Field(default=None, max_length=255)
+    description: str = ""
+    preconditions: str = ""
+    business_domain: str = ""
+    priority: ScenarioPriority = "P2"
+    status: ScenarioLifecycleStatus = "active"
+    owner: str = ""
+    source: ScenarioSource = "manual"
+    tags: list[str] = Field(default_factory=list)
+    assertions: list[ScenarioAssertion] = Field(default_factory=list)
+    negative_cases: list[ScenarioNegativeCase] = Field(default_factory=list)
+
+
+class ScenarioUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+    preconditions: str | None = None
+    business_domain: str | None = None
+    priority: ScenarioPriority | None = None
+    status: ScenarioLifecycleStatus | None = None
+    owner: str | None = None
+    source: ScenarioSource | None = None
+    tags: list[str] | None = None
+    assertions: list[ScenarioAssertion] | None = None
+    negative_cases: list[ScenarioNegativeCase] | None = None
+
+
+class ScenarioRunRef(BaseModel):
+    run_id: str
+    run_name: str
+    status: str
+    created_at: datetime | None = None
+
+
+class ScenarioResponse(BaseModel):
+    id: str
+    project_id: str
+    slug: str
+    name: str
+    description: str = ""
+    preconditions: str = ""
+    business_domain: str = ""
+    priority: ScenarioPriority = "P2"
+    status: ScenarioLifecycleStatus = "active"
+    owner: str = ""
+    source: ScenarioSource = "manual"
+    tags: list[str] = Field(default_factory=list)
+    assertions: list[ScenarioAssertion] = Field(default_factory=list)
+    negative_cases: list[ScenarioNegativeCase] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    endpoint_count: int = 0
+    run_count: int = 0
+    last_run_id: str | None = None
+    last_run_name: str | None = None
+    assertion_count: int = 0
+    assertions_passed_count: int = 0
+    negative_case_count: int = 0
+    negative_cases_covered_count: int = 0
+    effectiveness_level: ScenarioEffectivenessLevel = "L0"
+
+
+class ScenarioDetailResponse(ScenarioResponse):
+    endpoints: list[InventoryEndpoint] = Field(default_factory=list)
+    runs: list[ScenarioRunRef] = Field(default_factory=list)
+
+
+class ScenarioListResponse(BaseModel):
+    project_id: str
+    total: int
+    by_priority: dict[str, int] = Field(default_factory=dict)
+    by_effectiveness: dict[str, int] = Field(default_factory=dict)
+    p0_p1_total: int = 0
+    p0_p1_effective_count: int = 0
+    p0_p1_effective_pct: float = 0.0
+    scenarios: list[ScenarioResponse] = Field(default_factory=list)
+
+
+class ReplayRequest(BaseModel):
+    method: str = "GET"
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    query_params: dict[str, str] = Field(default_factory=dict)
+    body: Any = None
+    credential_id: str | None = None
+    timeout_sec: float = 15.0
+
+
+class ReplayResponse(BaseModel):
+    status_code: int
+    status_text: str
+    duration_ms: float
+    response_headers: dict[str, str] = Field(default_factory=dict)
+    body_text: str = ""
+    body_json: Any = None
+    content_type: str = ""
+    truncated: bool = False
+    error: str | None = None
 
 
 class RunCreate(BaseModel):

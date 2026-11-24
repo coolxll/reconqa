@@ -3,6 +3,7 @@ import { computed } from "vue";
 import { useRoute } from "vue-router";
 import { ChevronRight, Globe, PanelLeftClose, PanelLeftOpen, Plus } from "lucide-vue-next";
 import { useI18n } from "@/i18n";
+import { useWorkspace } from "@/stores/workspace";
 
 const props = withDefaults(
   defineProps<{
@@ -19,22 +20,33 @@ const emit = defineEmits<{
 
 const route = useRoute();
 const { locale, setLocale, t } = useI18n();
+const { activeProject, activeProjectId, workspacePath } = useWorkspace();
 
-const routeKeyMap: Record<string, string> = {
-  overview: "overview",
-  projects: "projects",
-  explore: "explore",
-  runs: "runs",
-  "run-detail": "runDetail",
-  trends: "trends",
-};
-
-const routeKey = computed(() => routeKeyMap[String(route.name || "overview")] ?? "overview");
-const title = computed(() => t(`route.${routeKey.value}.title`));
-const subtitle = computed(() => t(`route.${routeKey.value}.subtitle`));
-const runIdParam = computed(() =>
-  route.name === "run-detail" ? String(route.params.runId || "") : ""
+const isPlatformRoute = computed(() => Boolean(route.meta?.platformScope));
+const isRunDetail = computed(
+  () => route.name === "run-detail" || route.name === "project-run-detail"
 );
+
+const title = computed(() => {
+  const key = typeof route.meta?.titleKey === "string" ? route.meta.titleKey : "route.projectOverview.title";
+  return t(key);
+});
+
+const subtitle = computed(() => {
+  const key = typeof route.meta?.subtitleKey === "string" ? route.meta.subtitleKey : "";
+  return key ? t(key) : "";
+});
+
+const runIdParam = computed(() =>
+  isRunDetail.value ? String(route.params.runId || "") : ""
+);
+
+const newRunTarget = computed(() =>
+  activeProjectId.value
+    ? { path: workspacePath("runs"), query: { new: "1" } }
+    : { path: "/runs", query: { new: "1" } }
+);
+
 const sidebarToggleLabel = computed(() =>
   props.sidebarCollapsed ? t("nav.expandSidebar") : t("nav.collapseSidebar")
 );
@@ -59,21 +71,33 @@ const sidebarToggleLabel = computed(() =>
       </button>
 
       <div class="min-w-0">
-        <div class="flex items-center gap-2">
-          <template v-if="runIdParam">
+        <div class="flex items-center gap-1.5 text-sm">
+          <!-- Project-scoped breadcrumb -->
+          <template v-if="!isPlatformRoute && activeProject">
             <router-link
-              to="/runs"
-              class="text-sm font-medium text-slate-500 transition hover:text-indigo-600"
+              :to="workspacePath('overview')"
+              class="max-w-[180px] truncate font-medium text-slate-500 transition hover:text-indigo-600"
+              data-testid="topbar-project-crumb"
             >
-              {{ t("route.runs.title") }}
+              {{ activeProject.name }}
             </router-link>
-            <ChevronRight class="h-4 w-4 text-slate-400" />
+            <ChevronRight class="h-3.5 w-3.5 shrink-0 text-slate-400" />
+          </template>
+
+          <template v-if="isRunDetail">
+            <router-link
+              :to="workspacePath('runs')"
+              class="font-medium text-slate-500 transition hover:text-indigo-600"
+            >
+              {{ t("ws.nav.runs") }}
+            </router-link>
+            <ChevronRight class="h-3.5 w-3.5 shrink-0 text-slate-400" />
             <h1 class="truncate font-mono text-sm font-semibold text-slate-900">
-              {{ runIdParam }}
+              #{{ runIdParam.slice(0, 8) }}
             </h1>
           </template>
           <template v-else>
-            <h1 class="truncate text-lg font-semibold tracking-tight text-slate-900">
+            <h1 class="truncate text-base font-semibold tracking-tight text-slate-900">
               {{ title }}
             </h1>
           </template>
@@ -123,10 +147,10 @@ const sidebarToggleLabel = computed(() =>
         </button>
       </div>
 
-      <router-link to="/projects" class="btn-secondary hidden sm:inline-flex">
-        {{ t("topbar.projects") }}
+      <router-link to="/projects" class="btn-secondary hidden md:inline-flex">
+        {{ t("ws.allProjects") }}
       </router-link>
-      <router-link :to="{ name: 'runs', query: { new: '1' } }" class="btn-primary">
+      <router-link :to="newRunTarget" class="btn-primary">
         <Plus class="h-4 w-4" />
         <span class="hidden sm:inline">{{ t("topbar.importHar") }}</span>
         <span class="sm:hidden">{{ t("topbar.importHarShort") }}</span>

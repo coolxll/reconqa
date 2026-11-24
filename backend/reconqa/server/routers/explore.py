@@ -10,9 +10,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +22,7 @@ from reconqa.models.db import get_db
 from reconqa.models.schemas import RunOut
 from reconqa.models.tables import Job, Project, Run, Target
 from reconqa.modules.discovery.seed_explorer import (
+    _registrable_root_domain,
     explore_from_seed,
     extract_seed_root_domain,
     merge_explore_results,
@@ -44,6 +45,7 @@ class ExploreRequest(BaseModel):
     crawl_js: bool = True
     depth: int = 2
     merge: bool = True
+    project_id: str | None = None
 
 
 class PromoteToRunRequest(BaseModel):
@@ -260,7 +262,77 @@ def _consolidate_legacy_explores() -> None:
                 shutil.rmtree(folder, ignore_errors=True)
 
 
+async def _project_domain_set(db: AsyncSession, project_id: str) -> set[str]:
+    """Return registrable root domains & raw hostnames associated with a project's targets/runs."""
+    domains: set[str] = set()
+    t_res = await db.execute(select(Target).where(Target.project_id == project_id))
+    for tgt in t_res.scalars().all():
+        for raw_dom in (tgt.root_domain, urlparse(tgt.base_url or "").hostname or ""):
+            dom = raw_dom.strip().lower()
+            if dom:
+                domains.add(dom)
+                reg = _registrable_root_domain(dom)
+                if reg:
+                    domains.add(reg)
+    r_res = await db.execute(select(Run).where(Run.project_id == project_id))
+    for run in r_res.scalars().all():
+        cfg = run.config_snapshot or {}
+        t_url = str(cfg.get("target_url") or "")
+        if t_url:
+            host = (urlparse(t_url).hostname or "").lower()
+            if host:
+                domains.add(host)
+                reg = _registrable_root_domain(host)
+                if reg:
+                    domains.add(reg)
+    return domains
+
+
+def _explore_matches_project(
+    data: dict[str, Any],
+    project_id: str,
+    project_domains: set[str],
+) -> bool:
+    if str(data.get("project_id") or "") == project_id:
+        return True
+    if not project_domains:
+        return False
+    seed = data.get("seed") or {}
+    candidates = [
+        str(seed.get("root_domain") or "").strip().lower(),
+        (urlparse(str(seed.get("base_url") or "")).hostname or "").strip().lower(),
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        if cand in project_domains or _registrable_root_domain(cand) in project_domains:
+            return True
+    return False
+
+
+async def find_project_explores(db: AsyncSession, project_id: str) -> list[dict[str, Any]]:
+    """Return full ExploreResult dicts belonging to or matching a project's target domains."""
+    _consolidate_legacy_explores()
+    project_domains = await _project_domain_set(db, project_id)
+    root = _explores_root()
+    matched: list[dict[str, Any]] = []
+    for res_file in root.glob("*/explore_result.json"):
+        if res_file.parent.name.startswith("_tmp_"):
+            continue
+        try:
+            data = read_json(res_file)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if _explore_matches_project(data, project_id, project_domains):
+            matched.append(data)
+    matched.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+    return matched
+
+
 @router.post("/explore", status_code=status.HTTP_201_CREATED)
+@router.post("/explore/seed", status_code=status.HTTP_201_CREATED)
 async def run_explore(body: ExploreRequest) -> dict[str, Any]:
     """Run an Explore & Discovery scan, automatically merging assets by root domain when merge=True."""
     has_curl = bool(body.seed_curl and body.seed_curl.strip())
@@ -292,6 +364,9 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if body.project_id:
+        incoming["project_id"] = body.project_id
+
     resolved_domain = (
         str((incoming.get("seed") or {}).get("root_domain") or "").strip().lower()
         or extract_seed_root_domain(body.seed_curl, body.target_url)
@@ -316,9 +391,13 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
 
 
 @router.get("/explore")
-async def list_explores() -> list[dict[str, Any]]:
-    """List consolidated root-domain Explore inventories (most recently updated first)."""
+async def list_explores(
+    project_id: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """List consolidated root-domain Explore inventories (optionally filtered to a project)."""
     _consolidate_legacy_explores()
+    project_domains = await _project_domain_set(db, project_id) if project_id else set()
     root = _explores_root()
     items: list[dict[str, Any]] = []
     for res_file in root.glob("*/explore_result.json"):
@@ -330,6 +409,8 @@ async def list_explores() -> list[dict[str, Any]]:
             continue
         if not isinstance(data, dict):
             continue
+        if project_id and not _explore_matches_project(data, project_id, project_domains):
+            continue
         scans = data.get("scans") or []
         summary = dict(data.get("summary") or {})
         scans_count = int(summary.get("scans_count") or len(scans) or 1)
@@ -339,6 +420,7 @@ async def list_explores() -> list[dict[str, Any]]:
         items.append(
             {
                 "explore_id": data.get("explore_id", res_file.parent.name),
+                "project_id": data.get("project_id"),
                 "created_at": created_at,
                 "updated_at": updated_at,
                 "mode": data.get("mode", "passive"),

@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
+import re
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
+import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
@@ -21,14 +28,31 @@ from reconqa.models.schemas import (
     KnowledgeDocOut,
     KnowledgeDocUpdate,
     ProjectCreate,
+    ProjectInventoryResponse,
     ProjectOut,
+    ReplayRequest,
+    ReplayResponse,
     TargetCreate,
     TargetOut,
 )
-from reconqa.models.tables import AuthProfile, KnowledgeDoc, Project, Target
+from reconqa.models.tables import AuthProfile, KnowledgeDoc, Project, Run, Target
+from reconqa.modules.hub.inventory import build_project_inventory
+from reconqa.server.routers.explore import find_project_explores
 from reconqa.utils.io import ensure_dir, slugify
 
 router = APIRouter(tags=["projects"])
+
+_ALLOWED_REPLAY_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+_BLOCKED_METADATA_HOSTS = {
+    "169.254.169.254",
+    "169.254.170.2",
+    "metadata.google.internal",
+    "metadata.goog",
+}
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+_LINK_LOCAL_NET = ipaddress.ip_network("169.254.0.0/16")
+_MAX_REPLAY_BODY_BYTES = 200 * 1024
+_ENV_REF_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 _VALID_DOC_TYPES = {"prd", "api_spec", "business_rule", "test_notes", "architecture", "other"}
 _TEXT_EXTRACTABLE_EXTS = {
@@ -475,3 +499,256 @@ async def delete_knowledge_doc(
     await db.delete(doc)
     await db.commit()
     return {"deleted": True, "id": doc_id}
+
+
+# --- Project Master API Inventory & Safe Inline Replay ---
+
+
+async def _compute_project_inventory(
+    db: AsyncSession,
+    project_id: str,
+) -> tuple[Project, dict[str, Any], dict[str, Any]]:
+    from sqlalchemy.orm import selectinload
+
+    from reconqa.server.routers.scenarios import build_project_scenario_meta
+
+    project = await _get_project_or_404(db, project_id)
+    runs_res = await db.execute(
+        select(Run)
+        .options(selectinload(Run.jobs))
+        .where(Run.project_id == project_id, Run.status == "completed")
+        .order_by(Run.started_at.asc(), Run.finished_at.asc())
+    )
+    completed_runs = list(runs_res.scalars().all())
+    explores = await find_project_explores(db, project_id)
+    inventory, openapi_doc = build_project_inventory(
+        project_id=project.id,
+        project_name=project.name,
+        project_slug=project.slug,
+        runs=completed_runs,
+        explore_results=explores,
+    )
+    inventory["scenario_meta"] = await build_project_scenario_meta(
+        db,
+        project.id,
+        inventory=inventory,
+        completed_runs=completed_runs,
+    )
+    return project, inventory, openapi_doc
+
+
+@router.get("/projects/{project_id}/inventory", response_model=ProjectInventoryResponse)
+async def get_project_inventory(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Return cumulative Master API Inventory across Explore sessions and Completed Runs."""
+    _, inventory, _ = await _compute_project_inventory(db, project_id)
+    return inventory
+
+
+@router.get("/projects/{project_id}/inventory/openapi.json")
+async def download_project_inventory_openapi(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Download merged Project Master API Inventory as an OpenAPI 3.0.3 JSON file."""
+    project, _, openapi_doc = await _compute_project_inventory(db, project_id)
+    fname = f"{slugify(project.slug or project.name)}-inventory-openapi.json"
+    return Response(
+        content=json.dumps(openapi_doc, ensure_ascii=False, indent=2).encode("utf-8"),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+def _is_blocked_metadata_host(host: str) -> bool:
+    h = host.strip().lower().rstrip(".")
+    if h in _BLOCKED_METADATA_HOSTS:
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+        if isinstance(ip, ipaddress.IPv4Address) and ip in _LINK_LOCAL_NET:
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def _should_bypass_env_proxy(host: str) -> bool:
+    h = host.strip().lower().rstrip(".")
+    if h in {"localhost", "127.0.0.1", "::1"} or h.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+        if ip.is_loopback or ip.is_private or ip.is_link_local:
+            return True
+        if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NET:
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def _resolve_header_value(raw_val: str) -> str:
+    val = str(raw_val).strip()
+    m = _ENV_REF_RE.match(val)
+    if m:
+        return os.environ.get(m.group(1), val)
+    if val.lower().startswith("env:"):
+        env_key = val[4:].strip()
+        return os.environ.get(env_key, val)
+    return val
+
+
+def _load_credential_headers(profile: AuthProfile, target_host: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    cookies: list[str] = []
+
+    if profile.storage_state_path:
+        state_path = Path(profile.storage_state_path)
+        if state_path.is_file():
+            try:
+                state_data = json.loads(state_path.read_text(encoding="utf-8"))
+                for ck in state_data.get("cookies") or []:
+                    if not isinstance(ck, dict):
+                        continue
+                    c_name = str(ck.get("name") or "").strip()
+                    c_val = str(ck.get("value") or "")
+                    c_dom = str(ck.get("domain") or "").lstrip(".").lower()
+                    if not c_name:
+                        continue
+                    if not c_dom or target_host == c_dom or target_host.endswith("." + c_dom):
+                        cookies.append(f"{c_name}={c_val}")
+            except Exception:
+                pass
+
+    if cookies:
+        headers["Cookie"] = "; ".join(cookies)
+
+    for k, v in (profile.extra_headers_ref or {}).items():
+        h_name = str(k).strip()
+        if h_name:
+            headers[h_name] = _resolve_header_value(str(v))
+
+    return headers
+
+
+@router.post("/projects/{project_id}/replay", response_model=ReplayResponse)
+async def replay_project_endpoint(
+    project_id: str,
+    body: ReplayRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ReplayResponse:
+    """Safely replay a single HTTP request inline with optional server-side credential injection."""
+    await _get_project_or_404(db, project_id)
+
+    method = (body.method or "GET").strip().upper()
+    if method not in _ALLOWED_REPLAY_METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported HTTP method '{body.method}'. Allowed: {sorted(_ALLOWED_REPLAY_METHODS)}",
+        )
+
+    raw_url = (body.url or "").strip()
+    parsed = urlparse(raw_url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(
+            status_code=400,
+            detail="Replay URL must use http:// or https:// with a valid host.",
+        )
+
+    target_host = parsed.hostname.lower()
+    if _is_blocked_metadata_host(target_host):
+        raise HTTPException(
+            status_code=400,
+            detail="Requests to cloud metadata or link-local addresses are blocked.",
+        )
+
+    clamped_timeout = max(1.0, min(30.0, float(body.timeout_sec or 15.0)))
+
+    # Build outgoing headers: credential headers first, explicit user headers override case-insensitively
+    merged_headers: dict[str, str] = {}
+    if body.credential_id:
+        profile = await db.get(AuthProfile, body.credential_id)
+        if profile is None or profile.project_id != project_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Credential '{body.credential_id}' not found in project '{project_id}'",
+            )
+        merged_headers.update(_load_credential_headers(profile, target_host))
+
+    lower_to_key = {k.lower(): k for k in merged_headers}
+    for k, v in (body.headers or {}).items():
+        clean_k = str(k).strip()
+        if not clean_k or clean_k.startswith(":"):
+            continue
+        existing_k = lower_to_key.get(clean_k.lower())
+        if existing_k and existing_k != clean_k:
+            merged_headers.pop(existing_k, None)
+        merged_headers[clean_k] = str(v)
+        lower_to_key[clean_k.lower()] = clean_k
+
+    req_kwargs: dict[str, Any] = {
+        "headers": merged_headers,
+        "params": body.query_params or None,
+    }
+    if body.body is not None and method not in {"GET", "HEAD"}:
+        if isinstance(body.body, (dict, list)):
+            req_kwargs["json"] = body.body
+        elif isinstance(body.body, str):
+            req_kwargs["content"] = body.body.encode("utf-8")
+        else:
+            req_kwargs["json"] = body.body
+
+    trust_env = not _should_bypass_env_proxy(target_host)
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            verify=False,
+            follow_redirects=False,
+            timeout=clamped_timeout,
+            trust_env=trust_env,
+        ) as client:
+            resp = await client.request(method, raw_url, **req_kwargs)
+    except httpx.HTTPError as exc:
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return ReplayResponse(
+            status_code=0,
+            status_text="Network Error",
+            duration_ms=elapsed_ms,
+            response_headers={},
+            body_text="",
+            body_json=None,
+            content_type="",
+            truncated=False,
+            error=str(exc),
+        )
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    raw_content = resp.content or b""
+    truncated = len(raw_content) > _MAX_REPLAY_BODY_BYTES
+    sliced = raw_content[:_MAX_REPLAY_BODY_BYTES]
+    body_text = sliced.decode("utf-8", errors="replace")
+    content_type = resp.headers.get("content-type", "")
+
+    body_json: Any = None
+    if not truncated and body_text.strip():
+        if "json" in content_type.lower() or body_text.lstrip().startswith(("{", "[")):
+            try:
+                body_json = json.loads(body_text)
+            except Exception:
+                body_json = None
+
+    resp_headers = {k: v for k, v in resp.headers.items()}
+    return ReplayResponse(
+        status_code=resp.status_code,
+        status_text=resp.reason_phrase or "",
+        duration_ms=elapsed_ms,
+        response_headers=resp_headers,
+        body_text=body_text,
+        body_json=body_json,
+        content_type=content_type,
+        truncated=truncated,
+        error=None,
+    )

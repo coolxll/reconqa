@@ -13,7 +13,16 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from reconqa.config import settings
-from reconqa.models.tables import Base
+from reconqa.models.tables import Base, ScenarioModel
+
+__all__ = [
+    "Base",
+    "ScenarioModel",
+    "get_db",
+    "get_engine",
+    "get_session_factory",
+    "init_db",
+]
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None

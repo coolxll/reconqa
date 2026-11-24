@@ -9,6 +9,7 @@ import io.qameta.allure.Step;
 import io.qameta.allure.Story;
 import io.restassured.http.Method;
 import io.restassured.response.Response;
+import org.hamcrest.Matchers;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.Test;
@@ -58,6 +59,12 @@ public class {{ chain.class_name }} extends ApiBaseTest {
                 "{{ step.biz_code_field | java_str }}",
                 "{{ step.biz_code_value | java_str }}"
         );
+{% for ba in step.business_assertions %}
+        {{ ba.comment }}
+{% for stmt in ba.lines %}
+        {{ stmt }}
+{% endfor %}
+{% endfor %}
 {% for ext in step.extracts %}
 
         String {{ ext.java_var }} = response.jsonPath().getString("{{ ext.gpath | java_str }}");

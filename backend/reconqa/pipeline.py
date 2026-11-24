@@ -288,6 +288,7 @@ def run_pipeline(
     module_cb: Callable[[str, str, dict[str, Any]], None] | None = None,
     java_package: str | None = None,
     java_version: str | None = None,
+    scenario_assertions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute the end-to-end ReconQA pipeline into ``run_dir``."""
     run_dir = Path(run_dir).resolve()
@@ -509,6 +510,7 @@ def run_pipeline(
                     java_version=eff_java_version,
                     base_uri=effective_base_url,
                     project_config=project_config,
+                    scenario_assertions=scenario_assertions,
                 )
                 if run_schemathesis and effective_base_url:
                     from reconqa.modules.codegen_java.schemathesis_run import (

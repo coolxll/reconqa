@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import {
   AlertTriangle,
   ArrowRight,
@@ -34,6 +34,7 @@ import {
 } from "@/api/explore";
 import { listProjects } from "@/api/projects";
 import type { Project } from "@/api/types";
+import { useWorkspace } from "@/stores/workspace";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import MetricCard from "@/components/layout/MetricCard.vue";
 import { useI18n } from "@/i18n";
@@ -46,8 +47,17 @@ const SAMPLE_CURL = `curl 'https://api.example.com/api/v1/orders/1001' \\
 
 const AUTH_HEADER_PATTERN = /^(authorization|cookie|x-auth-token|x-api-key|x-token|token)$/i;
 
+const route = useRoute();
 const router = useRouter();
 const { t } = useI18n();
+const { activeProjectId, ensureLoaded, setActiveProject } = useWorkspace();
+
+const projectId = computed(
+  () =>
+    (typeof route.params.projectId === "string" && route.params.projectId) ||
+    activeProjectId.value ||
+    ""
+);
 
 // Seed input state
 const inputMode = ref<"curl" | "url">("curl");
@@ -307,9 +317,15 @@ function toggleExpandEndpoint(id: string): void {
   expandedEndpointIds.value = next;
 }
 
-async function fetchHistoryAndProjects(): Promise<void> {
+async function fetchHistoryAndProjects(resetSelection = false): Promise<void> {
   loadingHistory.value = true;
-  const [histRes, projRes] = await Promise.allSettled([listExplores(), listProjects()]);
+  if (resetSelection) {
+    result.value = null;
+    selectedHistoryId.value = "";
+    confirmingDelete.value = false;
+  }
+  const pid = projectId.value || null;
+  const [histRes, projRes] = await Promise.allSettled([listExplores(pid), listProjects()]);
   if (histRes.status === "fulfilled") {
     historyItems.value = histRes.value;
     if (!result.value && histRes.value.length > 0) {
@@ -324,6 +340,9 @@ async function fetchHistoryAndProjects(): Promise<void> {
   }
   if (projRes.status === "fulfilled") {
     projects.value = projRes.value;
+    if (projectId.value && projRes.value.some((p) => p.id === projectId.value)) {
+      promoteProjectSelection.value = projectId.value;
+    }
   }
   loadingHistory.value = false;
 }
@@ -354,7 +373,7 @@ async function handleDeleteExplore(): Promise<void> {
   try {
     await deleteExplore(targetId);
     confirmingDelete.value = false;
-    const updatedList = await listExplores().catch(() =>
+    const updatedList = await listExplores(projectId.value || null).catch(() =>
       historyItems.value.filter((item) => item.explore_id !== targetId)
     );
     historyItems.value = updatedList;
@@ -389,6 +408,7 @@ async function handleRunExplore(): Promise<void> {
   running.value = true;
   try {
     const res = await runExplore({
+      project_id: projectId.value || null,
       seed_curl: curlText || null,
       target_url: urlText || null,
       mode: discoveryMode.value,
@@ -397,7 +417,9 @@ async function handleRunExplore(): Promise<void> {
       depth: depth.value,
     });
     applyResult(res);
-    const updatedList = await listExplores().catch(() => historyItems.value);
+    const updatedList = await listExplores(projectId.value || null).catch(
+      () => historyItems.value
+    );
     historyItems.value = updatedList;
   } catch (err) {
     error.value = err instanceof Error ? err.message : t("explore.errorRun");
@@ -436,7 +458,12 @@ async function handlePromoteToRun(): Promise<void> {
       selected_endpoints: selected.length > 0 ? selected : null,
     };
     const createdRun = await promoteExploreToRun(result.value.explore_id, payload);
-    await router.push(`/runs/${createdRun.id}`);
+    if (createdRun.project_id) {
+      setActiveProject(createdRun.project_id);
+      await router.push(`/p/${createdRun.project_id}/runs/${createdRun.id}`);
+    } else {
+      await router.push(`/runs/${createdRun.id}`);
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : t("explore.errorPromote");
   } finally {
@@ -444,7 +471,12 @@ async function handlePromoteToRun(): Promise<void> {
   }
 }
 
-onMounted(() => {
+watch(projectId, () => {
+  void fetchHistoryAndProjects(true);
+});
+
+onMounted(async () => {
+  await ensureLoaded();
   void fetchHistoryAndProjects();
 });
 </script>
@@ -540,7 +572,7 @@ onMounted(() => {
           type="button"
           class="btn-secondary py-1 text-xs"
           :disabled="loadingHistory"
-          @click="fetchHistoryAndProjects"
+          @click="fetchHistoryAndProjects()"
         >
           <RefreshCw class="h-3.5 w-3.5" :class="loadingHistory ? 'animate-spin' : ''" />
           <span>{{ t("explore.refreshHistory") }}</span>

@@ -43,10 +43,17 @@ import {
 } from '@/api/runs'
 import StatusBadge from '@/components/layout/StatusBadge.vue'
 import EmptyState from '@/components/layout/EmptyState.vue'
+import { useWorkspace } from '@/stores/workspace'
 import '@/i18n/locales/runs'
 import { useI18n } from '@/i18n'
 
 const { locale, t } = useI18n()
+const {
+  activeProjectId,
+  ensureLoaded: ensureWorkspaceLoaded,
+  upsertProject,
+  setActiveProject,
+} = useWorkspace()
 
 interface RunWithProject extends Run {
   project_name: string
@@ -75,6 +82,11 @@ const STATUS_FILTER_KEYS = ['all', 'running', 'queued', 'completed', 'failed', '
 
 const route = useRoute()
 const router = useRouter()
+
+const routeProjectId = computed(() =>
+  typeof route.params.projectId === 'string' ? route.params.projectId : '',
+)
+const scopedProjectId = computed(() => routeProjectId.value || '')
 
 const loading = ref(true)
 const errorMessage = ref('')
@@ -228,17 +240,24 @@ async function loadProjectsAndRuns() {
     projects.value = projList
 
     const queryProj =
-      typeof route.query.projectId === 'string'
+      routeProjectId.value ||
+      (typeof route.query.projectId === 'string'
         ? route.query.projectId
         : typeof route.query.project === 'string'
           ? route.query.project
-          : ''
+          : '')
     if (queryProj && projList.some((p) => p.id === queryProj)) {
       selectedProjectFilter.value = queryProj
+    } else if (!routeProjectId.value) {
+      selectedProjectFilter.value = 'all'
     }
 
+    const targetProjects = routeProjectId.value
+      ? projList.filter((p) => p.id === routeProjectId.value)
+      : projList
+
     const runLists = await Promise.all(
-      projList.map(async (proj) => {
+      targetProjects.map(async (proj) => {
         try {
           const list = await listProjectRuns(proj.id)
           return list.map((r) => ({ ...r, project_name: proj.name }))
@@ -312,13 +331,20 @@ watch(
 function openWizard() {
   wizardError.value = ''
   submitStepLabel.value = ''
-  projectMode.value = 'auto'
   inlineNewProjectName.value = ''
   customRunName.value = ''
-  if (selectedProjectFilter.value !== 'all') {
-    wizardProjectId.value = selectedProjectFilter.value
-  } else if (!wizardProjectId.value && projects.value.length > 0) {
-    wizardProjectId.value = projects.value[0].id
+  const preferredProj =
+    routeProjectId.value ||
+    (selectedProjectFilter.value !== 'all' ? selectedProjectFilter.value : '') ||
+    activeProjectId.value
+  if (preferredProj && projects.value.some((p) => p.id === preferredProj)) {
+    projectMode.value = 'existing'
+    wizardProjectId.value = preferredProj
+  } else {
+    projectMode.value = 'auto'
+    if (!wizardProjectId.value && projects.value.length > 0) {
+      wizardProjectId.value = projects.value[0].id
+    }
   }
   if (wizardProjectId.value) {
     loadWizardProjectContext(wizardProjectId.value)
@@ -431,6 +457,7 @@ async function ensureProjectAndTarget(): Promise<{
       description: t('runs.wizard.project.newDescDefault'),
     })
     projects.value = [project, ...projects.value]
+    upsertProject(project)
     createdFresh = true
   }
 
@@ -537,7 +564,8 @@ async function handleLaunchRun() {
     inlineNewProjectName.value = ''
     customRunName.value = ''
     drawerOpen.value = false
-    await router.push({ name: 'run-detail', params: { runId: created.id } })
+    setActiveProject(projectId)
+    await router.push(`/p/${projectId}/runs/${created.id}`)
   } catch (err) {
     wizardError.value =
       err instanceof Error ? err.message : t('runs.wizard.errLaunch')
@@ -582,7 +610,12 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
+watch(routeProjectId, () => {
+  void loadProjectsAndRuns()
+})
+
 onMounted(async () => {
+  await ensureWorkspaceLoaded()
   await loadProjectsAndRuns()
   if (route.query.new === '1') {
     openWizard()
@@ -627,7 +660,7 @@ onMounted(async () => {
     <!-- Filter Bar -->
     <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
       <div class="flex flex-wrap items-center gap-3">
-        <div class="flex items-center gap-2">
+        <div v-if="!scopedProjectId" class="flex items-center gap-2">
           <SlidersHorizontal class="h-4 w-4 text-slate-400" />
           <label class="text-xs font-medium text-slate-600">{{ t('runs.filter.project') }}</label>
           <select
@@ -750,7 +783,7 @@ onMounted(async () => {
               v-for="run in filteredRuns"
               :key="run.id"
               class="cursor-pointer transition hover:bg-slate-50/90"
-              @click="router.push({ name: 'run-detail', params: { runId: run.id } })"
+              @click="router.push(`/p/${run.project_id}/runs/${run.id}`)"
             >
               <td class="px-5 py-3.5">
                 <div
@@ -838,7 +871,7 @@ onMounted(async () => {
                   </template>
                   <template v-else>
                     <router-link
-                      :to="{ name: 'run-detail', params: { runId: run.id } }"
+                      :to="`/p/${run.project_id}/runs/${run.id}`"
                       class="inline-flex items-center gap-1 text-xs font-medium text-indigo-600 hover:text-indigo-800"
                     >
                       {{ t('runs.table.open') }}
@@ -1172,7 +1205,7 @@ onMounted(async () => {
                   <span>{{ t('runs.wizard.exploreHint') }}</span>
                 </span>
                 <router-link
-                  to="/explore"
+                  :to="scopedProjectId ? `/p/${scopedProjectId}/explore` : '/explore'"
                   class="font-medium text-indigo-600 hover:underline"
                   @click="drawerOpen = false"
                 >

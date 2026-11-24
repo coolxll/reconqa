@@ -1,4 +1,4 @@
-"""Integration tests for ReconQA MCP Server (10 tools & 3 resources via in-process FastAPI)."""
+"""Integration tests for ReconQA MCP Server (14 tools & 3 resources via FastAPI & mocks)."""
 
 from __future__ import annotations
 
@@ -24,6 +24,9 @@ EXPECTED_TOOLS = {
     "reconqa_execute_run_modules",
     "reconqa_get_run_summary",
     "reconqa_list_findings",
+    "reconqa_get_project_inventory",
+    "reconqa_list_scenarios",
+    "reconqa_upsert_scenario",
 }
 
 EXPECTED_RESOURCE_TEMPLATES = {
@@ -206,7 +209,7 @@ async def test_mcp_server_registers_all_tools_resources_and_executes_e2e(
         )
         assert "chains" in corr_text
 
-        # 7. Upload local HAR directory via 11th tool reconqa_upload_har_files
+        # 7. Upload local HAR directory via reconqa_upload_har_files
         har_run = _extract_json_result(
             await mcp.call_tool(
                 "reconqa_upload_har_files",
@@ -221,5 +224,281 @@ async def test_mcp_server_registers_all_tools_resources_and_executes_e2e(
         assert har_run["run_id"]
         assert har_run.get("summary_metrics", {}).get("total_endpoints", 0) >= 6
 
+        # 8. Master API Inventory + First-Class Scenarios against live in-process FastAPI
+        inv = _extract_json_result(
+            await mcp.call_tool(
+                "reconqa_get_project_inventory",
+                {"project_id": project_id, "source": "har-live", "limit": 20},
+            )
+        )
+        assert inv["project_id"] == project_id
+        assert inv["total_endpoints"] >= 6
+        assert inv["har_live_count"] >= 6
+        assert all(ep["discovery_source"] == "har-live" for ep in inv["endpoints"])
+
+        upserted = _extract_json_result(
+            await mcp.call_tool(
+                "reconqa_upsert_scenario",
+                {
+                    "project_id": project_id,
+                    "slug": "01_mcp_curl",
+                    "name": "Item Search Flow",
+                    "description": "Verify catalog search returns matching items.",
+                    "business_domain": "catalog",
+                    "priority": "P0",
+                    "assertions": [
+                        {
+                            "title": "Search returns items array",
+                            "target_endpoint": "GET /api/v1/items/search",
+                            "jsonpath": "$.data",
+                            "operator": "not_empty",
+                        }
+                    ],
+                    "negative_cases": [
+                        {
+                            "title": "Empty keyword returns 400",
+                            "category": "validation",
+                            "expected_behavior": "HTTP 400 validation error",
+                        }
+                    ],
+                },
+            )
+        )
+        assert upserted["slug"] == "01_mcp_curl"
+        assert upserted["source"] == "ai-agent"
+        assert upserted["priority"] == "P0"
+        assert upserted["assertion_count"] == 1
+        assert upserted["negative_case_count"] == 1
+
+        sc_list = _extract_json_result(
+            await mcp.call_tool(
+                "reconqa_list_scenarios",
+                {"project_id": project_id, "priority": "P0"},
+            )
+        )
+        assert sc_list["total"] >= 1
+        assert any(s["slug"] == "01_mcp_curl" for s in sc_list["scenarios"])
+
     if db_mod._engine is not None:
         await db_mod._engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_mcp_inventory_and_scenarios_tools_mocked() -> None:
+    """Verify inventory and scenario MCP tools against mocked FastAPI HTTP responses."""
+    captured_requests: list[tuple[str, str, dict[str, str], Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body: Any = None
+        if request.content:
+            body = json.loads(request.content.decode("utf-8"))
+        captured_requests.append(
+            (request.method, request.url.path, dict(request.url.params), body)
+        )
+
+        if request.method == "GET" and request.url.path == "/api/v1/projects/proj_1/inventory":
+            return httpx.Response(
+                200,
+                json={
+                    "project_id": "proj_1",
+                    "project_name": "Demo Shop",
+                    "runs_merged_count": 2,
+                    "explore_sessions_count": 1,
+                    "total_endpoints": 3,
+                    "har_live_count": 2,
+                    "js_static_count": 1,
+                    "coverage_pct": 66.7,
+                    "scenarios": ["01_checkout", "02_orders"],
+                    "by_prefix": [
+                        {"prefix": "/api/v1/orders", "total": 2, "covered": 2, "coverage_pct": 100.0},
+                        {"prefix": "/api/v1/admin", "total": 1, "covered": 0, "coverage_pct": 0.0},
+                    ],
+                    "endpoints": [
+                        {
+                            "method": "POST",
+                            "path": "/api/v1/orders/submit",
+                            "summary": "Submit order",
+                            "discovery_source": "har-live",
+                            "host": "shop.example.com",
+                            "scenarios": ["01_checkout"],
+                            "status_codes": [200, 201],
+                            "parameters": [{"name": "coupon", "in": "query"}],
+                            "seen_in_runs": [{"run_id": "run_1", "run_name": "Checkout"}],
+                            "response_example": {"huge": "omitted-by-mcp"},
+                        },
+                        {
+                            "method": "GET",
+                            "path": "/api/v1/orders/{id}",
+                            "summary": "Get order",
+                            "discovery_source": "har-live",
+                            "host": "shop.example.com",
+                            "scenarios": ["02_orders"],
+                            "status_codes": [200],
+                            "parameters": [{"name": "id", "in": "path"}],
+                            "seen_in_runs": [{"run_id": "run_1", "run_name": "Checkout"}],
+                        },
+                        {
+                            "method": "DELETE",
+                            "path": "/api/v1/admin/users/{id}",
+                            "summary": "Delete user",
+                            "discovery_source": "js-static",
+                            "host": "shop.example.com",
+                            "scenarios": [],
+                            "status_codes": [],
+                            "parameters": [],
+                            "seen_in_runs": [],
+                        },
+                    ],
+                },
+            )
+
+        if request.method == "GET" and request.url.path == "/api/v1/projects/proj_1/scenarios":
+            return httpx.Response(
+                200,
+                json={
+                    "project_id": "proj_1",
+                    "total": 2,
+                    "by_priority": {"P0": 1, "P1": 1},
+                    "by_effectiveness": {"L1": 1, "L4": 1},
+                    "p0_p1_total": 2,
+                    "p0_p1_effective_count": 1,
+                    "p0_p1_effective_pct": 50.0,
+                    "scenarios": [
+                        {
+                            "id": "sc_1",
+                            "project_id": "proj_1",
+                            "slug": "01_checkout",
+                            "name": "Checkout Flow",
+                            "priority": "P0",
+                            "status": "active",
+                            "business_domain": "commerce",
+                            "owner": "qa-team",
+                            "source": "har-auto",
+                            "effectiveness_level": "L1",
+                            "description": "Checkout submission flow",
+                            "tags": ["checkout"],
+                            "endpoint_count": 2,
+                            "run_count": 1,
+                            "last_run_id": "run_1",
+                            "assertion_count": 0,
+                            "assertions_passed_count": 0,
+                            "negative_case_count": 0,
+                            "negative_cases_covered_count": 0,
+                        }
+                    ],
+                },
+            )
+
+        if request.method == "POST" and request.url.path == "/api/v1/projects/proj_1/scenarios":
+            assert request.url.params.get("upsert") == "true"
+            assert body["source"] == "ai-agent"
+            return httpx.Response(
+                201,
+                json={
+                    "id": "sc_1",
+                    "project_id": "proj_1",
+                    "slug": body["slug"],
+                    "name": body["name"],
+                    "priority": body.get("priority", "P2"),
+                    "status": body.get("status", "active"),
+                    "business_domain": body.get("business_domain", ""),
+                    "owner": body.get("owner", ""),
+                    "source": body["source"],
+                    "tags": body.get("tags", []),
+                    "endpoint_count": 2,
+                    "assertion_count": len(body.get("assertions", [])),
+                    "negative_case_count": len(body.get("negative_cases", [])),
+                    "effectiveness_level": "L4",
+                },
+            )
+
+        return httpx.Response(404, json={"detail": f"Unhandled mock route: {request.url}"})
+
+    mcp = create_mcp_server("http://127.0.0.1:8000", transport=httpx.MockTransport(handler))
+
+    # 1. reconqa_get_project_inventory filtering + limit cap
+    inv = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_get_project_inventory",
+            {
+                "project_id": "proj_1",
+                "source": "har-live",
+                "prefix": "/api/v1/orders",
+                "limit": 1,
+            },
+        )
+    )
+    assert inv["total_endpoints"] == 3
+    assert inv["har_live_count"] == 2
+    assert inv["js_static_count"] == 1
+    assert inv["coverage_pct"] == 66.7
+    assert inv["matched_endpoints_count"] == 2
+    assert inv["endpoints_truncated"] == 1
+    assert len(inv["endpoints"]) == 1
+    assert inv["endpoints"][0]["path"] == "/api/v1/orders/submit"
+    assert "response_example" not in inv["endpoints"][0]
+
+    # 2. reconqa_list_scenarios query forwarding + effectiveness summary
+    sc_list = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_list_scenarios",
+            {"project_id": "proj_1", "priority": "p0", "effectiveness_level": "l1"},
+        )
+    )
+    assert sc_list["p0_p1_effective_pct"] == 50.0
+    assert sc_list["by_priority"] == {"P0": 1, "P1": 1}
+    assert sc_list["by_effectiveness"] == {"L1": 1, "L4": 1}
+    assert len(sc_list["scenarios"]) == 1
+    assert sc_list["scenarios"][0]["effectiveness_level"] == "L1"
+
+    # 3. reconqa_upsert_scenario sends ?upsert=true and source='ai-agent'
+    upserted = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_upsert_scenario",
+            {
+                "project_id": "proj_1",
+                "slug": "01_checkout",
+                "name": "Checkout Submission",
+                "description": "Order total must match line items.",
+                "preconditions": "Authenticated shopper with cart items",
+                "business_domain": "commerce",
+                "priority": "P0",
+                "status": "verified",
+                "owner": "qa-agent",
+                "tags": ["checkout", "p0"],
+                "assertions": [
+                    {
+                        "title": "Order ID is returned",
+                        "target_endpoint": "POST /api/v1/orders/submit",
+                        "jsonpath": "$.data.order_id",
+                        "operator": "not_empty",
+                    }
+                ],
+                "negative_cases": [
+                    {
+                        "title": "Reject expired coupon",
+                        "category": "validation",
+                        "expected_behavior": "HTTP 400 coupon_expired",
+                    }
+                ],
+            },
+        )
+    )
+    assert upserted["source"] == "ai-agent"
+    assert upserted["priority"] == "P0"
+    assert upserted["assertion_count"] == 1
+    assert upserted["negative_case_count"] == 1
+    assert upserted["effectiveness_level"] == "L4"
+
+    # Verify exact backend URLs & query parameters sent
+    assert captured_requests[0][0:2] == ("GET", "/api/v1/projects/proj_1/inventory")
+    assert captured_requests[1][0:3] == (
+        "GET",
+        "/api/v1/projects/proj_1/scenarios",
+        {"priority": "P0", "effectiveness_level": "L1"},
+    )
+    assert captured_requests[2][0:3] == (
+        "POST",
+        "/api/v1/projects/proj_1/scenarios",
+        {"upsert": "true"},
+    )

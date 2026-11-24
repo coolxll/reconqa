@@ -16,6 +16,8 @@ ReconQA is a **"one-recording, multi-use"** Web/API testing platform backed by a
 | Create/list projects, search or save PRDs & business rules | **MCP** (`reconqa_*_project`, `reconqa_*_knowledge`) | Persists directly to SQLite and shows up live in the Web UI Knowledge Base |
 | Discover endpoints from 1 seed cURL or target URL | **MCP** (`reconqa_explore_from_seed`, `reconqa_promote_explore_to_run`) | Returns compact summaries + top 40 endpoints without blowing up agent context |
 | Import pasted cURL / fetch / Raw HTTP / HAR & build OpenAPI + correlations | **MCP** (`reconqa_import_traffic_and_analyze`, `reconqa_upload_har_files`, `reconqa_get_run_summary`) | Auto-links project, runs fast `["merge"]`, exposes `reconqa://` resources |
+| Inspect cumulative project API inventory across Explore + Runs | **MCP** (`reconqa_get_project_inventory`) | Returns merged `har-live` vs `js-static` coverage, prefix stats, and filtered endpoints |
+| Track business scenarios, P0–P3 priorities, and L0–L4 testing effectiveness | **MCP** (`reconqa_list_scenarios`, `reconqa_upsert_scenario`) | Identifies `P0/P1` scenarios lacking assertions/negative cases and compiles business assertions into Java RestAssured tests |
 | Trigger Java codegen, HAR/k6 performance, or security audit on demand | **MCP** (`reconqa_execute_run_modules`, `reconqa_list_findings`) | Progressive execution: run only the capability you need, when you need it |
 | Execute generated Maven tests or Allure report locally | **CLI** (`mvn test`, `allure serve target/allure-results`) | Local build/runtime execution against the generated `java-tests/` workspace |
 | Execute k6 load tests or check local binaries | **CLI** (`k6 run scenario_ramp.js`, `reconqa doctor`) | High-throughput local load generation and host toolchain diagnostics |
@@ -84,6 +86,14 @@ Use this playbook when you have browser automation (or a human co-pilot) and wan
    Call `reconqa_upload_har_files(har_paths=["./roam_hars"], wait=True)`.
    - ReconQA auto-detects the primary host, links/creates the project, runs fast `["merge"]` (OpenAPI 3.0.3 + correlation chains + JS Coverage Diff), and surfaces the live run immediately in the Vue 3 Web Console.
    - Follow up on demand with `reconqa_execute_run_modules(run_id, ["java_gen" | "perf" | "security"])`.
+
+### Effectiveness Loop (Beyond HTTP 200)
+Capturing `HTTP 200` traffic alone only proves an endpoint responds (`L1`/`L2`); true QA effectiveness verifies **business invariants and negative paths** (`L3`/`L4`):
+1. Read PRDs and business rules from `reconqa://projects/{project_id}/knowledge`, inspect cumulative API coverage via `reconqa_get_project_inventory(project_id)`, and inspect scenario effectiveness via `reconqa_list_scenarios(project_id)`.
+2. Identify **`P0`/`P1` scenarios stuck at `L1` (Captured) or `L2` (Smoke)** (`p0_p1_effective_pct < 100%`).
+3. Enrich each high-priority scenario via `reconqa_upsert_scenario(project_id, slug=..., name=..., description=..., preconditions=..., business_domain=..., priority="P0"|"P1", assertions=[...], negative_cases=[...])`:
+   - Add structured `assertions` (`target_endpoint`, `jsonpath`, `operator`, `expected`, `note`)—ReconQA compiles these directly into Java RestAssured test assertions when you run `reconqa_execute_run_modules(run_id, ["java_gen"])`!
+   - Add `negative_cases` (`auth`, `validation`, `boundary`, `idempotency`, `state_machine`, `security`) so humans and agents systematically close edge-case blind spots.
 
 ---
 

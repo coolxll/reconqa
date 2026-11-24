@@ -20,6 +20,7 @@ from reconqa.modules.codegen_java.schema_gen import (
     strip_var_braces,
     write_parameterized_payload,
 )
+from reconqa.modules.hub.har_parser import normalize_path
 from reconqa.utils.io import ensure_dir, read_json, slugify, write_json
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -502,6 +503,186 @@ def _build_l2_path_template(step: dict[str, Any]) -> str:
     return path_template
 
 
+def _sanitize_java_comment(text: Any) -> str:
+    return re.sub(r"[\r\n]+", " ", str(text or "")).replace("*/", "* /").strip()
+
+
+def _parse_java_number_literal(raw: str) -> str | None:
+    s = (raw or "").strip()
+    if re.fullmatch(r"-?\d+", s):
+        val = int(s)
+        if -2147483648 <= val <= 2147483647:
+            return s
+        return f"{s}L"
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        return f"{s}f"
+    return None
+
+
+def _compile_scenario_assertion_java(assertion: dict[str, Any]) -> dict[str, Any]:
+    """Compile a ScenarioAssertion dict into valid Java RestAssured / TestNG statements."""
+    priority = _sanitize_java_comment(assertion.get("priority") or "P2") or "P2"
+    title = _sanitize_java_comment(assertion.get("title") or "Business Rule")
+    note = _sanitize_java_comment(assertion.get("note") or "")
+    operator = str(assertion.get("operator") or "not_empty").strip().lower()
+    expected = "" if assertion.get("expected") is None else str(assertion.get("expected"))
+    raw_jsonpath = str(assertion.get("jsonpath") or "").strip()
+    gpath = jsonpath_to_gpath(raw_jsonpath)
+    gpath_esc = escape_java_string(gpath)
+    expected_esc = escape_java_string(expected)
+    title_esc = escape_java_string(title)
+
+    comment = f"// Business Assertion [{priority}]: {title}"
+    lines: list[str] = []
+
+    if operator == "custom":
+        todo_detail = note or title
+        lines.append(f"// TODO Business Rule: {todo_detail}")
+    elif operator == "not_empty":
+        if gpath:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", Matchers.notNullValue());'
+            )
+        else:
+            lines.append(
+                f'Assert.assertFalse(response.getBody().asString().trim().isEmpty(), "{title_esc}");'
+            )
+    elif operator in {"equals", "not_equals"}:
+        if gpath:
+            low = expected.strip().lower()
+            if low in {"true", "false"}:
+                matcher_val = low
+            else:
+                num_lit = _parse_java_number_literal(expected)
+                matcher_val = num_lit if num_lit is not None else f'"{expected_esc}"'
+            eq_expr = f"Matchers.equalTo({matcher_val})"
+            if operator == "not_equals":
+                eq_expr = f"Matchers.not({eq_expr})"
+            lines.append(f'response.then().assertThat().body("{gpath_esc}", {eq_expr});')
+        elif operator == "equals":
+            lines.append(
+                f'Assert.assertEquals(response.getBody().asString().trim(), "{expected_esc}", "{title_esc}");'
+            )
+        else:
+            lines.append(
+                f'Assert.assertNotEquals(response.getBody().asString().trim(), "{expected_esc}", "{title_esc}");'
+            )
+    elif operator == "contains":
+        if gpath:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", '
+                f'Matchers.hasToString(Matchers.containsString("{expected_esc}")));'
+            )
+        else:
+            lines.append(
+                f'response.then().assertThat().body(Matchers.containsString("{expected_esc}"));'
+            )
+    elif operator == "matches":
+        if gpath:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", '
+                f'Matchers.hasToString(Matchers.matchesPattern("{expected_esc}")));'
+            )
+        else:
+            lines.append(
+                f'response.then().assertThat().body(Matchers.matchesPattern("{expected_esc}"));'
+            )
+    elif operator in {"gt", "gte", "lt", "lte"}:
+        cmp_map = {
+            "gt": "greaterThan",
+            "gte": "greaterThanOrEqualTo",
+            "lt": "lessThan",
+            "lte": "lessThanOrEqualTo",
+        }
+        num_lit = _parse_java_number_literal(expected)
+        if gpath and num_lit is not None:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", '
+                f"Matchers.{cmp_map[operator]}({num_lit}));"
+            )
+        elif gpath:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", Matchers.notNullValue());'
+            )
+            lines.append(
+                f"// TODO Business Rule: verify {gpath} {operator} {_sanitize_java_comment(expected)}"
+            )
+        else:
+            lines.append(f"// TODO Business Rule: {note or title}")
+    else:
+        lines.append(f"// TODO Business Rule: {note or title}")
+
+    return {"comment": comment, "lines": lines}
+
+
+def _clean_endpoint_path(raw_path: str) -> str:
+    p = (raw_path or "").strip()
+    if p.startswith(("http://", "https://")):
+        p = urlparse(p).path
+    p = p.split("?", 1)[0].strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return p.rstrip("/") or "/"
+
+
+def _match_scenario_assertions(
+    method_upper: str,
+    path_template: str,
+    concrete_path: str,
+    scenario_assertions: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Find and compile ScenarioAssertions targeting this endpoint (METHOD /path or path suffix)."""
+    if not scenario_assertions:
+        return []
+
+    ep_method = method_upper.upper().strip()
+    ep_clean_tpl = _clean_endpoint_path(path_template)
+    ep_clean_conc = _clean_endpoint_path(concrete_path)
+    ep_norm, _ = normalize_path(ep_clean_tpl)
+    ep_norm_clean = _clean_endpoint_path(ep_norm)
+
+    compiled: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, raw in enumerate(scenario_assertions):
+        if not isinstance(raw, dict):
+            continue
+        target = str(raw.get("target_endpoint") or "").strip()
+        if not target:
+            continue
+
+        parts = target.split(None, 1)
+        if len(parts) == 2 and parts[0].upper() in {m.upper() for m in HTTP_METHODS}:
+            t_method: str | None = parts[0].upper()
+            t_path_raw = parts[1].strip()
+        else:
+            t_method = None
+            t_path_raw = target
+
+        if t_method is not None and t_method != ep_method:
+            continue
+
+        t_clean = _clean_endpoint_path(t_path_raw)
+        t_norm, _ = normalize_path(t_clean)
+        t_norm_clean = _clean_endpoint_path(t_norm)
+
+        matched = (
+            t_clean in {ep_clean_tpl, ep_clean_conc}
+            or t_norm_clean == ep_norm_clean
+            or (len(t_clean) > 1 and ep_clean_tpl.endswith(t_clean))
+            or (len(t_clean) > 1 and ep_clean_conc.endswith(t_clean))
+        )
+        if not matched:
+            continue
+
+        aid = str(raw.get("id") or f"idx_{idx}_{raw.get('title', '')}")
+        if aid in seen_ids:
+            continue
+        seen_ids.add(aid)
+        compiled.append(_compile_scenario_assertion_java(raw))
+
+    return compiled
+
+
 def _build_l2_step_model(
     step: dict[str, Any],
     *,
@@ -512,6 +693,7 @@ def _build_l2_step_model(
     openapi_ops: dict[tuple[str, str], dict[str, Any]],
     global_biz_rules: Any,
     project_config: Any = None,
+    scenario_assertions: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     method_upper = str(step.get("method") or "GET").upper()
     norm_path = str(step.get("path") or "/")
@@ -615,6 +797,13 @@ def _build_l2_step_model(
     method_suffix = sanitize_java_identifier(f"{method_upper.lower()}_{norm_path}", pascal=False)
     method_name = f"step{step_idx:02d}_{method_suffix}"
 
+    business_assertions = _match_scenario_assertions(
+        method_upper,
+        norm_path,
+        urlparse(raw_url).path if raw_url else norm_path,
+        scenario_assertions,
+    )
+
     step_model = {
         "method_name": method_name,
         "depends_on": depends_on,
@@ -627,6 +816,7 @@ def _build_l2_step_model(
         "biz_code_field": biz_code_field,
         "biz_code_value": biz_code_value,
         "extracts": extracts_list,
+        "business_assertions": business_assertions,
         "required_vars": required_vars,
         "label": f"Step {step_idx} {method_upper} {norm_path}",
         "description": f"Step {step_idx}: {method_upper} {norm_path}",
@@ -664,6 +854,7 @@ def generate_java_project(
     java_version: str = "21",
     base_uri: str | None = None,
     project_config: Any = None,
+    scenario_assertions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Generate a complete, compilable Java TestNG + RestAssured + Allure Maven project."""
     openapi_path = Path(openapi_path)
@@ -762,8 +953,10 @@ def generate_java_project(
 
     # 2. Build L1 Smoke CSV + externalized query/header/payload JSON files
     l1_rows: list[list[str]] = []
+    l1_assertion_groups: list[dict[str, Any]] = []
     l3_cases: list[dict[str, str]] = []
     payload_count = 0
+    business_assertions_compiled = 0
     l1_idx = 0
     l3_idx = 0
 
@@ -842,6 +1035,19 @@ def generate_java_project(
                         str(max_latency_ms),
                     ]
                 )
+                l1_matched = _match_scenario_assertions(
+                    method_upper, path, concrete_path, scenario_assertions
+                )
+                if l1_matched:
+                    l1_assertion_groups.append(
+                        {
+                            "case_id": case_id,
+                            "method": method_upper,
+                            "path": concrete_path,
+                            "assertions": l1_matched,
+                        }
+                    )
+                    business_assertions_compiled += len(l1_matched)
 
             # L3: Authenticated endpoints (any HTTP method)
             if _is_authenticated_operation(
@@ -958,9 +1164,11 @@ def generate_java_project(
                 openapi_ops=openapi_ops,
                 global_biz_rules=global_biz_rules,
                 project_config=project_config,
+                scenario_assertions=scenario_assertions,
             )
             if wrote:
                 payload_count += 1
+            business_assertions_compiled += len(step_model.get("business_assertions") or [])
             step_models.append(step_model)
             prev_method = step_model["method_name"]
 
@@ -1014,6 +1222,7 @@ def generate_java_project(
         "latency_multiplier": f"{latency_multiplier:.1f}",
         "default_custom_headers": default_custom_headers,
         "has_l1_cases": len(l1_rows) > 0,
+        "l1_assertion_groups": l1_assertion_groups,
         "l2_chain_classes": l2_chain_classes,
         "has_l3_cases": len(l3_cases) > 0,
         "l3_cases": l3_cases,
@@ -1062,5 +1271,48 @@ def generate_java_project(
         "l3_count": len(l3_cases),
         "schema_count": len(schema_map),
         "payload_count": payload_count,
+        "business_assertions_compiled": business_assertions_compiled,
         "generated_files": generated_files,
     }
+
+
+class JavaProjectGenerator:
+    """Object-oriented facade over ``generate_java_project`` with scenario assertion support."""
+
+    def __init__(
+        self,
+        *,
+        package_name: str = "com.reconqa.generated",
+        java_version: str = "21",
+        base_uri: str | None = None,
+        project_config: Any = None,
+        scenario_assertions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.package_name = package_name
+        self.java_version = java_version
+        self.base_uri = base_uri
+        self.project_config = project_config
+        self.scenario_assertions = scenario_assertions
+
+    def generate(
+        self,
+        openapi_path: Path,
+        out_dir: Path,
+        *,
+        correlation_path: Path | None = None,
+        scenario_assertions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return generate_java_project(
+            openapi_path,
+            out_dir,
+            correlation_path=correlation_path,
+            package_name=self.package_name,
+            java_version=self.java_version,
+            base_uri=self.base_uri,
+            project_config=self.project_config,
+            scenario_assertions=(
+                scenario_assertions
+                if scenario_assertions is not None
+                else self.scenario_assertions
+            ),
+        )

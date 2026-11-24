@@ -12,6 +12,7 @@ import io.restassured.http.Method;
 import io.restassured.module.jsv.JsonSchemaValidator;
 import io.restassured.response.Response;
 import org.hamcrest.Matchers;
+import org.testng.Assert;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
@@ -80,5 +81,19 @@ public class L1SmokeContractTest extends ApiBaseTest {
             );
             response.then().time(Matchers.lessThan(effectiveMaxMs));
         }
+{% if l1_assertion_groups %}
+
+        // Compiled Scenario Business Assertions
+{% for grp in l1_assertion_groups %}
+        if ("{{ grp.case_id | java_str }}".equals(caseId)) {
+{% for ba in grp.assertions %}
+            {{ ba.comment }}
+{% for stmt in ba.lines %}
+            {{ stmt }}
+{% endfor %}
+{% endfor %}
+        }
+{% endfor %}
+{% endif %}
     }
 }
