@@ -362,7 +362,7 @@ def create_mcp_server(
         ),
     )
 
-    # --- 17 Token-Efficient MCP Tools ---
+    # --- 19 Token-Efficient MCP Tools ---
 
     async def _resolve_or_create_project(
         project_id: str | None,
@@ -1228,6 +1228,114 @@ def create_mcp_server(
             "synced_negative_cases": int(data.get("synced_negative_cases", 0) or 0),
             "stdout_tail": _truncate_str(str(data.get("stdout_tail") or ""), _MAX_REPLAY_TEXT_CHARS),
             "error": data.get("error"),
+        }
+
+    @mcp.tool()
+    async def reconqa_get_capability_map(
+        project_id: str,
+        live_only: bool = True,
+        module: str | None = None,
+        role: str | None = None,
+        has_writes: bool = False,
+        limit: int = 30,
+    ) -> dict[str, Any]:
+        """Fetch a project's Business Capability Map (Resource x Action x Role x State) with 5-dim QA metrics."""
+        clamped_limit = max(1, min(int(limit or 30), 100))
+        params: dict[str, Any] = {
+            "live_only": "true" if live_only else "false",
+            "has_writes": "true" if has_writes else "false",
+        }
+        if module and module.strip():
+            params["module"] = module.strip()
+        if role and role.strip():
+            params["role"] = role.strip().lower()
+
+        data = await client.request_json(
+            "GET",
+            f"/projects/{project_id}/capabilities",
+            params=params,
+        )
+        raw_caps = list(data.get("capabilities") or [])
+        compact_caps: list[dict[str, Any]] = []
+        for cap in raw_caps[:clamped_limit]:
+            raw_eps = list(cap.get("endpoints") or [])
+            sample_endpoints: list[str] = []
+            for ep in raw_eps[:8]:
+                if isinstance(ep, dict):
+                    method = str(ep.get("method") or "GET").upper()
+                    path = str(ep.get("path") or "/")
+                    sample_endpoints.append(f"{method} {path}")
+                elif isinstance(ep, str):
+                    sample_endpoints.append(ep)
+            compact_caps.append(
+                {
+                    "key": cap.get("key", ""),
+                    "module": cap.get("module", ""),
+                    "resource": cap.get("resource", ""),
+                    "display_name": cap.get("display_name", cap.get("key", "")),
+                    "recommended_priority": cap.get("recommended_priority", "P2"),
+                    "priority_score": cap.get("priority_score", 0),
+                    "live_endpoints": cap.get("live_endpoints", 0),
+                    "total_endpoints": cap.get("total_endpoints", 0),
+                    "write_endpoints": cap.get("write_endpoints", 0),
+                    "roles": list(cap.get("roles") or []),
+                    "actions": list(cap.get("actions") or []),
+                    "observed_statuses": cap.get("observed_statuses") or {},
+                    "case_matrix": cap.get("case_matrix") or {},
+                    "case_coverage_pct": cap.get("case_coverage_pct", 0.0),
+                    "linked_scenarios": list(cap.get("linked_scenarios") or []),
+                    "sample_endpoints": sample_endpoints,
+                    "endpoints_truncated": max(0, len(raw_eps) - len(sample_endpoints)),
+                }
+            )
+        return {
+            "project_id": data.get("project_id", project_id),
+            "project_name": data.get("project_name", ""),
+            "metrics": data.get("metrics") or {},
+            "modules": list(data.get("modules") or []),
+            "total_matching_capabilities": len(raw_caps),
+            "capabilities_truncated": max(0, len(raw_caps) - len(compact_caps)),
+            "capabilities": compact_caps,
+        }
+
+    @mcp.tool()
+    async def reconqa_promote_capability_scenario(
+        project_id: str,
+        capability_key: str,
+        priority: str | None = None,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """Promote a Business Capability into a 5-case effectiveness Scenario (Happy Path + Invalid Params + Illegal State + AuthZ + Idempotency)."""
+        clean_key = (capability_key or "").strip()
+        if not clean_key:
+            raise ValueError("capability_key must not be empty.")
+
+        payload: dict[str, Any] = {"capability_key": clean_key}
+        if priority is not None and priority.strip():
+            payload["priority"] = priority.strip().upper()
+        if name is not None and name.strip():
+            payload["name"] = name.strip()
+
+        data = await client.request_json(
+            "POST",
+            f"/projects/{project_id}/capabilities/promote-scenario",
+            json_body=payload,
+        )
+        return {
+            "id": data.get("id"),
+            "project_id": data.get("project_id", project_id),
+            "slug": data.get("slug", ""),
+            "name": data.get("name", ""),
+            "priority": data.get("priority", "P2"),
+            "status": data.get("status", "active"),
+            "business_domain": data.get("business_domain", ""),
+            "source": data.get("source", "ai-agent"),
+            "endpoint_count": data.get("endpoint_count", 0),
+            "assertion_count": data.get("assertion_count", len(data.get("assertions") or [])),
+            "negative_case_count": data.get(
+                "negative_case_count", len(data.get("negative_cases") or [])
+            ),
+            "effectiveness_level": data.get("effectiveness_level", "L0"),
         }
 
     # --- 3 MCP Resources ---

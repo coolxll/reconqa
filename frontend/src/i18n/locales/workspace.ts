@@ -16,6 +16,8 @@ registerMessages({
     "ws.nav.exploreHint": "种子 cURL 与接口挖掘",
     "ws.nav.inventory": "API 资产库",
     "ws.nav.inventoryHint": "累计主 OpenAPI 与在线调试",
+    "ws.nav.capabilities": "业务能力",
+    "ws.nav.capabilitiesHint": "资源 × 动作 × 角色 × 状态机聚类",
     "ws.nav.scenarios": "业务场景",
     "ws.nav.scenariosHint": "优先级、断言规则与测试有效性",
     "ws.nav.runs": "测试运行",
@@ -36,6 +38,8 @@ registerMessages({
     "route.projectExplore.subtitle": "从种子 cURL 或域名发掘 OpenAPI 文档、JS 接口与子域资产",
     "route.projectInventory.title": "API 资产库",
     "route.projectInventory.subtitle": "聚合本项目历次运行与探索的接口全量清单，支持在线 Try It 调试",
+    "route.projectCapabilities.title": "业务能力图谱",
+    "route.projectCapabilities.subtitle": "按 资源 × 动作 × 角色 × 状态机 聚类压缩接口噪声，追踪 5 维质量覆盖并一键沉淀 5 用例场景",
     "route.projectScenarios.title": "业务场景",
     "route.projectScenarios.subtitle": "围绕业务流管理 P0–P3 优先级、结构化业务断言、异常边界与 L0–L4 测试有效性",
     "route.projectRuns.title": "测试运行",
@@ -319,6 +323,8 @@ registerMessages({
     "ws.nav.exploreHint": "Seed cURL & asset mining",
     "ws.nav.inventory": "API Inventory",
     "ws.nav.inventoryHint": "Master OpenAPI & Try It",
+    "ws.nav.capabilities": "Capabilities",
+    "ws.nav.capabilitiesHint": "Resource × Action × Role × State",
     "ws.nav.scenarios": "Scenarios",
     "ws.nav.scenariosHint": "Priority, assertions & effectiveness",
     "ws.nav.runs": "Runs",
@@ -342,6 +348,9 @@ registerMessages({
     "route.projectInventory.title": "API Inventory",
     "route.projectInventory.subtitle":
       "Cumulative Master OpenAPI catalog across runs & explorations with inline Try It replay",
+    "route.projectCapabilities.title": "Business Capabilities",
+    "route.projectCapabilities.subtitle":
+      "Cluster endpoints into Resource × Action × Role × State capabilities, track 5-dim QA coverage & promote 5-case scenarios",
     "route.projectScenarios.title": "Business Scenarios",
     "route.projectScenarios.subtitle":
       "Manage P0–P3 priorities, structured business assertions, negative edge cases & L0–L4 testing effectiveness",

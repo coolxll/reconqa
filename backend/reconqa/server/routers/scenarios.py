@@ -16,6 +16,8 @@ from sqlalchemy.orm import selectinload
 from reconqa.models.db import get_db
 from reconqa.models.schemas import (
     InventoryEndpoint,
+    ProjectCapabilityMapResponse,
+    PromoteCapabilityRequest,
     ScenarioAssertion,
     ScenarioCreateRequest,
     ScenarioDetailResponse,
@@ -27,8 +29,10 @@ from reconqa.models.schemas import (
     ScenarioUpdateRequest,
 )
 from reconqa.models.tables import Project, Run, ScenarioModel
+from reconqa.modules.hub.capability_map import build_capability_map
 from reconqa.modules.hub.inventory import build_project_inventory
 from reconqa.server.routers.explore import find_project_explores
+from reconqa.utils.io import slugify
 
 router = APIRouter(tags=["scenarios"])
 
@@ -722,3 +726,244 @@ async def delete_project_scenario(
     await db.delete(row)
     await db.commit()
     return {"deleted": True, "id": deleted_id, "slug": deleted_slug}
+
+
+# --- Business Capability Map & One-Click 5-Case Scenario Promotion ---
+
+
+@router.get("/projects/{project_id}/capabilities", response_model=ProjectCapabilityMapResponse)
+async def get_project_capabilities(
+    project_id: str,
+    module: str | None = Query(default=None),
+    role: str | None = Query(default=None),
+    live_only: bool = Query(default=False),
+    has_writes: bool = Query(default=False),
+    q: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Return Business Capability Map (Resource x Action x Role x State) + 5-dim QA metrics."""
+    project = await _get_project_or_404(db, project_id)
+    completed_runs, inventory = await _load_project_inventory_context(db, project)
+    await sync_project_scenarios(db, project_id, inventory=inventory)
+
+    res = await db.execute(select(ScenarioModel).where(ScenarioModel.project_id == project_id))
+    rows = list(res.scalars().all())
+    runs_by_id = {r.id: r for r in completed_runs}
+    enriched_scenarios = [
+        _enrich_scenario(row, inventory=inventory, runs_by_id=runs_by_id)[0] for row in rows
+    ]
+
+    cap_map = build_capability_map(
+        inventory=inventory,
+        scenarios=enriched_scenarios,
+        project_id=project.id,
+        project_name=project.name,
+    )
+
+    filtered_caps = cap_map["capabilities"]
+    if live_only:
+        filtered_caps = [c for c in filtered_caps if c["live_endpoints"] > 0]
+    if has_writes:
+        filtered_caps = [c for c in filtered_caps if c["write_endpoints"] > 0]
+    if module and module.strip():
+        want_mod = module.strip().lower()
+        filtered_caps = [c for c in filtered_caps if c["module"].lower() == want_mod]
+    if role and role.strip():
+        want_role = role.strip().lower()
+        filtered_caps = [
+            c for c in filtered_caps if any(r.lower() == want_role for r in c["roles"])
+        ]
+    if q and q.strip():
+        needle = q.strip().lower()
+        filtered_caps = [
+            c
+            for c in filtered_caps
+            if needle in c["key"].lower()
+            or needle in c["display_name"].lower()
+            or any(needle in a.lower() for a in c["actions"])
+            or any(needle in ep["path"].lower() for ep in c["endpoints"])
+        ]
+
+    return {
+        "project_id": cap_map["project_id"],
+        "project_name": cap_map["project_name"],
+        "metrics": cap_map["metrics"],
+        "modules": cap_map["modules"],
+        "capabilities": filtered_caps,
+    }
+
+
+@router.post(
+    "/projects/{project_id}/capabilities/promote-scenario",
+    response_model=ScenarioResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def promote_capability_to_scenario(
+    project_id: str,
+    body: PromoteCapabilityRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ScenarioResponse:
+    """Materialize a 5-case effectiveness Scenario for a Business Capability (idempotent)."""
+    project = await _get_project_or_404(db, project_id)
+    completed_runs, inventory = await _load_project_inventory_context(db, project)
+
+    res = await db.execute(select(ScenarioModel).where(ScenarioModel.project_id == project_id))
+    rows = list(res.scalars().all())
+    runs_by_id = {r.id: r for r in completed_runs}
+    enriched_scenarios = [
+        _enrich_scenario(row, inventory=inventory, runs_by_id=runs_by_id)[0] for row in rows
+    ]
+
+    cap_map = build_capability_map(
+        inventory=inventory,
+        scenarios=enriched_scenarios,
+        project_id=project.id,
+        project_name=project.name,
+    )
+    target_key = body.capability_key.strip().lower()
+    cap = next(
+        (c for c in cap_map["capabilities"] if c["key"].lower() == target_key),
+        None,
+    )
+    if cap is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Capability '{body.capability_key}' not found in project '{project_id}'",
+        )
+
+    cap_slug = normalize_scenario_slug(f"cap_{slugify(cap['key'])}")
+    existing_res = await db.execute(
+        select(ScenarioModel).where(
+            ScenarioModel.project_id == project_id,
+            ScenarioModel.slug == cap_slug,
+        )
+    )
+    existing = existing_res.scalar_one_or_none()
+    if existing is not None:
+        # Idempotent & non-destructive: preserve user-edited scenario fields on repeat calls
+        enriched, _, _ = _enrich_scenario(existing, inventory=inventory, runs_by_id=runs_by_id)
+        return enriched
+
+    # Pick representative primary endpoint (prefer har-live write, then har-live read, then first)
+    cap_eps = cap["endpoints"]
+    primary_ep = cap_eps[0] if cap_eps else {"method": "GET", "path": f"/{cap['key']}"}
+    primary_target = f"{primary_ep['method']} {primary_ep['path']}"
+    write_ep = next(
+        (e for e in cap_eps if e["method"] in {"POST", "PUT", "PATCH", "DELETE"}),
+        primary_ep,
+    )
+    write_target = f"{write_ep['method']} {write_ep['path']}"
+
+    roles_str = ", ".join(cap["roles"]) or "common"
+    actions_str = ", ".join(cap["actions"]) or "read"
+    statuses_lines = (
+        "\n".join(
+            f"- `{field}`: `{', '.join(vals)}`"
+            for field, vals in (cap["observed_statuses"] or {}).items()
+        )
+        if cap["observed_statuses"]
+        else "- (No status enum fields observed in HAR examples yet)"
+    )
+    ep_sample_lines = "\n".join(
+        f"- `{e['method']} {e['path']}` (`{e['role']}` · `{e['action']}` · `{e['discovery_source']}`)"
+        for e in cap_eps[:8]
+    )
+
+    description_md = f"""### Business Capability: `{cap['display_name']}`
+
+- **Actions**: `{actions_str}`
+- **Roles**: `{roles_str}`
+- **Endpoints**: `{cap['live_endpoints']} live / {cap['total_endpoints']} total ({cap['write_endpoints']} writes)`
+
+#### Observed State-Machine Enums
+{statuses_lines}
+
+#### Representative Endpoints
+{ep_sample_lines}
+
+#### 4-Class Verification Oracle Checklist
+1. **Schema Contract**: Validate response structure, field types, and non-null business payload.
+2. **HAR Baseline**: Compare live status codes and business success envelope against captured HARs.
+3. **Business Invariants**: Verify state enum legality, non-negative totals, and role scoping.
+4. **Cross-Resource Consistency**: Confirm mutations reflect consistently on subsequent detail/list reads.
+""".strip()
+
+    preconditions_txt = f"Authenticated test credentials available for role(s): {roles_str}."
+    scenario_name = (body.name or "").strip() or f"{cap['module']} / {cap['resource']} 核心能力验证"
+    scenario_priority = body.priority or cap["recommended_priority"]
+
+    seeded_assertions = [
+        ScenarioAssertion(
+            title=f"[Happy Path] {cap['display_name']} returns valid business payload",
+            target_endpoint=primary_target,
+            jsonpath="$.data",
+            operator="not_empty",
+            note="Verify primary capability endpoint returns non-empty business data payload.",
+            status="pending",
+        ),
+        ScenarioAssertion(
+            title=f"[Invariant] {cap['display_name']} state & cross-resource consistency",
+            target_endpoint=write_target,
+            jsonpath="",
+            operator="custom",
+            note=(
+                f"Verify state transition & read-after-write consistency across actions ({actions_str})."
+            ),
+            status="pending",
+        ),
+    ]
+
+    seeded_negative_cases = [
+        ScenarioNegativeCase(
+            title=f"[Invalid Params] Reject missing/malformed inputs on {write_target}",
+            category="validation",
+            expected_behavior="Returns HTTP 400 or business validation error without 5xx.",
+            status="pending",
+        ),
+        ScenarioNegativeCase(
+            title=f"[Illegal State] Block invalid state transition on {cap['display_name']}",
+            category="state_machine",
+            expected_behavior="Disallowed status transition is rejected cleanly without mutating state.",
+            status="pending",
+        ),
+        ScenarioNegativeCase(
+            title=f"[AuthZ / Role] Verify cross-role BFLA/IDOR isolation ({roles_str})",
+            category="auth",
+            expected_behavior="Anonymous and unauthorized roles receive 401/403 or business denial code.",
+            status="pending",
+        ),
+        ScenarioNegativeCase(
+            title=f"[Idempotency] Verify duplicate submission safety on {write_target}",
+            category="idempotency",
+            expected_behavior="Replaying identical mutation does not create duplicate records or double charges.",
+            status="pending",
+        ),
+    ]
+
+    tags = list(dict.fromkeys([cap["module"], cap["resource"], *cap["roles"]]))
+    now = datetime.now(UTC)
+    row = ScenarioModel(
+        project_id=project_id,
+        slug=cap_slug,
+        name=scenario_name,
+        description=description_md,
+        preconditions=preconditions_txt,
+        business_domain=cap["module"],
+        priority=scenario_priority,
+        status="active",
+        owner="",
+        source="ai-agent",
+        tags_json=json.dumps(tags, ensure_ascii=False),
+        assertions_json=json.dumps([a.model_dump() for a in seeded_assertions], ensure_ascii=False),
+        negative_cases_json=json.dumps(
+            [nc.model_dump() for nc in seeded_negative_cases], ensure_ascii=False
+        ),
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+
+    enriched, _, _ = _enrich_scenario(row, inventory=inventory, runs_by_id=runs_by_id)
+    return enriched

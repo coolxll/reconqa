@@ -867,6 +867,103 @@ export interface AcceptancePromptResponse {
   context_summary: AcceptancePromptContextSummary;
 }
 
+// --- Business Capability Map (Resource x Action x Role x State) ---
+
+export type CapabilitySlotName =
+  | "happy_path"
+  | "invalid_params"
+  | "illegal_state"
+  | "authz_role"
+  | "consistency_idempotency";
+
+export type CapabilitySlotStatusValue = "covered" | "pending" | "failed" | "missing";
+
+export interface CapabilitySlotStatus {
+  slot: CapabilitySlotName;
+  status: CapabilitySlotStatusValue;
+  count: number;
+}
+
+export interface CapabilityEndpointRef {
+  method: string;
+  path: string;
+  action: string;
+  role: string;
+  discovery_source: string;
+  host?: string | null;
+}
+
+export interface CapabilityScenarioRef {
+  id: string;
+  slug: string;
+  name: string;
+  priority: ScenarioPriority;
+  effectiveness_level?: string;
+}
+
+export interface BusinessCapability {
+  key: string;
+  module: string;
+  resource: string;
+  display_name: string;
+  total_endpoints: number;
+  live_endpoints: number;
+  write_endpoints: number;
+  read_endpoints: number;
+  live_pct: number;
+  roles: string[];
+  actions: string[];
+  observed_statuses: Record<string, string[]>;
+  has_state_machine: boolean;
+  priority_score: number;
+  recommended_priority: ScenarioPriority;
+  linked_scenarios: CapabilityScenarioRef[];
+  case_matrix: CapabilitySlotStatus[];
+  case_coverage_pct: number;
+  endpoints: CapabilityEndpointRef[];
+}
+
+export interface CapabilityQualityMetrics {
+  total_endpoints: number;
+  total_capabilities: number;
+  live_capabilities: number;
+  target_capabilities: number;
+  capability_coverage_pct: number;
+  stateful_capabilities: number;
+  state_transition_covered: number;
+  state_coverage_pct: number;
+  role_matrix_cells_total: number;
+  role_matrix_cells_covered: number;
+  role_matrix_coverage_pct: number;
+  negative_slots_total: number;
+  negative_slots_tested: number;
+  negative_coverage_pct: number;
+  invariant_assertions_total: number;
+  invariant_assertions_passed: number;
+  invariant_pass_rate_pct: number;
+}
+
+export interface CapabilityModuleSummary {
+  module: string;
+  capabilities: number;
+  live_capabilities: number;
+  endpoints: number;
+}
+
+export interface ProjectCapabilityMapResponse {
+  project_id: string;
+  project_name: string;
+  metrics: CapabilityQualityMetrics;
+  modules: CapabilityModuleSummary[];
+  capabilities: BusinessCapability[];
+}
+
+export interface PromoteCapabilityRequest {
+  capability_key: string;
+  priority?: ScenarioPriority;
+  name?: string;
+}
+
 // --- SSE Events ---
 
 export interface SseRunEvent {

@@ -388,6 +388,104 @@ class ScenarioListResponse(BaseModel):
     scenarios: list[ScenarioResponse] = Field(default_factory=list)
 
 
+# --- Business Capability Map (Resource x Action x Role x State) DTOs ---
+
+CapabilitySlotName = Literal[
+    "happy_path",
+    "invalid_params",
+    "illegal_state",
+    "authz_role",
+    "consistency_idempotency",
+]
+CapabilitySlotState = Literal["covered", "pending", "failed", "missing"]
+
+
+class CapabilitySlotStatus(BaseModel):
+    slot: CapabilitySlotName
+    status: CapabilitySlotState = "missing"
+    count: int = 0
+
+
+class CapabilityEndpointRef(BaseModel):
+    method: str
+    path: str
+    action: str
+    role: str
+    discovery_source: str
+    host: str = ""
+
+
+class CapabilityScenarioRef(BaseModel):
+    id: str
+    slug: str
+    name: str
+    priority: str = "P2"
+    effectiveness_level: str = "L0"
+
+
+class BusinessCapability(BaseModel):
+    key: str
+    module: str
+    resource: str
+    display_name: str
+    total_endpoints: int = 0
+    live_endpoints: int = 0
+    write_endpoints: int = 0
+    read_endpoints: int = 0
+    live_pct: float = 0.0
+    roles: list[str] = Field(default_factory=list)
+    actions: list[str] = Field(default_factory=list)
+    observed_statuses: dict[str, list[str]] = Field(default_factory=dict)
+    has_state_machine: bool = False
+    priority_score: float = 0.0
+    recommended_priority: ScenarioPriority = "P2"
+    linked_scenarios: list[CapabilityScenarioRef] = Field(default_factory=list)
+    case_matrix: list[CapabilitySlotStatus] = Field(default_factory=list)
+    case_coverage_pct: float = 0.0
+    endpoints: list[CapabilityEndpointRef] = Field(default_factory=list)
+
+
+class CapabilityQualityMetrics(BaseModel):
+    total_endpoints: int = 0
+    total_capabilities: int = 0
+    live_capabilities: int = 0
+    target_capabilities: int = 0
+    capability_coverage_pct: float = 0.0
+    stateful_capabilities: int = 0
+    state_transition_covered: int = 0
+    state_coverage_pct: float = 0.0
+    role_matrix_cells_total: int = 0
+    role_matrix_cells_covered: int = 0
+    role_matrix_coverage_pct: float = 0.0
+    negative_slots_total: int = 0
+    negative_slots_tested: int = 0
+    negative_coverage_pct: float = 0.0
+    invariant_assertions_total: int = 0
+    invariant_assertions_passed: int = 0
+    invariant_pass_rate_pct: float = 0.0
+
+
+class CapabilityModuleSummary(BaseModel):
+    module: str
+    capabilities: int = 0
+    live_capabilities: int = 0
+    endpoints: int = 0
+
+
+class ProjectCapabilityMapResponse(BaseModel):
+    project_id: str
+    project_name: str
+    metrics: CapabilityQualityMetrics
+    modules: list[CapabilityModuleSummary] = Field(default_factory=list)
+    capabilities: list[BusinessCapability] = Field(default_factory=list)
+
+
+class PromoteCapabilityRequest(BaseModel):
+    capability_key: str = Field(..., min_length=1, max_length=255)
+    priority: ScenarioPriority | None = None
+    name: str | None = Field(default=None, max_length=255)
+
+
 # --- Autonomous External-System Acceptance Glue DTOs ---
 
 

@@ -16,13 +16,16 @@ import type {
   KnowledgeDocType,
   KnowledgeDocUpdate,
   Project,
+  ProjectCapabilityMapResponse,
   ProjectCreate,
   ProjectInventoryResponse,
   ProjectUpdate,
+  PromoteCapabilityRequest,
   ReplayMatrixRequest,
   ReplayMatrixResponse,
   ReplayRequest,
   ReplayResponse,
+  ScenarioItem,
   Target,
   TargetCreate,
   TargetUpdate,
@@ -250,6 +253,44 @@ export function getProjectInventory(projectId: string): Promise<ProjectInventory
 
 export function getProjectInventoryOpenApiUrl(projectId: string): string {
   return `${API_BASE}/projects/${encodeURIComponent(projectId)}/inventory/openapi.json`;
+}
+
+// --- Business Capability Map ---
+
+export interface CapabilityMapFilters {
+  module?: string;
+  role?: string;
+  live_only?: boolean;
+  has_writes?: boolean;
+  q?: string;
+}
+
+export function getProjectCapabilities(
+  projectId: string,
+  params?: CapabilityMapFilters
+): Promise<ProjectCapabilityMapResponse> {
+  const search = new URLSearchParams();
+  if (params?.module && params.module !== "ALL") search.set("module", params.module);
+  if (params?.role && params.role !== "ALL") search.set("role", params.role);
+  if (params?.live_only) search.set("live_only", "true");
+  if (params?.has_writes) search.set("has_writes", "true");
+  if (params?.q && params.q.trim()) search.set("q", params.q.trim());
+  const qs = search.toString();
+  const base = `/projects/${encodeURIComponent(projectId)}/capabilities`;
+  return apiFetch<ProjectCapabilityMapResponse>(qs ? `${base}?${qs}` : base);
+}
+
+export function promoteCapabilityToScenario(
+  projectId: string,
+  payload: PromoteCapabilityRequest
+): Promise<ScenarioItem> {
+  return apiFetch<ScenarioItem>(
+    `/projects/${encodeURIComponent(projectId)}/capabilities/promote-scenario`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
 }
 
 export function replayEndpoint(

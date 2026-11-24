@@ -155,7 +155,7 @@ If your team runs ReconQA on an internal QA server (e.g. `http://qa-reconqa.exam
 
 ## 4. MCP Tools & Resources Reference
 
-### Tools (17)
+### Tools (19)
 
 | Tool | Key Parameters | Purpose |
 |---|---|---|
@@ -171,6 +171,8 @@ If your team runs ReconQA on an internal QA server (e.g. `http://qa-reconqa.exam
 | `reconqa_get_run_summary` | `run_id` | Return run status, jobs, `summary_metrics`, coverage %, correlation chain count, available artifacts, and resource URIs. |
 | `reconqa_list_findings` | `run_id`, `category=None`, `severity=None`, `limit=30` | Return severity-sorted findings with bounded evidence payloads (max 100 per call). |
 | `reconqa_get_project_inventory` | `project_id`, `source=None`, `prefix=None`, `limit=80` | Fetch the project's cumulative Master API Inventory (`total_endpoints`, `har_live_count`, `js_static_count`, `coverage_pct`, `by_prefix`, `scenarios`, and filtered endpoints). |
+| `reconqa_get_capability_map` | `project_id`, `live_only=True`, `module=None`, `role=None`, `has_writes=False`, `limit=30` | Fetch the synthesized Business Capability Map (`Resource × Action × Role × State`) with 5-dimensional QA metrics, module breakdown, observed state enums, 5-slot case matrix, and up to 8 sample endpoint paths per capability. |
+| `reconqa_promote_capability_scenario` | `project_id`, `capability_key`, `priority=None`, `name=None` | Materialize a 5-case effectiveness `Scenario` (Happy Path + Invalid Params + Illegal State + AuthZ/Role + Consistency/Idempotency) for a capability cleanly and idempotently. |
 | `reconqa_list_scenarios` | `project_id`, `priority=None`, `effectiveness_level=None` | List first-class business scenarios with `p0_p1_effective_pct`, `by_priority`, `by_effectiveness`, and per-scenario `L0`–`L4` effectiveness status. |
 | `reconqa_upsert_scenario` | `project_id`, `slug`, `name=None`, `description=None`, `preconditions=None`, `business_domain=None`, `priority=None`, `status=None`, `owner=None`, `tags=None`, `assertions=None`, `negative_cases=None` | Upsert a business scenario (`source="ai-agent"`) with priority, business description, structured JSONPath assertions, and negative/edge test checklists. |
 | `reconqa_extract_credential` | `project_id`, `run_id=None`, `name=None`, `role_tag="account_a"` | Auto-extract auth headers from a run's HAR into a project `AuthProfile` and return `{ profile_id, name, role_tag, extracted_header_names, source_run_id, source_host }` without echoing raw secrets. |
@@ -211,8 +213,8 @@ Pair a browser-capable AI agent with ReconQA's scenario proxy (or browser HAR re
    - The new run appears immediately in the Vue 3 Web Console, ready for on-demand **Java TestNG+Allure (`java_gen`)**, **Performance & k6 (`perf`)**, or **Security & IDOR (`security`)** via `reconqa_execute_run_modules` or the Web UI tabs.
 5. **Autonomous 0->1 External-System Acceptance Loop (Beyond HTTP 200)**:
    - Extract session credentials from the ingested HAR without exposing tokens to the LLM via `reconqa_extract_credential(project_id, run_id=...)` -> returns `profile_id` and header names only.
-   - Read Project Knowledge Base PRDs (`reconqa://projects/{project_id}/knowledge`), inspect cumulative Master API Inventory (`reconqa_get_project_inventory`), and call `reconqa_list_scenarios(project_id)` to spot `P0`/`P1` scenarios stuck at `L0`/`L1`/`L2`.
-   - Call `reconqa_upsert_scenario(project_id, slug=..., priority="P0", assertions=[...], negative_cases=[...])` to persist structured JSONPath business assertions and negative/edge checklists, and spot-check endpoints safely with `reconqa_replay_endpoint(project_id, ..., credential_id=profile_id)`.
+   - Start with `reconqa_get_capability_map(project_id, live_only=True)` to compress hundreds/thousands of endpoints into prioritized business capabilities (`Resource × Action × Role × State`) with 5-dimensional QA metrics, then call `reconqa_promote_capability_scenario(project_id, capability_key=...)` to materialize the 5 canonical cases (**Happy Path + Invalid Params + Illegal State + AuthZ/Role + Consistency/Idempotency**).
+   - Read Project Knowledge Base PRDs (`reconqa://projects/{project_id}/knowledge`), inspect `reconqa_list_scenarios(project_id)`, refine domain assertions with `reconqa_upsert_scenario(...)`, and spot-check endpoints safely via `reconqa_replay_endpoint(project_id, ..., credential_id=profile_id)`.
    - Execute real external verifiers with `reconqa_run_external_tool(project_id, run_id, tool="java_test" | "schemathesis" | "nuclei" | "k6", credential_id=profile_id, sync_scenarios=True)` so pass/fail results automatically sync back into Scenario `L0`–`L4` effectiveness scores in the Web Console!
 
 ---

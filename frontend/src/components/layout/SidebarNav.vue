@@ -4,6 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import {
   Activity,
   BookOpen,
+  Boxes,
   Check,
   ChevronsUpDown,
   Compass,
@@ -119,6 +120,13 @@ const workspaceNavItems = computed(() => [
     label: t("ws.nav.inventory"),
     hint: t("ws.nav.inventoryHint"),
     icon: Layers,
+  },
+  {
+    section: "capabilities" as WorkspaceSection,
+    to: workspacePath("capabilities"),
+    label: t("ws.nav.capabilities"),
+    hint: t("ws.nav.capabilitiesHint"),
+    icon: Boxes,
   },
   {
     section: "scenarios" as WorkspaceSection,

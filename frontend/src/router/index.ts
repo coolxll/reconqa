@@ -6,6 +6,7 @@ import { useWorkspace, type WorkspaceSection } from "@/stores/workspace";
 const LEGACY_REDIRECT_MAP: Record<string, WorkspaceSection> = {
   "legacy-overview": "overview",
   "legacy-explore": "explore",
+  "legacy-capabilities": "capabilities",
   "legacy-scenarios": "scenarios",
   "legacy-runs": "runs",
   "legacy-trends": "trends",
@@ -26,6 +27,15 @@ const router = createRouter({
       name: "legacy-explore",
       component: () => import("@/views/ExploreView.vue"),
       meta: { titleKey: "route.projectExplore.title", subtitleKey: "route.projectExplore.subtitle" },
+    },
+    {
+      path: "/capabilities",
+      name: "legacy-capabilities",
+      component: () => import("@/views/CapabilitiesView.vue"),
+      meta: {
+        titleKey: "route.projectCapabilities.title",
+        subtitleKey: "route.projectCapabilities.subtitle",
+      },
     },
     {
       path: "/scenarios",
@@ -112,6 +122,16 @@ const router = createRouter({
         titleKey: "route.projectInventory.title",
         subtitleKey: "route.projectInventory.subtitle",
         workspaceSection: "inventory",
+      },
+    },
+    {
+      path: "/p/:projectId/capabilities",
+      name: "workspace-capabilities",
+      component: () => import("@/views/CapabilitiesView.vue"),
+      meta: {
+        titleKey: "route.projectCapabilities.title",
+        subtitleKey: "route.projectCapabilities.subtitle",
+        workspaceSection: "capabilities",
       },
     },
     {

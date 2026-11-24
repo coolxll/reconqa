@@ -1,4 +1,4 @@
-"""Integration tests for ReconQA MCP Server (17 tools & 3 resources via FastAPI & mocks)."""
+"""Integration tests for ReconQA MCP Server (19 tools & 3 resources via FastAPI & mocks)."""
 
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ EXPECTED_TOOLS = {
     "reconqa_extract_credential",
     "reconqa_replay_endpoint",
     "reconqa_run_external_tool",
+    "reconqa_get_capability_map",
+    "reconqa_promote_capability_scenario",
 }
 
 EXPECTED_RESOURCE_TEMPLATES = {
@@ -775,3 +777,201 @@ async def test_mcp_upsert_scenario_omits_name_when_unspecified() -> None:
     )
     assert "name" not in sent_bodies[1]
     assert res_blank["name"] == existing_custom_name
+
+
+@pytest.mark.asyncio
+async def test_mcp_capability_map_and_promote_tools_mocked() -> None:
+    """Verify reconqa_get_capability_map and reconqa_promote_capability_scenario via mocks."""
+    captured: list[tuple[str, str, dict[str, str], Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        captured.append(
+            (request.method, request.url.path, dict(request.url.params), body)
+        )
+
+        if request.method == "GET" and request.url.path == "/api/v1/projects/proj_1/capabilities":
+            ten_endpoints = [
+                {"method": "GET", "path": f"/api/v1/orders/item-{i}", "role": "admin", "action": "read"}
+                for i in range(10)
+            ]
+            return httpx.Response(
+                200,
+                json={
+                    "project_id": "proj_1",
+                    "project_name": "Demo Commerce",
+                    "metrics": {
+                        "total_endpoints": 120,
+                        "total_capabilities": 18,
+                        "live_capabilities": 12,
+                        "target_capabilities": 18,
+                        "capability_coverage_pct": 66.7,
+                        "stateful_capabilities": 6,
+                        "state_transition_covered": 3,
+                        "state_coverage_pct": 50.0,
+                        "role_matrix_cells_total": 24,
+                        "role_matrix_cells_covered": 12,
+                        "role_matrix_coverage_pct": 50.0,
+                        "negative_slots_total": 48,
+                        "negative_slots_tested": 12,
+                        "negative_coverage_pct": 25.0,
+                        "invariant_assertions_total": 10,
+                        "invariant_assertions_passed": 8,
+                        "invariant_pass_rate_pct": 80.0,
+                    },
+                    "modules": [
+                        {"module": "orders", "total_capabilities": 5, "live_capabilities": 4},
+                        {"module": "billing", "total_capabilities": 3, "live_capabilities": 2},
+                    ],
+                    "capabilities": [
+                        {
+                            "key": "orders/order",
+                            "module": "orders",
+                            "resource": "order",
+                            "display_name": "orders / order",
+                            "recommended_priority": "P0",
+                            "priority_score": 95,
+                            "live_endpoints": 8,
+                            "total_endpoints": 10,
+                            "write_endpoints": 4,
+                            "roles": ["admin", "buyer"],
+                            "actions": ["create", "audit", "refund", "list"],
+                            "observed_statuses": {"orderStatus": [0, 1, 2, 5]},
+                            "case_matrix": {
+                                "happy_path": "covered",
+                                "invalid_params": "pending",
+                                "illegal_state": "missing",
+                                "authz_role": "missing",
+                                "consistency_idempotency": "missing",
+                            },
+                            "case_coverage_pct": 20.0,
+                            "linked_scenarios": [],
+                            "endpoints": ten_endpoints,
+                        },
+                        {
+                            "key": "billing/invoice",
+                            "module": "billing",
+                            "resource": "invoice",
+                            "display_name": "billing / invoice",
+                            "recommended_priority": "P1",
+                            "priority_score": 70,
+                            "live_endpoints": 4,
+                            "total_endpoints": 5,
+                            "write_endpoints": 2,
+                            "roles": ["admin"],
+                            "actions": ["create", "detail"],
+                            "observed_statuses": {"status": ["draft", "paid"]},
+                            "case_matrix": {
+                                "happy_path": "pending",
+                                "invalid_params": "missing",
+                                "illegal_state": "missing",
+                                "authz_role": "missing",
+                                "consistency_idempotency": "missing",
+                            },
+                            "case_coverage_pct": 0.0,
+                            "linked_scenarios": [],
+                            "endpoints": [
+                                {"method": "POST", "path": "/api/v1/billing/invoice"},
+                            ],
+                        },
+                    ],
+                },
+            )
+
+        if (
+            request.method == "POST"
+            and request.url.path == "/api/v1/projects/proj_1/capabilities/promote-scenario"
+        ):
+            return httpx.Response(
+                201,
+                json={
+                    "id": "sc_cap_1",
+                    "project_id": "proj_1",
+                    "slug": "cap_orders_order",
+                    "name": body.get("name") or "orders / order Core Capability",
+                    "priority": body.get("priority") or "P0",
+                    "status": "active",
+                    "business_domain": "orders",
+                    "source": "ai-agent",
+                    "endpoint_count": 10,
+                    "assertion_count": 2,
+                    "negative_case_count": 4,
+                    "effectiveness_level": "L3",
+                },
+            )
+
+        return httpx.Response(404, json={"detail": f"Unhandled mock route: {request.url}"})
+
+    mcp = create_mcp_server("http://127.0.0.1:8000", transport=httpx.MockTransport(handler))
+
+    # 1. reconqa_get_capability_map forwards filters and bounds both capabilities & sample endpoints
+    cap_map = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_get_capability_map",
+            {
+                "project_id": "proj_1",
+                "live_only": True,
+                "module": "orders",
+                "role": "Admin",
+                "has_writes": True,
+                "limit": 1,
+            },
+        )
+    )
+    assert cap_map["metrics"]["capability_coverage_pct"] == 66.7
+    assert cap_map["metrics"]["state_coverage_pct"] == 50.0
+    assert len(cap_map["modules"]) == 2
+    assert cap_map["total_matching_capabilities"] == 2
+    assert cap_map["capabilities_truncated"] == 1
+    assert len(cap_map["capabilities"]) == 1
+
+    top_cap = cap_map["capabilities"][0]
+    assert top_cap["key"] == "orders/order"
+    assert top_cap["recommended_priority"] == "P0"
+    assert top_cap["observed_statuses"] == {"orderStatus": [0, 1, 2, 5]}
+    assert top_cap["case_matrix"]["happy_path"] == "covered"
+    assert len(top_cap["sample_endpoints"]) == 8
+    assert top_cap["endpoints_truncated"] == 2
+    assert top_cap["sample_endpoints"][0] == "GET /api/v1/orders/item-0"
+
+    # 2. reconqa_promote_capability_scenario materializes 5-case effectiveness Scenario
+    promoted = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_promote_capability_scenario",
+            {
+                "project_id": "proj_1",
+                "capability_key": "orders/order",
+                "priority": "p0",
+                "name": "Order Lifecycle 5-Case Verification",
+            },
+        )
+    )
+    assert promoted["id"] == "sc_cap_1"
+    assert promoted["slug"] == "cap_orders_order"
+    assert promoted["name"] == "Order Lifecycle 5-Case Verification"
+    assert promoted["priority"] == "P0"
+    assert promoted["assertion_count"] == 2
+    assert promoted["negative_case_count"] == 4
+    assert promoted["effectiveness_level"] == "L3"
+
+    assert captured[0] == (
+        "GET",
+        "/api/v1/projects/proj_1/capabilities",
+        {
+            "live_only": "true",
+            "has_writes": "true",
+            "module": "orders",
+            "role": "admin",
+        },
+        None,
+    )
+    assert captured[1] == (
+        "POST",
+        "/api/v1/projects/proj_1/capabilities/promote-scenario",
+        {},
+        {
+            "capability_key": "orders/order",
+            "priority": "P0",
+            "name": "Order Lifecycle 5-Case Verification",
+        },
+    )

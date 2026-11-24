@@ -12,6 +12,7 @@ export type WorkspaceSection =
   | "overview"
   | "explore"
   | "inventory"
+  | "capabilities"
   | "scenarios"
   | "runs"
   | "kb"
@@ -107,6 +108,7 @@ function resolveSectionFromRoute(route?: RouteLocationNormalizedLoaded): Workspa
   const name = String(route?.name || "");
   if (name === "project-explore") return "explore";
   if (name === "project-inventory") return "inventory";
+  if (name === "workspace-capabilities") return "capabilities";
   if (name === "workspace-scenarios") return "scenarios";
   if (name === "project-runs" || name === "project-run-detail") return "runs";
   if (name === "project-kb") return "kb";
