@@ -87,6 +87,8 @@ DEFAULT_SKIP_EXTENSIONS: tuple[str, ...] = (
     ".otf",
     ".mp4",
     ".mp3",
+    ".gif",
+    ".mp4",
     ".webm",
     ".pdf",
     ".webp",
@@ -106,6 +108,7 @@ DEFAULT_SKIP_PREFIXES: tuple[str, ...] = (
     "/img/",
     "/fonts/",
     "/icons/",
+    "/css/",
     "/node_modules/",
 )
 
@@ -156,7 +159,24 @@ JS_RESERVED_KEYS: set[str] = {
 
 HTTP_CLIENT_CALL_RE = re.compile(
     r"""(?:\.(?:get|post|put|delete|patch)|fetch|axios|request)\s*\(\s*"""
-    r"""(?:\{\s*url\s*:\s*)?(['"`])(?P<path>/[A-Za-z0-9_./:${}-]{3,140}(?:\?[^'"`]{0,120})?)\1""",
+    r"""(?:\{\s*url\s*:\s*)?(['"`])(?P<path>/[A-Za-z0-9_./:${}-]{3,140}(?:\?[^'"`\s]{0,120})?)\1""",
+    re.IGNORECASE,
+)
+
+# Context-aware generic HTTP client patterns (Axios config objects, XHR, chained method calls)
+AXIOS_URL_PROP_RE = re.compile(
+    r"""\burl\s*:\s*(['"`])(?P<path>/[A-Za-z0-9_./:${}-]{3,140}(?:\?[^'"`\s]{0,120})?)\1""",
+)
+
+XHR_OPEN_RE = re.compile(
+    r"""\.open\s*\(\s*['"](?P<method>GET|POST|PUT|DELETE|PATCH)['"]\s*,\s*"""
+    r"""(['"`])(?P<path>(?:https?://[^'"`\s]{4,180}|/[A-Za-z0-9_./:${}-]{2,140})(?:\?[^'"`\s]{0,120})?)\2""",
+    re.IGNORECASE,
+)
+
+METHOD_CALL_RE = re.compile(
+    r"""\.(?P<method>get|post|put|delete|patch)\s*\(\s*"""
+    r"""(['"`])(?P<path>/[A-Za-z0-9_./:${}-]{3,140}(?:\?[^'"`\s]{0,120})?)\2""",
     re.IGNORECASE,
 )
 
@@ -379,13 +399,22 @@ def analyze_js_call_context(
     }
 
 
-def _normalize_js_path(raw: str) -> tuple[str | None, list[str]]:
-    """Normalize a raw JS API path/URL into an OpenAPI path template + inline query keys."""
+def _normalize_js_path(
+    raw: str,
+    *,
+    allow_single_segment: bool = False,
+) -> tuple[str | None, list[str], str | None]:
+    """Normalize a raw JS API path/URL into (openapi_path, inline_query_keys, full_url)."""
     s = raw.strip()
+    if any(ch.isspace() for ch in s):
+        return None, [], None
+    full_url: str | None = None
     if s.startswith(("http://", "https://")):
         parsed = urlparse(s)
         path_part = parsed.path or ""
         query_part = parsed.query or ""
+        if parsed.netloc:
+            full_url = f"{parsed.scheme}://{parsed.netloc}{path_part}"
     else:
         if "?" in s:
             path_part, query_part = s.split("?", 1)
@@ -405,17 +434,17 @@ def _normalize_js_path(raw: str) -> tuple[str | None, list[str]]:
 
     # Reject malformed colons that are not path params (e.g. "http:" or "data:")
     if ":" in path_part and not re.search(r"/:[A-Za-z_][A-Za-z0-9_]*", path_part):
-        return None, []
+        return None, [], None
     path_part = re.sub(r"/:([A-Za-z_][A-Za-z0-9_]*)", r"/{\1}", path_part)
     path_part = re.sub(r"/{2,}", "/", path_part)
     if len(path_part) > 1:
         path_part = path_part.rstrip("/")
 
     if not path_part.startswith("/") or len(path_part) <= 3:
-        return None, []
-    if path_part.count("/") < 2:
-        return None, []
-    return path_part, query_keys
+        return None, [], None
+    if not allow_single_segment and path_part.count("/") < 2:
+        return None, [], None
+    return path_part, query_keys, full_url
 
 
 def _build_api_pattern(
@@ -484,14 +513,39 @@ def extract_js_endpoints(
             continue
         files_scanned += 1
 
-        matches: list[tuple[str, int, int]] = []
+        # (raw_val, match_start, match_end, explicit_method_hint, allow_single_segment)
+        matches: list[tuple[str, int, int, str | None, bool]] = []
         for m in api_pat.finditer(code):
-            matches.append((m.group("raw"), m.start(), m.end()))
+            matches.append((m.group("raw"), m.start(), m.end(), None, False))
         for m in HTTP_CLIENT_CALL_RE.finditer(code):
-            matches.append((m.group("path"), m.start("path") - 1, m.end("path") + 1))
+            matches.append((m.group("path"), m.start("path") - 1, m.end("path") + 1, None, False))
+        for m in AXIOS_URL_PROP_RE.finditer(code):
+            matches.append((m.group("path"), m.start("path") - 1, m.end("path") + 1, None, False))
+        for m in METHOD_CALL_RE.finditer(code):
+            matches.append(
+                (
+                    m.group("path"),
+                    m.start("path") - 1,
+                    m.end("path") + 1,
+                    m.group("method").upper(),
+                    True,
+                )
+            )
+        for m in XHR_OPEN_RE.finditer(code):
+            matches.append(
+                (
+                    m.group("path"),
+                    m.start("path") - 1,
+                    m.end("path") + 1,
+                    m.group("method").upper(),
+                    True,
+                )
+            )
 
-        for raw_val, m_start, m_end in matches:
-            oa_path, inline_qkeys = _normalize_js_path(raw_val)
+        for raw_val, m_start, m_end, explicit_method, allow_single in matches:
+            oa_path, inline_qkeys, full_url = _normalize_js_path(
+                raw_val, allow_single_segment=allow_single
+            )
             if not oa_path:
                 continue
             low = oa_path.lower()
@@ -501,6 +555,9 @@ def extract_js_endpoints(
                 continue
 
             ctx = analyze_js_call_context(code, m_start, m_end, oa_path)
+            eff_method = explicit_method or ctx["method"]
+            eff_explicit = bool(explicit_method or ctx["method_explicit"])
+
             all_req_keys = list(ctx["req_keys"])
             for qk in inline_qkeys:
                 if qk not in all_req_keys:
@@ -510,8 +567,9 @@ def extract_js_endpoints(
                 oa_path,
                 {
                     "path": oa_path,
-                    "method": ctx["method"],
-                    "method_explicit": ctx["method_explicit"],
+                    "url": full_url,
+                    "method": eff_method,
+                    "method_explicit": eff_explicit,
                     "req_keys": [],
                     "resp_keys": [],
                     "sources": set(),
@@ -519,8 +577,10 @@ def extract_js_endpoints(
                 },
             )
             rec["sources"].add(js_file.name)
-            if ctx["method_explicit"] and not rec["method_explicit"]:
-                rec["method"] = ctx["method"]
+            if full_url and not rec.get("url"):
+                rec["url"] = full_url
+            if eff_explicit and not rec["method_explicit"]:
+                rec["method"] = eff_method
                 rec["method_explicit"] = True
             for k in all_req_keys:
                 if k not in rec["req_keys"]:
@@ -545,20 +605,21 @@ def extract_js_endpoints(
             path_only_count += 1
 
         path_params = re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", oa_path)
-        endpoints_out.append(
-            {
-                "path": oa_path,
-                "method": rec["method"],
-                "discovery_source": source_tier,
-                "x-discovery-source": source_tier,
-                "req_keys": rec["req_keys"][:20],
-                "resp_keys": rec["resp_keys"][:12],
-                "path_params": path_params,
-                "sources": sorted(rec["sources"]),
-                "snippet": rec["snippet"],
-                "x-js-snippet": rec["snippet"],
-            }
-        )
+        ep_item: dict[str, Any] = {
+            "path": oa_path,
+            "method": rec["method"],
+            "discovery_source": source_tier,
+            "x-discovery-source": source_tier,
+            "req_keys": rec["req_keys"][:20],
+            "resp_keys": rec["resp_keys"][:12],
+            "path_params": path_params,
+            "sources": sorted(rec["sources"]),
+            "snippet": rec["snippet"],
+            "x-js-snippet": rec["snippet"],
+        }
+        if rec.get("url"):
+            ep_item["url"] = rec["url"]
+        endpoints_out.append(ep_item)
 
     payload: dict[str, Any] = {
         "js_dir": str(js_dir),

@@ -36,6 +36,9 @@ class Project(Base):
         back_populates="project", cascade="all, delete-orphan"
     )
     runs: Mapped[list[Run]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    knowledge_docs: Mapped[list[KnowledgeDoc]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
 
 
 class Target(Base):
@@ -125,3 +128,28 @@ class Artifact(Base):
     sha256: Mapped[str] = mapped_column(String(64), default="")
 
     run: Mapped[Run] = relationship(back_populates="artifacts")
+
+
+class KnowledgeDoc(Base):
+    __tablename__ = "knowledge_docs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(255))
+    doc_type: Mapped[str] = mapped_column(String(32), default="prd", index=True)
+    source_kind: Mapped[str] = mapped_column(String(32), default="markdown")
+    content: Mapped[str] = mapped_column(Text, default="")
+    file_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    original_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    external_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    related_endpoints: Mapped[list[str]] = mapped_column(JSON, default=list)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    project: Mapped[Project] = relationship(back_populates="knowledge_docs")

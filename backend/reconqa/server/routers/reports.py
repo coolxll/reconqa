@@ -1,20 +1,259 @@
-"""Findings, security/performance reports, and historical project trend endpoints."""
+"""Findings, security/performance/Java reports, system doctor, and project trends."""
 
 from __future__ import annotations
 
+import csv
+import re
+import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from reconqa.config import doctor_check, settings
 from reconqa.models.db import get_db
 from reconqa.models.schemas import FindingOut
 from reconqa.models.tables import Finding, Project, Run
 from reconqa.utils.io import read_json, read_jsonl
+from reconqa.utils.proc import run_cmd_async
 
 router = APIRouter(tags=["reports"])
+
+_PD_AUTO_TOOLS = frozenset({"subfinder", "urlfinder", "tlsx", "katana", "httpx", "nuclei"})
+_PY_AUTO_TOOLS: dict[str, str] = {
+    "mitmdump": "mitmproxy",
+    "schemathesis": "schemathesis",
+}
+
+_TOOL_METADATA: dict[str, dict[str, Any]] = {
+    "mvn": {
+        "purpose_zh": "编译并执行生成的 Java (TestNG + RestAssured + Allure) 接口自动化工程。",
+        "purpose_en": "Compile and run generated Java (TestNG + RestAssured + Allure) API test projects.",
+        "impact_zh": "不影响 HAR/cURL 导入、OpenAPI/关联分析、Java 代码生成及静态安全/性能报告；仅无法在本机直接执行 `mvn test`，可改用 Docker java-runner 容器执行。",
+        "impact_en": "HAR/cURL import, OpenAPI/correlation, Java code generation, and static security/perf reports still work with zero external binaries; only local `mvn test` execution requires Maven or Docker.",
+        "install_cmd": "sudo apt-get update && sudo apt-get install -y maven  # or: brew install maven",
+        "docker_alt": "docker compose --profile runner run --rm java-runner",
+        "auto_installable": False,
+    },
+    "allure": {
+        "purpose_zh": "将 Java 测试产出的 `target/allure-results` 渲染为可交互 Allure HTML 报告。",
+        "purpose_en": "Render `target/allure-results` into an interactive Allure HTML test report.",
+        "impact_zh": "不影响 HAR/cURL 分析、Java 代码生成及平台内置 Allure 摘要看板；仅无法在本机生成独立静态 HTML 报告，可改用 Docker java-runner 容器。",
+        "impact_en": "Does not block HAR/cURL analysis, Java codegen, or ReconQA's built-in Allure summary board; only local static HTML report generation needs Allure CLI or Docker.",
+        "install_cmd": "brew install allure  # or download from https://allurereport.org/docs/install/",
+        "docker_alt": "docker compose --profile runner run --rm java-runner",
+        "auto_installable": False,
+    },
+    "java": {
+        "purpose_zh": "OpenJDK 21+ 运行时，用于本地编译与执行生成的 Java 接口自动化套件。",
+        "purpose_en": "OpenJDK 21+ runtime for compiling and running generated Java API test suites locally.",
+        "impact_zh": "不影响任何 HAR/cURL 导入、报告分析或 Java 工程代码生成；仅无法在本机直接运行生成的测试，可使用 Docker java-runner 替代。",
+        "impact_en": "Does not affect HAR/cURL import, analysis reports, or Java code generation; only local Java test execution needs JDK 21+ or Docker.",
+        "install_cmd": "sudo apt-get install -y temurin-21-jdk  # or: brew install --cask temurin@21",
+        "docker_alt": "docker compose --profile runner run --rm java-runner",
+        "auto_installable": False,
+    },
+    "k6": {
+        "purpose_zh": "本地执行自动生成的阶梯加压 k6 脚本并产出 `p95`/`429`/`5xx` 拐点分析。",
+        "purpose_en": "Execute generated ramping k6 load scripts locally and analyze p95/429/5xx inflection points.",
+        "impact_zh": "不影响 HAR 静态性能体检与 `scenario_ramp.js` 脚本生成；仅无法在当前主机直接触发 `run_k6` 实压，可下载脚本到压测机或使用 Docker k6 运行。",
+        "impact_en": "HAR performance profiling and `scenario_ramp.js` generation still work; only local `run_k6` execution requires k6 CLI or Docker.",
+        "install_cmd": "brew install k6  # or: https://grafana.com/docs/k6/latest/set-up/install-k6/",
+        "docker_alt": "docker run --rm -i grafana/k6 run - < performance/k6/scenario_ramp.js",
+        "auto_installable": False,
+    },
+    "mitmdump": {
+        "purpose_zh": "手工测试代理录包（支持访问 `http://reconqa.local/scenario/<name>` 实时切分场景 HAR）。",
+        "purpose_en": "Manual exploratory testing proxy recorder with live scenario switching into HAR 1.2.",
+        "impact_zh": "不影响导入 Chrome DevTools / Charles / Fiddler 的 HAR 或粘贴 cURL/fetch；仅无法使用内置 `reconqa record --mitm` 代理录包。",
+        "impact_en": "Importing HARs from Chrome DevTools/Charles/Fiddler or pasting cURL/fetch works unaffected; only built-in `reconqa record --mitm` proxy capture needs mitmproxy.",
+        "install_cmd": "uv sync --extra recorder  # or: uv pip install mitmproxy",
+        "docker_alt": "docker compose --profile recorder up -d mitmproxy",
+        "auto_installable": True,
+    },
+    "nuclei": {
+        "purpose_zh": "可选的主动安全配置/暴露面基线扫描引擎（需显式开启 `--nuclei`）。",
+        "purpose_en": "Optional active misconfiguration and exposure scanner (enabled only when `--nuclei` is toggled).",
+        "impact_zh": "不影响 HAR 静态安全审计、双账号 A/B 越权复测与 Burp 导出；仅在显式勾选 Nuclei 扫描时会跳过该子步骤。",
+        "impact_en": "Static security audit, dual-account A/B IDOR matrix, and Burp export work without Nuclei; only optional active Nuclei scans are skipped.",
+        "install_cmd": "./scripts/install-tools.sh ./bin --only nuclei",
+        "docker_alt": "docker run --rm projectdiscovery/nuclei:latest -u https://api.example.com -jsonl",
+        "auto_installable": True,
+    },
+    "docker": {
+        "purpose_zh": "运行容器化 `java-runner`（Maven + JDK 21 + Allure）、`mitmproxy` 或 OWASP ZAP 服务。",
+        "purpose_en": "Run containerized `java-runner` (Maven + JDK 21 + Allure), `mitmproxy`, or OWASP ZAP.",
+        "impact_zh": "不影响核心 Python 引擎、Web 控制台、HAR/cURL 分析及代码/脚本生成；仅无法通过 Docker 替代本机缺失的 Maven/ZAP 环境。",
+        "impact_en": "Core Python engine, Web Console, HAR/cURL analysis, and code/script generation work natively without Docker.",
+        "install_cmd": "https://docs.docker.com/engine/install/",
+        "docker_alt": None,
+        "auto_installable": False,
+    },
+    "subfinder": {
+        "purpose_zh": "可选被动子域名资产发现工具（仅在启用 Discovery 模块时调用）。",
+        "purpose_en": "Optional passive subdomain enumeration tool (used only when Discovery module is enabled).",
+        "impact_zh": "完全不影响 HAR/cURL 导入及三大核心能力（API 自动化/性能/安全）；仅 Discovery 被动资产收集会跳过子域名步骤。",
+        "impact_en": "Zero impact on HAR/cURL import or the 3 core testing pillars; only optional Discovery subdomain enumeration is skipped.",
+        "install_cmd": "./scripts/install-tools.sh ./bin --only subfinder",
+        "docker_alt": None,
+        "auto_installable": True,
+    },
+    "urlfinder": {
+        "purpose_zh": "可选被动历史 URL 发现工具（仅在启用 Discovery 模块时调用）。",
+        "purpose_en": "Optional passive historical URL discovery tool (used only when Discovery module is enabled).",
+        "impact_zh": "完全不影响 HAR/cURL 导入及三大核心能力；仅 Discovery 被动历史 URL 收集会被跳过。",
+        "impact_en": "Zero impact on HAR/cURL import or core testing pillars; only optional Discovery historical URL collection is skipped.",
+        "install_cmd": "./scripts/install-tools.sh ./bin --only urlfinder",
+        "docker_alt": None,
+        "auto_installable": True,
+    },
+    "tlsx": {
+        "purpose_zh": "可选 TLS 证书 SAN/CN 资产发现工具（仅在启用 Discovery 模块时调用）。",
+        "purpose_en": "Optional TLS certificate SAN/CN discovery tool (used only when Discovery module is enabled).",
+        "impact_zh": "完全不影响 HAR/cURL 导入及三大核心能力；仅 Discovery 证书域名提取步骤会被跳过。",
+        "impact_en": "Zero impact on HAR/cURL import or core testing pillars; only optional Discovery TLS SAN extraction is skipped.",
+        "install_cmd": "./scripts/install-tools.sh ./bin --only tlsx",
+        "docker_alt": None,
+        "auto_installable": True,
+    },
+    "katana": {
+        "purpose_zh": "可选主动爬虫与 JS 链接发现工具（仅在启用 Active Discovery 时调用）。",
+        "purpose_en": "Optional active web crawler and JS endpoint finder (used only for Active Discovery).",
+        "impact_zh": "完全不影响 HAR/cURL 导入及三大核心能力；仅主动爬取发现步骤会被跳过。",
+        "impact_en": "Zero impact on HAR/cURL import or core testing pillars; only optional active crawl discovery is skipped.",
+        "install_cmd": "./scripts/install-tools.sh ./bin --only katana",
+        "docker_alt": None,
+        "auto_installable": True,
+    },
+    "httpx": {
+        "purpose_zh": "可选存活探测与技术栈指纹识别工具（仅在启用 Active Discovery 时调用）。",
+        "purpose_en": "Optional live host probing and tech-stack fingerprinting tool (Active Discovery only).",
+        "impact_zh": "完全不影响 HAR/cURL 导入及三大核心能力；仅主动存活探测步骤会被跳过。",
+        "impact_en": "Zero impact on HAR/cURL import or core testing pillars; only optional live host probing is skipped.",
+        "install_cmd": "./scripts/install-tools.sh ./bin --only httpx",
+        "docker_alt": None,
+        "auto_installable": True,
+    },
+    "playwright": {
+        "purpose_zh": "可选本地浏览器流量抓包辅助驱动（仅用于 `reconqa record` 捕获网络包，非 UI 自动化）。",
+        "purpose_en": "Optional local browser traffic-capture helper for `reconqa record` (traffic capture only, not UI testing).",
+        "impact_zh": "完全不影响 HAR/cURL/fetch/Raw HTTP 导入、mitmproxy 代理录包及所有下游生成与分析能力。",
+        "impact_en": "Zero impact on HAR/cURL/fetch/Raw HTTP import, mitmproxy recording, or any downstream analysis/codegen.",
+        "install_cmd": "uv sync --extra recorder && uv run playwright install chromium",
+        "docker_alt": None,
+        "auto_installable": False,
+    },
+    "schemathesis": {
+        "purpose_zh": "可选基于 OpenAPI 3.0.3 的 L3 边界值/错类型接口 Fuzzing 工具。",
+        "purpose_en": "Optional OpenAPI 3.0.3 contract fuzzing runner for L3 boundary and schema edge cases.",
+        "impact_zh": "不影响 OpenAPI 合并与 Java L1/L2/L3 代码生成；仅在显式开启 `--run-schemathesis` 时需要。",
+        "impact_en": "Does not affect OpenAPI merging or Java L1/L2/L3 codegen; only needed when `--run-schemathesis` is explicitly enabled.",
+        "install_cmd": "uv sync --extra fuzz  # or: uv pip install schemathesis",
+        "docker_alt": None,
+        "auto_installable": True,
+    },
+}
+
+
+class DoctorInstallRequest(BaseModel):
+    tool: str
+
+
+def _resolve_install_script() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parents[4] / "scripts" / "install-tools.sh",
+        Path.cwd() / "scripts" / "install-tools.sh",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _enriched_doctor() -> dict[str, dict[str, Any]]:
+    raw = doctor_check()
+    enriched: dict[str, dict[str, Any]] = {}
+    for tool_name, info in raw.items():
+        meta = _TOOL_METADATA.get(tool_name, {})
+        enriched[tool_name] = {
+            **info,
+            "purpose_zh": meta.get("purpose_zh", ""),
+            "purpose_en": meta.get("purpose_en", ""),
+            "impact_zh": meta.get(
+                "impact_zh",
+                "不影响 HAR/cURL 导入及核心报告与代码生成。",
+            ),
+            "impact_en": meta.get(
+                "impact_en",
+                "Does not block HAR/cURL import or core report/code generation.",
+            ),
+            "install_cmd": meta.get("install_cmd", info.get("install_hint", "")),
+            "docker_alt": meta.get("docker_alt"),
+            "auto_installable": bool(meta.get("auto_installable", False)),
+        }
+    return enriched
+
+
+@router.get("/system/doctor")
+async def get_system_doctor() -> dict[str, dict[str, Any]]:
+    """Return enriched live external toolchain readiness for Web UI Overview."""
+    return _enriched_doctor()
+
+
+@router.post("/system/doctor/install")
+async def install_doctor_tool(body: DoctorInstallRequest) -> dict[str, Any]:
+    """Install a safe, allowlisted user-space CLI tool without sudo or shell interpolation."""
+    tool = body.tool.strip().lower()
+    doctor_before = _enriched_doctor()
+    if tool not in doctor_before:
+        raise HTTPException(status_code=400, detail=f"Unknown tool '{body.tool}'")
+
+    info = doctor_before[tool]
+    if not info.get("auto_installable"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Tool '{tool}' cannot be auto-installed safely from the server. "
+                "Please follow the manual install command or Docker alternative."
+            ),
+        )
+
+    cmd: list[str]
+    if tool in _PD_AUTO_TOOLS:
+        script = _resolve_install_script()
+        if script is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Installer script 'scripts/install-tools.sh' not found on server.",
+            )
+        cmd = ["bash", str(script), str(settings.bin_dir), "--only", tool]
+    elif tool in _PY_AUTO_TOOLS:
+        pkg = _PY_AUTO_TOOLS[tool]
+        uv_bin = shutil.which("uv")
+        if uv_bin:
+            cmd = [uv_bin, "pip", "install", "--python", sys.executable, pkg]
+        else:
+            cmd = [sys.executable, "-m", "pip", "install", pkg]
+    else:
+        raise HTTPException(status_code=400, detail=f"Tool '{tool}' is not auto-installable")
+
+    res = await run_cmd_async(cmd, timeout=120)
+    combined_output = "\n".join(part for part in (res.stdout.strip(), res.stderr.strip()) if part)
+    refreshed = _enriched_doctor()
+    is_ok = res.returncode == 0 and not res.timed_out and bool(refreshed[tool]["available"])
+
+    return {
+        "ok": is_ok,
+        "tool": tool,
+        "returncode": res.returncode,
+        "output": combined_output[-8000:],
+        "doctor": refreshed,
+    }
 
 
 async def _get_run_or_404(db: AsyncSession, run_id: str) -> Run:
@@ -52,9 +291,6 @@ async def get_run_performance(
     k6_analysis_path = perf_dir / "k6" / "k6_analysis.json"
     k6_script_path = perf_dir / "k6" / "scenario_ramp.js"
 
-    if not har_report_path.is_file() and not k6_analysis_path.is_file():
-        raise HTTPException(status_code=404, detail="Performance report not found for this run")
-
     return {
         "run_id": run_id,
         "har_profiler": read_json(har_report_path) if har_report_path.is_file() else None,
@@ -75,9 +311,6 @@ async def get_run_security(
     nuclei_path = sec_dir / "nuclei.jsonl"
     burp_dir = sec_dir / "burp_exports"
 
-    if not static_path.is_file() and not auth_path.is_file() and not nuclei_path.is_file():
-        raise HTTPException(status_code=404, detail="Security report not found for this run")
-
     return {
         "run_id": run_id,
         "static_audit": read_json(static_path) if static_path.is_file() else None,
@@ -85,6 +318,163 @@ async def get_run_security(
         "nuclei": read_jsonl(nuclei_path) if nuclei_path.is_file() else [],
         "burp_exports_available": burp_dir.is_dir() and any(burp_dir.iterdir()),
     }
+
+
+def _inspect_java_project_meta(java_dir: Path) -> dict[str, Any]:
+    l1_cases = 0
+    l2_chains = 0
+    l3_checks = 0
+    package_name = "com.reconqa.generated"
+    java_version = "21"
+
+    csv_path = java_dir / "src" / "test" / "resources" / "data" / "l1_smoke_endpoints.csv"
+    if csv_path.is_file():
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as f:
+                l1_cases = sum(1 for _ in csv.DictReader(f))
+        except Exception:
+            l1_cases = 0
+
+    java_src = java_dir / "src" / "test" / "java"
+    if java_src.is_dir():
+        l2_files = list(java_src.rglob("chains/L2*.java"))
+        l2_chains = len(l2_files)
+
+        for l3_file in java_src.rglob("security/L3*.java"):
+            try:
+                content = l3_file.read_text(encoding="utf-8")
+                l3_checks += len(re.findall(r"@Test\b", content))
+            except Exception:
+                pass
+
+        for base_file in java_src.rglob("base/ApiBaseTest.java"):
+            try:
+                match = re.search(r"^\s*package\s+([a-zA-Z0-9_.]+)\.base\s*;", base_file.read_text(encoding="utf-8"), re.MULTILINE)
+                if match:
+                    package_name = match.group(1)
+                    break
+            except Exception:
+                pass
+
+    pom_path = java_dir / "pom.xml"
+    if pom_path.is_file():
+        try:
+            pom_text = pom_path.read_text(encoding="utf-8")
+            ver_match = re.search(
+                r"<(?:maven\.compiler\.release|java\.version)>\s*([^<\s]+)\s*</",
+                pom_text,
+            )
+            if ver_match:
+                java_version = ver_match.group(1)
+        except Exception:
+            pass
+
+    return {
+        "l1_cases": l1_cases,
+        "l2_chains": l2_chains,
+        "l3_checks": l3_checks,
+        "package_name": package_name,
+        "java_version": java_version,
+    }
+
+
+def _parse_allure_results(results_dir: Path) -> list[dict[str, Any]]:
+    if not results_dir.is_dir():
+        return []
+    parsed: list[dict[str, Any]] = []
+    for result_file in sorted(results_dir.glob("*-result.json")):
+        try:
+            rec = read_json(result_file)
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        labels: dict[str, str] = {}
+        for lbl in rec.get("labels", []):
+            if isinstance(lbl, dict) and lbl.get("name"):
+                labels[str(lbl["name"]).lower()] = str(lbl.get("value", ""))
+        start = rec.get("start")
+        stop = rec.get("stop")
+        if isinstance(start, (int, float)) and isinstance(stop, (int, float)):
+            duration_ms = max(0, int(stop - start))
+        else:
+            duration_ms = int(rec.get("duration_ms", 0) or 0)
+        status_details = rec.get("statusDetails")
+        message = ""
+        if isinstance(status_details, dict):
+            message = str(status_details.get("message") or "")
+        parsed.append(
+            {
+                "name": str(rec.get("name", result_file.stem)),
+                "status": str(rec.get("status", "unknown")),
+                "duration_ms": duration_ms,
+                "epic": labels.get("epic", ""),
+                "feature": labels.get("feature", ""),
+                "story": labels.get("story", ""),
+                "message": message,
+            }
+        )
+    return parsed
+
+
+@router.get("/runs/{run_id}/java-report")
+async def get_run_java_report(
+    run_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    run = await _get_run_or_404(db, run_id)
+    java_dir = Path(run.workspace_dir) / "java-tests"
+    generated = java_dir.is_dir() and (java_dir / "pom.xml").is_file()
+
+    project_meta = _inspect_java_project_meta(java_dir)
+    exec_summary_path = java_dir / "target" / "reconqa-execution-summary.json"
+    execution_summary: dict[str, Any] | None = None
+    if exec_summary_path.is_file():
+        try:
+            execution_summary = read_json(exec_summary_path)
+        except Exception:
+            execution_summary = None
+
+    allure_results = _parse_allure_results(java_dir / "target" / "allure-results")
+
+    allure_index = java_dir / "target" / "allure-report" / "index.html"
+    allure_report_url = (
+        f"/api/v1/runs/{run_id}/allure-report/index.html" if allure_index.is_file() else None
+    )
+
+    schemathesis_path = java_dir / "schemathesis_report.json"
+    schemathesis: dict[str, Any] | None = None
+    if schemathesis_path.is_file():
+        try:
+            schemathesis = read_json(schemathesis_path)
+        except Exception:
+            schemathesis = None
+
+    return {
+        "run_id": run_id,
+        "generated": generated,
+        "project_meta": project_meta,
+        "execution_summary": execution_summary,
+        "allure_results": allure_results,
+        "allure_report_url": allure_report_url,
+        "schemathesis": schemathesis,
+    }
+
+
+@router.get("/runs/{run_id}/allure-report/{file_path:path}")
+async def serve_allure_report_asset(
+    run_id: str,
+    file_path: str,
+    db: AsyncSession = Depends(get_db),
+) -> FileResponse:
+    run = await _get_run_or_404(db, run_id)
+    report_root = (Path(run.workspace_dir) / "java-tests" / "target" / "allure-report").resolve()
+    target = (report_root / (file_path or "index.html")).resolve()
+    if target != report_root and report_root not in target.parents:
+        raise HTTPException(status_code=400, detail="Invalid Allure report path")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Allure report asset not found")
+    return FileResponse(path=target)
 
 
 @router.get("/projects/{project_id}/trends")

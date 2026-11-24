@@ -60,6 +60,53 @@ def _extract_base_url(target_url: str | None, project_config: Any) -> str | None
     return None
 
 
+def _collect_har_hosts(paths: list[Path]) -> set[str]:
+    hosts: set[str] = set()
+    har_files: list[Path] = []
+    for p in paths:
+        if p.is_dir():
+            har_files.extend(sorted(p.glob("*.har")))
+        elif p.is_file() and p.suffix.lower() == ".har":
+            har_files.append(p)
+    for har_file in har_files:
+        try:
+            doc = read_json(har_file)
+        except Exception:
+            continue
+        entries = (doc.get("log") or {}).get("entries") if isinstance(doc, dict) else None
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            url = str((entry.get("request") or {}).get("url") or "")
+            host = (urlparse(url).hostname or "").lower()
+            if host:
+                hosts.add(host)
+    return hosts
+
+
+def _resolve_effective_target_domain(
+    har_dir: Path,
+    target_domain: str | None,
+) -> tuple[str | None, str | None]:
+    """Return target_domain if any HAR entry matches it; else fall back to None with a warning."""
+    if not target_domain:
+        return None, None
+    found_hosts = _collect_har_hosts([har_dir])
+    if not found_hosts:
+        return target_domain, None
+    want = target_domain.lower().lstrip(".")
+    if any(h == want or h.endswith(f".{want}") for h in found_hosts):
+        return target_domain, None
+    hosts_preview = ", ".join(sorted(found_hosts)[:5])
+    warning = (
+        f"Configured target_domain '{target_domain}' matched 0 HAR entries "
+        f"(found hosts: {hosts_preview}); falling back to analyzing all HAR hosts."
+    )
+    return None, warning
+
+
 def _cfg_get(obj: Any, *keys: str, default: Any = None) -> Any:
     cur = obj
     for key in keys:
@@ -239,6 +286,8 @@ def run_pipeline(
     auth_a_headers: dict[str, str] | None = None,
     auth_b_headers: dict[str, str] | None = None,
     module_cb: Callable[[str, str, dict[str, Any]], None] | None = None,
+    java_package: str | None = None,
+    java_version: str | None = None,
 ) -> dict[str, Any]:
     """Execute the end-to-end ReconQA pipeline into ``run_dir``."""
     run_dir = Path(run_dir).resolve()
@@ -276,15 +325,29 @@ def run_pipeline(
     if har_sources:
         from reconqa.modules.recorder.har_importer import import_hars
 
-        log(f"Importing {len(har_sources)} HAR source(s) into {har_dir}...")
+        src_paths = [Path(s) for s in har_sources]
+        import_domain = target_domain
+        if import_domain:
+            src_hosts = _collect_har_hosts(src_paths)
+            want = import_domain.lower().lstrip(".")
+            if src_hosts and not any(h == want or h.endswith(f".{want}") for h in src_hosts):
+                msg = (
+                    f"Configured target_domain '{import_domain}' matched 0 entries in HAR sources "
+                    f"(found hosts: {', '.join(sorted(src_hosts)[:5])}); importing all hosts."
+                )
+                warnings.append(msg)
+                log(f"[import_har] {msg}")
+                import_domain = None
+
+        log(f"Importing {len(src_paths)} HAR source(s) into {har_dir}...")
         import_res = import_hars(
-            [Path(s) for s in har_sources],
+            src_paths,
             har_dir,
-            target_domain=target_domain,
+            target_domain=import_domain,
             extract_js=True,
         )
         module_results["import_har"] = import_res
-        _ensure_js_extraction(har_dir, target_domain, project_config, log)
+        _ensure_js_extraction(har_dir, import_domain, project_config, log)
 
     # Module 1: Discovery
     if "discovery" in selected_modules:
@@ -356,6 +419,13 @@ def run_pipeline(
             emit_module("record", "failed", err_meta)
             log(f"[record] Failed: {exc}")
 
+    # Resolve effective target_domain against actual HAR hosts so mismatched targets never silently yield 0
+    effective_target_domain, domain_warning = _resolve_effective_target_domain(har_dir, target_domain)
+    if domain_warning:
+        warnings.append(domain_warning)
+        log(f"[pipeline] {domain_warning}")
+    target_domain = effective_target_domain
+
     # Ensure JS endpoints extracted whenever JS bundles exist
     js_endpoints_path = _ensure_js_extraction(har_dir, target_domain, project_config, log)
 
@@ -421,14 +491,14 @@ def run_pipeline(
             else:
                 from reconqa.modules.codegen_java.generator import generate_java_project
 
-                package_name = _cfg_get(
+                package_name = java_package or _cfg_get(
                     project_config, "java", "package_name", default="com.reconqa.generated"
                 )
-                java_version = str(
-                    _cfg_get(project_config, "java", "java_version", default="21")
+                eff_java_version = str(
+                    java_version or _cfg_get(project_config, "java", "java_version", default="21")
                 )
                 log(
-                    f"[java_gen] Generating Java {java_version} Maven project "
+                    f"[java_gen] Generating Java {eff_java_version} Maven project "
                     f"(package={package_name})..."
                 )
                 java_res = generate_java_project(
@@ -436,7 +506,7 @@ def run_pipeline(
                     java_dir,
                     correlation_path=correlation_json if correlation_json.is_file() else None,
                     package_name=package_name,
-                    java_version=java_version,
+                    java_version=eff_java_version,
                     base_uri=effective_base_url,
                     project_config=project_config,
                 )
@@ -602,6 +672,16 @@ def run_pipeline(
         except Exception:
             perf_data = {}
 
+    slow_ttfb_rows = perf_data.get(
+        "slowest_ttfb",
+        perf_data.get("slowest_by_ttfb", perf_data.get("slow_endpoints", [])),
+    )
+    slow_endpoints_count = category_counts.get("perf_slow_ttfb", 0) or sum(
+        1
+        for row in slow_ttfb_rows
+        if isinstance(row, dict) and float(row.get("ttfb_ms", 0) or 0) >= 500.0
+    )
+
     summary_metrics: dict[str, Any] = {
         "modules_executed": selected_modules,
         "har_files_count": len(list(har_dir.glob("*.har"))),
@@ -609,7 +689,10 @@ def run_pipeline(
             "total_endpoints",
             _cfg_get(module_results, "merge", "openapi_paths", default=0),
         ),
-        "har_live_endpoints": cov_data.get("har_live_count", cov_data.get("live_count", 0)),
+        "har_live_endpoints": cov_data.get(
+            "covered_count",
+            cov_data.get("har_live_count", cov_data.get("live_count", 0)),
+        ),
         "js_only_endpoints": cov_data.get("uncovered_count", cov_data.get("js_only_count", 0)),
         "coverage_pct": cov_data.get("coverage_pct", cov_data.get("overall_coverage_pct", 0.0)),
         "correlation_variables": len(corr_data.get("variables", [])),
@@ -617,9 +700,7 @@ def run_pipeline(
         "findings_total": len(findings),
         "findings_by_severity": severity_counts,
         "findings_by_category": category_counts,
-        "slow_endpoints_count": len(
-            perf_data.get("slowest_by_ttfb", perf_data.get("slow_endpoints", []))
-        ),
+        "slow_endpoints_count": slow_endpoints_count,
         "warnings_count": len(warnings),
     }
 

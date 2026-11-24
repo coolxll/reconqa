@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+from collections import Counter
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import (
     APIRouter,
@@ -29,11 +31,12 @@ from sqlalchemy.orm import selectinload
 from reconqa.config import settings
 from reconqa.models.db import get_db
 from reconqa.models.schemas import RunCreate, RunOut
-from reconqa.models.tables import Artifact, Job, Project, Run
+from reconqa.models.tables import Artifact, Job, Project, Run, Target
 from reconqa.modules.recorder.har_importer import import_hars
-from reconqa.pipeline import DEFAULT_MODULES
+from reconqa.modules.recorder.text_importer import import_traffic_text
+from reconqa.pipeline import ALL_MODULES, DEFAULT_MODULES
 from reconqa.server.worker import InProcessTaskRunner
-from reconqa.utils.io import ensure_dir, sha256_file
+from reconqa.utils.io import ensure_dir, read_json, sha256_file
 
 router = APIRouter(tags=["runs"])
 
@@ -41,6 +44,18 @@ router = APIRouter(tags=["runs"])
 class HarReuseRequest(BaseModel):
     source_run_id: str
     scenarios: list[str] | None = None
+
+
+class ImportTextRequest(BaseModel):
+    content: str
+    scenario: str = "01_devtools"
+    format: str = "auto"
+    target_domain: str | None = None
+
+
+class ExecuteModulesRequest(BaseModel):
+    modules: list[str]
+    config: dict[str, Any] = {}
 
 
 def _get_runner(request: Request) -> InProcessTaskRunner:
@@ -88,6 +103,61 @@ async def _upsert_har_artifacts(db: AsyncSession, run: Run) -> None:
                 )
             )
     await db.commit()
+
+
+def _detect_primary_origin(har_paths: list[Path]) -> str | None:
+    counts: Counter[str] = Counter()
+    for p in har_paths:
+        if not p.is_file():
+            continue
+        try:
+            doc = read_json(p)
+        except Exception:
+            continue
+        entries = (doc.get("log") or {}).get("entries") if isinstance(doc, dict) else None
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            url = str((entry.get("request") or {}).get("url") or "") if isinstance(entry, dict) else ""
+            parsed = urlparse(url)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                counts[f"{parsed.scheme}://{parsed.netloc}"] += 1
+    if not counts:
+        return None
+    return counts.most_common(1)[0][0]
+
+
+async def _sync_run_target_url_from_hars(
+    db: AsyncSession,
+    run: Run,
+    har_paths: list[Path],
+    explicit_target_domain: str | None,
+) -> None:
+    if explicit_target_domain:
+        return
+    primary_origin = _detect_primary_origin(har_paths)
+    if not primary_origin:
+        return
+    imported_host = (urlparse(primary_origin).hostname or "").lower()
+    if not imported_host:
+        return
+
+    cfg = dict(run.config_snapshot or {})
+    configured_url = cfg.get("target_url")
+    if not configured_url and run.target_id:
+        target_obj = await db.get(Target, run.target_id)
+        if target_obj is not None:
+            configured_url = target_obj.base_url
+
+    configured_host = (urlparse(str(configured_url)).hostname or "").lower() if configured_url else ""
+    if not configured_url or (
+        configured_host
+        and imported_host != configured_host
+        and not imported_host.endswith(f".{configured_host}")
+    ):
+        cfg["target_url"] = primary_origin
+        run.config_snapshot = cfg
+        await db.commit()
 
 
 @router.post(
@@ -206,13 +276,51 @@ async def upload_run_hars(
         )
 
     await _upsert_har_artifacts(db, run)
-    har_files = [p.name for p in sorted(har_dir.glob("*.har"))]
+    har_paths = sorted(har_dir.glob("*.har"))
+    await _sync_run_target_url_from_hars(db, run, har_paths, target_domain)
+    har_files = [p.name for p in har_paths]
     return {
         "run_id": run_id,
         "import_result": import_res,
         "har_files": har_files,
         "total_hars": len(har_files),
     }
+
+
+@router.post("/runs/{run_id}/import-text")
+async def import_run_text(
+    run_id: str,
+    body: ImportTextRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    run = await _get_run_with_jobs(db, run_id)
+    if not body.content or not body.content.strip():
+        raise HTTPException(status_code=400, detail="Traffic text content must not be empty")
+
+    har_dir = ensure_dir(Path(run.workspace_dir) / "har")
+    result = import_traffic_text(
+        body.content,
+        har_dir,
+        scenario_name=body.scenario,
+        format_hint=body.format,
+        target_domain=body.target_domain,
+    )
+    if result.get("requests_imported", 0) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No valid HTTP requests could be parsed (detected_format="
+                f"'{result.get('detected_format', 'unknown')}'). "
+                "Supported formats: Chrome DevTools Copy as cURL, Copy as fetch, "
+                "Raw HTTP (.http), or HAR 1.2 JSON."
+            ),
+        )
+
+    await _upsert_har_artifacts(db, run)
+    imported_har = Path(result["har_path"]) if result.get("har_path") else None
+    har_candidates = [imported_har] if imported_har and imported_har.is_file() else sorted(har_dir.glob("*.har"))
+    await _sync_run_target_url_from_hars(db, run, har_candidates, body.target_domain)
+    return result
 
 
 @router.post("/runs/{run_id}/hars/reuse")
@@ -288,6 +396,54 @@ async def start_run(
     for job in run.jobs:
         if job.status in {"pending", "failed"}:
             job.status = "queued"
+    await db.commit()
+
+    runner = _get_runner(request)
+    await runner.enqueue(run_id)
+    return await _get_run_with_jobs(db, run_id)
+
+
+@router.post("/runs/{run_id}/execute-modules", response_model=RunOut)
+async def execute_run_modules(
+    run_id: str,
+    body: ExecuteModulesRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Run:
+    """Incrementally execute one or more capability modules on an existing run."""
+    run = await _get_run_with_jobs(db, run_id)
+    if run.status == "running":
+        raise HTTPException(status_code=409, detail="Run is currently executing")
+
+    requested = list(dict.fromkeys(m.strip() for m in body.modules if m and m.strip()))
+    if not requested:
+        raise HTTPException(status_code=400, detail="At least one module is required")
+    invalid = [m for m in requested if m not in ALL_MODULES]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported module(s): {', '.join(invalid)}. Allowed: {', '.join(ALL_MODULES)}",
+        )
+
+    cfg = dict(run.config_snapshot or {})
+    if body.config:
+        for k, v in body.config.items():
+            cfg[k] = v
+
+    existing_mods = list(cfg.get("modules") or [])
+    cfg["modules"] = list(dict.fromkeys([*existing_mods, *requested]))
+    cfg["pending_modules"] = requested
+    run.config_snapshot = cfg
+    run.status = "queued"
+
+    existing_jobs = {j.module: j for j in run.jobs}
+    for mod in requested:
+        if mod in existing_jobs:
+            existing_jobs[mod].status = "queued"
+            existing_jobs[mod].finished_at = None
+        else:
+            db.add(Job(run_id=run.id, module=mod, status="queued"))
+
     await db.commit()
 
     runner = _get_runner(request)

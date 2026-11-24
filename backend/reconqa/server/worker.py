@@ -163,6 +163,9 @@ class InProcessTaskRunner:
                 metrics = dict(run.summary_metrics or {})
                 metrics["error"] = error_msg
                 run.summary_metrics = metrics
+                cfg_snap = dict(run.config_snapshot or {})
+                cfg_snap.pop("pending_modules", None)
+                run.config_snapshot = cfg_snap
                 await session.commit()
         self._publish(
             run_id,
@@ -182,7 +185,8 @@ class InProcessTaskRunner:
                 return
 
             run.status = "running"
-            run.started_at = _utcnow()
+            if run.started_at is None:
+                run.started_at = _utcnow()
             await session.commit()
 
             cfg = dict(run.config_snapshot or {})
@@ -192,7 +196,11 @@ class InProcessTaskRunner:
                 if target is not None:
                     target_url = target.base_url
 
-            modules: list[str] = list(cfg.get("modules") or DEFAULT_MODULES)
+            pending = cfg.get("pending_modules")
+            if isinstance(pending, list) and pending:
+                modules: list[str] = [str(m) for m in pending if str(m).strip()]
+            else:
+                modules = list(cfg.get("modules") or DEFAULT_MODULES)
             workspace_dir = Path(run.workspace_dir)
 
             # Resolve optional auth profiles for the project
@@ -204,17 +212,41 @@ class InProcessTaskRunner:
             profiles_res = await session.execute(
                 select(AuthProfile).where(AuthProfile.project_id == run.project_id)
             )
-            for prof in profiles_res.scalars().all():
-                if prof.role_tag == "account_a":
-                    if prof.storage_state_path and Path(prof.storage_state_path).is_file():
-                        auth_a_path = Path(prof.storage_state_path)
-                    if prof.extra_headers_ref:
-                        auth_a_headers = {str(k): str(v) for k, v in prof.extra_headers_ref.items()}
-                elif prof.role_tag == "account_b":
-                    if prof.storage_state_path and Path(prof.storage_state_path).is_file():
-                        auth_b_path = Path(prof.storage_state_path)
-                    if prof.extra_headers_ref:
-                        auth_b_headers = {str(k): str(v) for k, v in prof.extra_headers_ref.items()}
+            all_profiles = list(profiles_res.scalars().all())
+            profiles_by_id = {p.id: p for p in all_profiles}
+
+            explicit_auth = (
+                "auth_a_profile_id" in cfg or "auth_b_profile_id" in cfg
+            )
+            if explicit_auth:
+                prof_a = profiles_by_id.get(str(cfg.get("auth_a_profile_id") or ""))
+                prof_b = profiles_by_id.get(str(cfg.get("auth_b_profile_id") or ""))
+                if prof_a is not None:
+                    if prof_a.storage_state_path and Path(prof_a.storage_state_path).is_file():
+                        auth_a_path = Path(prof_a.storage_state_path)
+                    if prof_a.extra_headers_ref:
+                        auth_a_headers = {str(k): str(v) for k, v in prof_a.extra_headers_ref.items()}
+                if prof_b is not None:
+                    if prof_b.storage_state_path and Path(prof_b.storage_state_path).is_file():
+                        auth_b_path = Path(prof_b.storage_state_path)
+                    if prof_b.extra_headers_ref:
+                        auth_b_headers = {str(k): str(v) for k, v in prof_b.extra_headers_ref.items()}
+            else:
+                for prof in all_profiles:
+                    if prof.role_tag == "account_a":
+                        if prof.storage_state_path and Path(prof.storage_state_path).is_file():
+                            auth_a_path = Path(prof.storage_state_path)
+                        if prof.extra_headers_ref:
+                            auth_a_headers = {
+                                str(k): str(v) for k, v in prof.extra_headers_ref.items()
+                            }
+                    elif prof.role_tag == "account_b":
+                        if prof.storage_state_path and Path(prof.storage_state_path).is_file():
+                            auth_b_path = Path(prof.storage_state_path)
+                        if prof.extra_headers_ref:
+                            auth_b_headers = {
+                                str(k): str(v) for k, v in prof.extra_headers_ref.items()
+                            }
 
         self._publish(
             run_id,
@@ -280,11 +312,12 @@ class InProcessTaskRunner:
             auth_a_headers=auth_a_headers,
             auth_b_headers=auth_b_headers,
             module_cb=on_module,
+            java_package=cfg.get("java_package"),
+            java_version=str(cfg["java_version"]) if cfg.get("java_version") else None,
         )
 
         # Ensure all module statuses & findings/artifacts are persisted cleanly
         async with session_factory() as session:
-            # Finalize any jobs that were updated via threadsafe callbacks
             seen_final: dict[str, tuple[str, dict[str, Any]]] = {}
             for mod, st, meta in module_events:
                 seen_final[mod] = (st, meta)
@@ -296,7 +329,7 @@ class InProcessTaskRunner:
                 if mod in existing_jobs:
                     existing_jobs[mod].status = st
                     existing_jobs[mod].output_meta = meta
-                    if st in {"completed", "failed"} and existing_jobs[mod].finished_at is None:
+                    if st in {"completed", "failed"}:
                         existing_jobs[mod].finished_at = now
                 else:
                     session.add(
@@ -310,36 +343,64 @@ class InProcessTaskRunner:
                         )
                     )
 
-            # Replace findings and artifacts with latest run results
-            await session.execute(delete(Finding).where(Finding.run_id == run_id))
-            for f in summary.get("findings", []):
-                session.add(
-                    Finding(
-                        run_id=run_id,
-                        category=str(f.get("category", "general")),
-                        severity=str(f.get("severity", "info")),
-                        endpoint=str(f.get("endpoint", "")),
-                        title=str(f.get("title", "Finding"))[:255],
-                        evidence=f.get("evidence") if isinstance(f.get("evidence"), dict) else {},
+            # Refresh findings from full workspace when security/perf ran or findings exist
+            new_findings = summary.get("findings", [])
+            if any(m in {"security", "perf"} for m in modules) or new_findings:
+                await session.execute(delete(Finding).where(Finding.run_id == run_id))
+                for f in new_findings:
+                    session.add(
+                        Finding(
+                            run_id=run_id,
+                            category=str(f.get("category", "general")),
+                            severity=str(f.get("severity", "info")),
+                            endpoint=str(f.get("endpoint", "")),
+                            title=str(f.get("title", "Finding"))[:255],
+                            evidence=f.get("evidence")
+                            if isinstance(f.get("evidence"), dict)
+                            else {},
+                        )
                     )
-                )
 
-            await session.execute(delete(Artifact).where(Artifact.run_id == run_id))
+            # Upsert artifacts by (kind, rel_path) so earlier artifacts are preserved
+            existing_art_res = await session.execute(
+                select(Artifact).where(Artifact.run_id == run_id)
+            )
+            existing_arts = {
+                (a.kind, a.rel_path): a for a in existing_art_res.scalars().all()
+            }
             for art in summary.get("artifacts", []):
-                session.add(
-                    Artifact(
-                        run_id=run_id,
-                        kind=str(art.get("kind", "file")),
-                        rel_path=str(art.get("rel_path", "")),
-                        size_bytes=int(art.get("size_bytes", 0)),
-                        sha256=str(art.get("sha256", "")),
+                kind = str(art.get("kind", "file"))
+                rel_path = str(art.get("rel_path", ""))
+                key = (kind, rel_path)
+                if key in existing_arts:
+                    existing_arts[key].size_bytes = int(art.get("size_bytes", 0))
+                    existing_arts[key].sha256 = str(art.get("sha256", ""))
+                else:
+                    session.add(
+                        Artifact(
+                            run_id=run_id,
+                            kind=kind,
+                            rel_path=rel_path,
+                            size_bytes=int(art.get("size_bytes", 0)),
+                            sha256=str(art.get("sha256", "")),
+                        )
                     )
-                )
 
             run = await session.get(Run, run_id)
+            merged_metrics: dict[str, Any] = {}
             if run is not None:
+                prev_metrics = dict(run.summary_metrics or {})
+                new_metrics = dict(summary.get("summary_metrics", {}))
+                prev_mods = list(prev_metrics.get("modules_executed") or [])
+                merged_mods = list(dict.fromkeys([*prev_mods, *modules]))
+                merged_metrics = {**prev_metrics, **new_metrics, "modules_executed": merged_mods}
+                merged_metrics.pop("error", None)
+
+                cfg_snap = dict(run.config_snapshot or {})
+                cfg_snap.pop("pending_modules", None)
+                run.config_snapshot = cfg_snap
                 run.status = "completed"
-                run.summary_metrics = summary.get("summary_metrics", {})
+                run.summary_metrics = merged_metrics
                 run.finished_at = _utcnow()
 
             await session.commit()
@@ -350,7 +411,7 @@ class InProcessTaskRunner:
                 "event": "run_completed",
                 "run_id": run_id,
                 "status": "completed",
-                "summary_metrics": summary.get("summary_metrics", {}),
+                "summary_metrics": merged_metrics,
                 "timestamp": _utcnow().isoformat(),
             },
         )

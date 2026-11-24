@@ -60,6 +60,55 @@ class AuthProfileOut(BaseModel):
     extra_headers_ref: dict[str, str]
 
 
+KnowledgeDocType = Literal[
+    "prd",
+    "api_spec",
+    "business_rule",
+    "test_notes",
+    "architecture",
+    "other",
+]
+KnowledgeDocSourceKind = Literal["markdown", "file", "link"]
+
+
+class KnowledgeDocCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+    doc_type: KnowledgeDocType = "prd"
+    source_kind: KnowledgeDocSourceKind = "markdown"
+    content: str = ""
+    external_url: str | None = Field(default=None, max_length=1024)
+    tags: list[str] = Field(default_factory=list)
+    related_endpoints: list[str] = Field(default_factory=list)
+
+
+class KnowledgeDocUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    doc_type: KnowledgeDocType | None = None
+    content: str | None = None
+    external_url: str | None = Field(default=None, max_length=1024)
+    tags: list[str] | None = None
+    related_endpoints: list[str] | None = None
+
+
+class KnowledgeDocOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    project_id: str
+    title: str
+    doc_type: str
+    source_kind: str
+    content: str
+    file_path: str | None = None
+    original_filename: str | None = None
+    external_url: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    related_endpoints: list[str] = Field(default_factory=list)
+    size_bytes: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
 class RunCreate(BaseModel):
     target_id: str | None = None
     target_url: str | None = None
