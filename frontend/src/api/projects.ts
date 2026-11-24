@@ -1,7 +1,13 @@
 import { API_BASE, apiFetch, apiUpload } from "./client";
 import type {
+  AcceptancePromptAgent,
+  AcceptancePromptResponse,
   AuthProfile,
   AuthProfileCreate,
+  ExecuteExternalToolRequest,
+  ExecuteExternalToolResponse,
+  ExtractCredentialRequest,
+  ExtractCredentialResponse,
   KnowledgeDoc,
   KnowledgeDocCreate,
   KnowledgeDocType,
@@ -9,6 +15,8 @@ import type {
   Project,
   ProjectCreate,
   ProjectInventoryResponse,
+  ReplayMatrixRequest,
+  ReplayMatrixResponse,
   ReplayRequest,
   ReplayResponse,
   Target,
@@ -200,4 +208,58 @@ export function replayEndpoint(
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export function replayEndpointMatrix(
+  projectId: string,
+  payload: ReplayMatrixRequest
+): Promise<ReplayMatrixResponse> {
+  return apiFetch<ReplayMatrixResponse>(
+    `/projects/${encodeURIComponent(projectId)}/replay-matrix`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+// --- Autonomous External-System Acceptance Glue APIs ---
+
+export function extractCredentialFromHar(
+  projectId: string,
+  payload?: ExtractCredentialRequest
+): Promise<ExtractCredentialResponse> {
+  return apiFetch<ExtractCredentialResponse>(
+    `/projects/${encodeURIComponent(projectId)}/auth-profiles/extract-from-har`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload ?? {}),
+    }
+  );
+}
+
+export function executeRunExternalTool(
+  projectId: string,
+  runId: string,
+  payload: ExecuteExternalToolRequest
+): Promise<ExecuteExternalToolResponse> {
+  return apiFetch<ExecuteExternalToolResponse>(
+    `/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}/execute-tool`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }
+  );
+}
+
+export function getAcceptancePrompt(
+  projectId: string,
+  options?: { lang?: "zh" | "en"; agent?: AcceptancePromptAgent }
+): Promise<AcceptancePromptResponse> {
+  const params = new URLSearchParams();
+  if (options?.lang) params.set("lang", options.lang);
+  if (options?.agent) params.set("agent", options.agent);
+  const qs = params.toString();
+  const base = `/projects/${encodeURIComponent(projectId)}/acceptance-prompt`;
+  return apiFetch<AcceptancePromptResponse>(qs ? `${base}?${qs}` : base);
 }

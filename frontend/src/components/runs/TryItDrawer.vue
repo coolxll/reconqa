@@ -3,18 +3,30 @@ import { computed, ref, watch } from "vue";
 import {
   AlertTriangle,
   Check,
+  ChevronDown,
+  ChevronRight,
   Clock,
   Copy,
+  ExternalLink,
   KeyRound,
   Loader2,
   Plus,
   Send,
+  ShieldAlert,
   Sparkles,
   Trash2,
+  Users,
   X,
 } from "lucide-vue-next";
-import { listAuthProfiles, listTargets, replayEndpoint } from "@/api/projects";
-import type { AuthProfile, ReplayResponse } from "@/api/types";
+import {
+  createAuthProfile,
+  extractCredentialFromHar,
+  listAuthProfiles,
+  listTargets,
+  replayEndpoint,
+  replayEndpointMatrix,
+} from "@/api/projects";
+import type { AuthProfile, ReplayMatrixResponse, ReplayResponse, RoleTag } from "@/api/types";
 import { useI18n } from "@/i18n";
 
 export interface TryItEndpointInput {
@@ -45,6 +57,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
+const ROLE_PRESETS = ["admin", "pharmacy", "doctor", "assistant", "account_a", "account_b", "guest"] as const;
 
 const method = ref("GET");
 const targetUrl = ref("");
@@ -55,12 +68,121 @@ const headerRows = ref<KvRow[]>([{ key: "Accept", value: "application/json" }]);
 const bodyText = ref("");
 
 const authProfiles = ref<AuthProfile[]>([]);
+const userClearedCredential = ref(false);
 const defaultBaseUrl = ref("");
 const sending = ref(false);
+const runningMatrix = ref(false);
 const errorMsg = ref<string | null>(null);
 const response = ref<ReplayResponse | null>(null);
+const matrixResponse = ref<ReplayMatrixResponse | null>(null);
+const expandedMatrixRows = ref<Set<number>>(new Set());
 const respTab = ref<"body" | "headers">("body");
 const copiedResp = ref(false);
+
+// Inline Quick Add Credential mini-form state
+const showQuickAddCred = ref(false);
+const quickCredSaving = ref(false);
+const quickCredError = ref<string | null>(null);
+const extractingHarCred = ref(false);
+const credNotice = ref<string | null>(null);
+const quickCredName = ref("");
+const quickCredRole = ref<RoleTag>("account_a");
+const quickCredPreset = ref<"bearer" | "cookie" | "custom">("bearer");
+const quickCredHeaderName = ref("Authorization");
+const quickCredHeaderValue = ref("");
+
+function applyQuickPreset(preset: "bearer" | "cookie" | "custom"): void {
+  quickCredPreset.value = preset;
+  if (preset === "bearer") {
+    quickCredHeaderName.value = "Authorization";
+  } else if (preset === "cookie") {
+    quickCredHeaderName.value = "Cookie";
+  } else {
+    if (
+      quickCredHeaderName.value === "Authorization" ||
+      quickCredHeaderName.value === "Cookie"
+    ) {
+      quickCredHeaderName.value = "X-Auth-Token";
+    }
+  }
+}
+
+function toggleQuickAddCred(): void {
+  showQuickAddCred.value = !showQuickAddCred.value;
+  quickCredError.value = null;
+  if (showQuickAddCred.value && !quickCredName.value) {
+    quickCredName.value =
+      authProfiles.value.length === 0
+        ? "Account A"
+        : `Account ${String.fromCharCode(65 + Math.min(authProfiles.value.length, 25))}`;
+  }
+}
+
+function onCredentialSelectChange(event: Event): void {
+  const val = (event.target as HTMLSelectElement).value;
+  credentialId.value = val;
+  userClearedCredential.value = val === "";
+}
+
+async function handleQuickAddCredential(): Promise<void> {
+  if (!props.projectId || !quickCredName.value.trim() || !quickCredHeaderName.value.trim() || !quickCredHeaderValue.value.trim()) {
+    return;
+  }
+  quickCredSaving.value = true;
+  quickCredError.value = null;
+  try {
+    let resolvedValue = quickCredHeaderValue.value.trim();
+    if (
+      quickCredPreset.value === "bearer" &&
+      !/^bearer\s+/i.test(resolvedValue) &&
+      !resolvedValue.startsWith("ENV:")
+    ) {
+      resolvedValue = `Bearer ${resolvedValue}`;
+    }
+    const created = await createAuthProfile(props.projectId, {
+      name: quickCredName.value.trim(),
+      role_tag: quickCredRole.value,
+      extra_headers_ref: {
+        [quickCredHeaderName.value.trim()]: resolvedValue,
+      },
+    });
+    authProfiles.value = [...authProfiles.value, created];
+    credentialId.value = created.id;
+    userClearedCredential.value = false;
+    showQuickAddCred.value = false;
+    quickCredName.value = "";
+    quickCredHeaderValue.value = "";
+  } catch (err) {
+    quickCredError.value = err instanceof Error ? err.message : t("tryit.quickErrCreate");
+  } finally {
+    quickCredSaving.value = false;
+  }
+}
+
+async function handleExtractHarCredential(): Promise<void> {
+  if (!props.projectId || extractingHarCred.value) return;
+  extractingHarCred.value = true;
+  errorMsg.value = null;
+  credNotice.value = null;
+  try {
+    const res = await extractCredentialFromHar(props.projectId);
+    const exists = authProfiles.value.some((p) => p.id === res.profile.id);
+    authProfiles.value = exists
+      ? authProfiles.value.map((p) => (p.id === res.profile.id ? res.profile : p))
+      : [...authProfiles.value, res.profile];
+    credentialId.value = res.profile.id;
+    userClearedCredential.value = false;
+    const headersText = res.extracted_header_names.join(", ") || "auth";
+    credNotice.value = t("tryit.extractHarSuccess", { headers: headersText });
+    window.setTimeout(() => {
+      credNotice.value = null;
+    }, 5000);
+  } catch (err) {
+    errorMsg.value = err instanceof Error ? err.message : t("tryit.extractHarErr");
+  } finally {
+    extractingHarCred.value = false;
+  }
+}
 
 const bodySupported = computed(() => !["GET", "HEAD"].includes(method.value.toUpperCase()));
 
@@ -121,6 +243,7 @@ async function loadProjectContext(pid: string): Promise<void> {
   if (!pid) {
     authProfiles.value = [];
     defaultBaseUrl.value = "";
+    credentialId.value = "";
     return;
   }
   const [profilesRes, targetsRes] = await Promise.allSettled([
@@ -129,15 +252,37 @@ async function loadProjectContext(pid: string): Promise<void> {
   ]);
   if (profilesRes.status === "fulfilled") {
     authProfiles.value = profilesRes.value;
+    const stillValid = authProfiles.value.some((p) => p.id === credentialId.value);
+    if (!stillValid) {
+      credentialId.value = "";
+    }
+    if (
+      authProfiles.value.length > 0 &&
+      !credentialId.value &&
+      !userClearedCredential.value
+    ) {
+      credentialId.value = authProfiles.value[0].id;
+    }
   }
   if (targetsRes.status === "fulfilled" && targetsRes.value.length > 0) {
     defaultBaseUrl.value = targetsRes.value[0].base_url || "";
   }
 }
 
+watch(
+  () => props.projectId,
+  () => {
+    credentialId.value = "";
+    userClearedCredential.value = false;
+    showQuickAddCred.value = false;
+  }
+);
+
 async function hydrateFromEndpoint(): Promise<void> {
   if (!props.open) return;
   response.value = null;
+  matrixResponse.value = null;
+  expandedMatrixRows.value = new Set();
   errorMsg.value = null;
   respTab.value = "body";
 
@@ -249,6 +394,78 @@ async function handleSend(): Promise<void> {
   }
 }
 
+function toggleMatrixRow(idx: number): void {
+  const next = new Set(expandedMatrixRows.value);
+  if (next.has(idx)) next.delete(idx);
+  else next.add(idx);
+  expandedMatrixRows.value = next;
+}
+
+function verdictBadgeClass(verdict: string): string {
+  if (verdict === "allowed") return "bg-emerald-50 text-emerald-700 ring-emerald-600/25";
+  if (verdict === "denied") return "bg-slate-100 text-slate-700 ring-slate-500/25";
+  return "bg-rose-50 text-rose-700 ring-rose-600/25";
+}
+
+function formatByteSize(bytes: number): string {
+  if (!bytes || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+async function handleRunRoleMatrix(): Promise<void> {
+  errorMsg.value = null;
+  const url = targetUrl.value.trim();
+  if (!url || !/^https?:\/\//i.test(url)) {
+    errorMsg.value = t("tryit.errMissingUrl");
+    return;
+  }
+
+  const headers: Record<string, string> = {};
+  for (const row of headerRows.value) {
+    if (row.key.trim()) {
+      headers[row.key.trim()] = row.value;
+    }
+  }
+
+  const queryParams: Record<string, string> = {};
+  for (const row of queryRows.value) {
+    if (row.key.trim()) {
+      queryParams[row.key.trim()] = row.value;
+    }
+  }
+
+  let parsedBody: unknown = undefined;
+  if (bodySupported.value && bodyText.value.trim()) {
+    const raw = bodyText.value.trim();
+    try {
+      parsedBody = JSON.parse(raw);
+    } catch {
+      parsedBody = raw;
+    }
+  }
+
+  runningMatrix.value = true;
+  matrixResponse.value = null;
+  expandedMatrixRows.value = new Set();
+  try {
+    matrixResponse.value = await replayEndpointMatrix(props.projectId, {
+      method: method.value,
+      url,
+      headers,
+      query_params: queryParams,
+      body: parsedBody,
+      credential_ids: null,
+      include_anonymous: true,
+      timeout_sec: timeoutSec.value,
+    });
+  } catch (err) {
+    errorMsg.value = err instanceof Error ? err.message : t("tryit.matrixErr");
+  } finally {
+    runningMatrix.value = false;
+  }
+}
+
 async function copyResponseBody(): Promise<void> {
   if (!formattedResponseBody.value) return;
   try {
@@ -311,20 +528,69 @@ async function copyResponseBody(): Promise<void> {
             <!-- Credential + Timeout row -->
             <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <div class="sm:col-span-2">
-                <label class="mb-1 flex items-center gap-1 text-xs font-medium text-slate-700">
-                  <KeyRound class="h-3.5 w-3.5 text-indigo-500" />
-                  <span>{{ t("tryit.credentialLabel") }}</span>
-                </label>
+                <div class="mb-1 flex flex-wrap items-center justify-between gap-2">
+                  <label class="flex items-center gap-1 text-xs font-medium text-slate-700">
+                    <KeyRound class="h-3.5 w-3.5 text-indigo-500" />
+                    <span>{{ t("tryit.credentialLabel") }}</span>
+                  </label>
+                  <div v-if="projectId" class="flex flex-wrap items-center gap-2 text-[11px]">
+                    <button
+                      type="button"
+                      data-testid="extract-har-cred-btn"
+                      :disabled="extractingHarCred"
+                      class="inline-flex items-center gap-1 font-semibold text-emerald-700 transition hover:text-emerald-900 disabled:opacity-50"
+                      @click="handleExtractHarCredential"
+                    >
+                      <Loader2 v-if="extractingHarCred" class="h-3 w-3 animate-spin" />
+                      <Sparkles v-else class="h-3 w-3" />
+                      <span>{{ extractingHarCred ? t("tryit.extractingHarBtn") : t("tryit.extractHarBtn") }}</span>
+                    </button>
+                    <span class="text-slate-300">|</span>
+                    <button
+                      type="button"
+                      data-testid="try-it-quick-add-cred-btn"
+                      class="font-semibold text-indigo-600 transition hover:text-indigo-800"
+                      @click="toggleQuickAddCred"
+                    >
+                      {{ t("tryit.quickAddBtn") }}
+                    </button>
+                    <span class="text-slate-300">|</span>
+                    <router-link
+                      :to="`/p/${encodeURIComponent(projectId)}/settings?tab=auth`"
+                      data-testid="try-it-manage-creds-link"
+                      class="inline-flex items-center gap-0.5 font-medium text-slate-500 transition hover:text-indigo-600"
+                      @click="emit('close')"
+                    >
+                      <span>{{ t("tryit.manageCreds") }}</span>
+                      <ExternalLink class="h-2.5 w-2.5" />
+                    </router-link>
+                  </div>
+                </div>
                 <select
-                  v-model="credentialId"
+                  :value="credentialId"
                   data-testid="try-it-credential"
                   class="input-field py-1.5 text-xs"
+                  @change="onCredentialSelectChange"
                 >
                   <option value="">{{ t("tryit.credentialNone") }}</option>
                   <option v-for="cred in authProfiles" :key="cred.id" :value="cred.id">
                     {{ cred.name }} ({{ cred.role_tag }})
                   </option>
                 </select>
+                <p
+                  v-if="credNotice"
+                  data-testid="try-it-cred-notice"
+                  class="mt-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] text-emerald-800"
+                >
+                  {{ credNotice }}
+                </p>
+                <p
+                  v-if="authProfiles.length === 0 && !showQuickAddCred"
+                  data-testid="try-it-no-creds-hint"
+                  class="mt-1.5 rounded-lg border border-amber-200 bg-amber-50/80 px-2.5 py-1.5 text-[11px] leading-relaxed text-amber-900"
+                >
+                  {{ t("tryit.noCredsHint") }}
+                </p>
               </div>
               <div>
                 <label class="mb-1 block text-xs font-medium text-slate-700">
@@ -337,6 +603,184 @@ async function copyResponseBody(): Promise<void> {
                   max="60"
                   class="input-field py-1.5 font-mono text-xs"
                 />
+              </div>
+            </div>
+
+            <!-- Inline Quick-Add Credential Mini-Form -->
+            <div
+              v-if="showQuickAddCred && projectId"
+              data-testid="try-it-quick-add-form"
+              class="space-y-3 rounded-xl border border-indigo-200 bg-indigo-50/50 p-3.5"
+            >
+              <div class="flex items-center justify-between">
+                <span class="flex items-center gap-1.5 text-xs font-semibold text-indigo-950">
+                  <KeyRound class="h-3.5 w-3.5 text-indigo-600" />
+                  <span>{{ t("tryit.quickAddTitle") }}</span>
+                </span>
+                <button
+                  type="button"
+                  class="rounded p-0.5 text-slate-400 hover:bg-white hover:text-slate-600"
+                  @click="showQuickAddCred = false"
+                >
+                  <X class="h-3.5 w-3.5" />
+                </button>
+              </div>
+
+              <div
+                v-if="quickCredError"
+                class="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] text-rose-700"
+              >
+                {{ quickCredError }}
+              </div>
+
+              <div class="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("tryit.quickNameLabel") }}
+                  </label>
+                  <input
+                    v-model="quickCredName"
+                    data-testid="quick-cred-name-input"
+                    type="text"
+                    :placeholder="t('tryit.quickNamePlaceholder')"
+                    class="input-field !py-1.5 text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("tryit.quickRoleLabel") }}
+                  </label>
+                  <input
+                    v-model="quickCredRole"
+                    data-testid="quick-cred-role-input"
+                    type="text"
+                    :placeholder="t('tryit.quickRolePlaceholder')"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                  <div class="mt-1.5 flex flex-wrap gap-1">
+                    <button
+                      v-for="rolePreset in ROLE_PRESETS"
+                      :key="rolePreset"
+                      type="button"
+                      class="rounded px-1.5 py-0.5 font-mono text-[10px] font-medium transition"
+                      :class="
+                        quickCredRole === rolePreset
+                          ? 'bg-indigo-600 text-white'
+                          : 'bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50'
+                      "
+                      @click="quickCredRole = rolePreset"
+                    >
+                      {{ rolePreset }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <span class="mb-1 block text-[11px] font-medium text-slate-700">
+                  {{ t("tryit.quickPresetLabel") }}
+                </span>
+                <div class="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    class="rounded-md px-2.5 py-1 text-[11px] font-medium transition"
+                    :class="
+                      quickCredPreset === 'bearer'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : 'bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50'
+                    "
+                    @click="applyQuickPreset('bearer')"
+                  >
+                    {{ t("tryit.quickPresetBearer") }}
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded-md px-2.5 py-1 text-[11px] font-medium transition"
+                    :class="
+                      quickCredPreset === 'cookie'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : 'bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50'
+                    "
+                    @click="applyQuickPreset('cookie')"
+                  >
+                    {{ t("tryit.quickPresetCookie") }}
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded-md px-2.5 py-1 text-[11px] font-medium transition"
+                    :class="
+                      quickCredPreset === 'custom'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : 'bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50'
+                    "
+                    @click="applyQuickPreset('custom')"
+                  >
+                    {{ t("tryit.quickPresetCustom") }}
+                  </button>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("tryit.quickHeaderName") }}
+                  </label>
+                  <input
+                    v-model="quickCredHeaderName"
+                    data-testid="quick-cred-header-name"
+                    type="text"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div class="sm:col-span-2">
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("tryit.quickHeaderValue") }}
+                  </label>
+                  <input
+                    v-model="quickCredHeaderValue"
+                    data-testid="quick-cred-header-value"
+                    type="password"
+                    autocomplete="off"
+                    :placeholder="
+                      quickCredPreset === 'cookie'
+                        ? 'session_id=...; token=...'
+                        : quickCredPreset === 'bearer'
+                          ? 'Bearer eyJ... or ENV:RECONQA_ACCOUNT_A_TOKEN'
+                          : 'token-value or ENV:API_KEY'
+                    "
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+              </div>
+
+              <p class="text-[11px] leading-relaxed text-indigo-900/75">
+                {{ t("tryit.quickValueHint") }}
+              </p>
+
+              <div class="flex justify-end gap-2">
+                <button
+                  type="button"
+                  class="btn-secondary !py-1 !text-xs"
+                  @click="showQuickAddCred = false"
+                >
+                  {{ t("common.cancel") }}
+                </button>
+                <button
+                  type="button"
+                  data-testid="quick-cred-save-btn"
+                  class="btn-primary !py-1 !text-xs"
+                  :disabled="
+                    quickCredSaving ||
+                    !quickCredName.trim() ||
+                    !quickCredHeaderName.trim() ||
+                    !quickCredHeaderValue.trim()
+                  "
+                  @click="handleQuickAddCredential"
+                >
+                  <Loader2 v-if="quickCredSaving" class="h-3 w-3 animate-spin" />
+                  <Plus v-else class="h-3 w-3" />
+                  <span>{{ quickCredSaving ? t("tryit.quickSavingBtn") : t("tryit.quickSaveBtn") }}</span>
+                </button>
               </div>
             </div>
           </div>
@@ -455,6 +899,112 @@ async function copyResponseBody(): Promise<void> {
             <span>{{ errorMsg }}</span>
           </div>
 
+          <!-- Multi-Role Authorization Matrix Results -->
+          <div
+            v-if="matrixResponse"
+            data-testid="try-it-matrix-results"
+            class="overflow-hidden rounded-xl border border-indigo-200 bg-white shadow-sm"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 bg-indigo-50/50 px-4 py-2.5">
+              <div class="flex items-center gap-2">
+                <Users class="h-4 w-4 text-indigo-600" />
+                <span class="text-xs font-semibold text-slate-900">
+                  {{ t("tryit.matrixTitle") }}
+                </span>
+              </div>
+              <span class="font-mono text-[11px] text-slate-600">
+                {{
+                  t("tryit.matrixSummary", {
+                    allowed: matrixResponse.allowed_count,
+                    denied: matrixResponse.denied_count,
+                    total: matrixResponse.results.length,
+                  })
+                }}
+              </span>
+            </div>
+
+            <!-- Potential BFLA / IDOR Warning Banner -->
+            <div
+              v-if="matrixResponse.potential_bfla_warning"
+              data-testid="try-it-matrix-bfla-warn"
+              class="flex items-start gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900"
+            >
+              <ShieldAlert class="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+              <span class="font-medium">{{ t("tryit.matrixBflaWarn") }}</span>
+            </div>
+
+            <div class="overflow-x-auto">
+              <table class="min-w-full divide-y divide-slate-200 text-left text-xs">
+                <thead class="bg-slate-50 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                  <tr>
+                    <th class="w-7 px-2 py-2" />
+                    <th class="px-3 py-2">{{ t("tryit.matrixColRole") }}</th>
+                    <th class="px-3 py-2">{{ t("tryit.matrixColCred") }}</th>
+                    <th class="px-3 py-2">{{ t("tryit.matrixColHttp") }}</th>
+                    <th class="px-3 py-2">{{ t("tryit.matrixColBiz") }}</th>
+                    <th class="px-3 py-2 text-right">{{ t("tryit.matrixColLatency") }}</th>
+                    <th class="px-3 py-2 text-right">{{ t("tryit.matrixColSize") }}</th>
+                    <th class="px-3 py-2 text-right">{{ t("tryit.matrixColVerdict") }}</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">
+                  <template v-for="(entry, idx) in matrixResponse.results" :key="`${entry.credential_id ?? 'anon'}-${idx}`">
+                    <tr
+                      class="cursor-pointer transition hover:bg-slate-50"
+                      @click="toggleMatrixRow(idx)"
+                    >
+                      <td class="px-2 py-2 text-slate-400">
+                        <ChevronDown v-if="expandedMatrixRows.has(idx)" class="h-3.5 w-3.5 text-indigo-600" />
+                        <ChevronRight v-else class="h-3.5 w-3.5" />
+                      </td>
+                      <td class="px-3 py-2">
+                        <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] font-semibold text-slate-700">
+                          {{ entry.role_tag }}
+                        </span>
+                      </td>
+                      <td class="px-3 py-2 font-medium text-slate-800">
+                        {{ entry.credential_name }}
+                      </td>
+                      <td class="px-3 py-2">
+                        <span
+                          class="inline-flex rounded px-1.5 py-0.5 font-mono text-[11px] font-bold ring-1 ring-inset"
+                          :class="statusColorClass(entry.status_code)"
+                        >
+                          {{ entry.status_code }}
+                        </span>
+                      </td>
+                      <td class="px-3 py-2 font-mono text-slate-600">
+                        {{ entry.biz_code !== null && entry.biz_code !== undefined ? entry.biz_code : "—" }}
+                      </td>
+                      <td class="px-3 py-2 text-right font-mono text-slate-500">
+                        {{ Math.round(entry.duration_ms) }}ms
+                      </td>
+                      <td class="px-3 py-2 text-right font-mono text-slate-500">
+                        {{ formatByteSize(entry.body_size) }}
+                      </td>
+                      <td class="px-3 py-2 text-right">
+                        <span
+                          class="inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ring-inset"
+                          :class="verdictBadgeClass(entry.verdict)"
+                        >
+                          {{ t(`tryit.verdict.${entry.verdict}`) }}
+                        </span>
+                      </td>
+                    </tr>
+                    <tr v-if="expandedMatrixRows.has(idx)" class="bg-slate-50/80">
+                      <td colspan="8" class="px-4 py-2.5">
+                        <p v-if="entry.error" class="mb-1.5 text-xs text-rose-700">{{ entry.error }}</p>
+                        <pre
+                          class="max-h-40 overflow-auto rounded-lg bg-slate-950 p-2.5 font-mono text-[11px] leading-relaxed text-slate-200"
+                        >{{ entry.body_preview || "(empty body)" }}</pre>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
           <!-- Live Response Section -->
           <div
             class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
@@ -562,15 +1112,27 @@ async function copyResponseBody(): Promise<void> {
         </div>
 
         <!-- Footer -->
-        <div class="flex items-center justify-end gap-2.5 border-t border-slate-200 bg-slate-50 px-6 py-3.5">
+        <div class="flex flex-wrap items-center justify-end gap-2.5 border-t border-slate-200 bg-slate-50 px-6 py-3.5">
           <button type="button" class="btn-secondary" @click="emit('close')">
             {{ t("common.cancel") }}
+          </button>
+          <button
+            v-if="projectId"
+            type="button"
+            data-testid="try-it-matrix-btn"
+            class="btn-secondary border-indigo-200 bg-indigo-50/70 text-indigo-800 hover:bg-indigo-100"
+            :disabled="runningMatrix || sending"
+            @click="handleRunRoleMatrix"
+          >
+            <Loader2 v-if="runningMatrix" class="h-4 w-4 animate-spin text-indigo-600" />
+            <ShieldAlert v-else class="h-4 w-4 text-indigo-600" />
+            <span>{{ runningMatrix ? t("tryit.matrixRunning") : t("tryit.matrixBtn") }}</span>
           </button>
           <button
             type="button"
             data-testid="try-it-send-btn"
             class="btn-primary px-5"
-            :disabled="sending"
+            :disabled="sending || runningMatrix"
             @click="handleSend"
           >
             <Loader2 v-if="sending" class="h-4 w-4 animate-spin" />

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -382,6 +382,138 @@ async def test_project_inline_replay_credential_injection_and_ssrf_guard(
                 assert r_err.status_code == 200
                 assert r_err.json()["status_code"] == 0
                 assert r_err.json()["error"]
+    finally:
+        srv.shutdown()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_custom_business_roles_and_replay_matrix_bfla_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify custom role_tag values and concurrent /replay-matrix BFLA/IDOR detection."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "replay_matrix.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+    monkeypatch.setattr(Settings, "resolve_bin", lambda self, name: None)
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+
+    class _MatrixHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            auth = self.headers.get("Authorization", "")
+            if self.path == "/api/v1/admin-only":
+                if auth == "Bearer tok-admin":
+                    code, payload = 200, {"code": 0, "data": {"ok": True}}
+                elif auth == "Bearer tok-pharmacy":
+                    # HTTP 200 with business denial code 40300 -> must classify as denied
+                    code, payload = 200, {"code": 40300, "msg": "无权限访问"}
+                else:
+                    code, payload = 401, {"code": 401, "message": "Unauthorized"}
+            elif self.path == "/api/v1/bfla-leaked":
+                if auth in {"Bearer tok-admin", "Bearer tok-doctor"}:
+                    code, payload = 200, {"code": 0, "data": {"records": [1, 2]}}
+                else:
+                    code, payload = 403, {"code": 403, "message": "Forbidden"}
+            else:
+                code, payload = 200, {"code": 0, "public": True}
+
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _MatrixHandler)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+
+    from reconqa.server.app import create_app
+
+    try:
+        fastapi_app = create_app()
+        async with fastapi_app.router.lifespan_context(fastapi_app):
+            transport = httpx.ASGITransport(app=fastapi_app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                pid = (
+                    await client.post("/api/v1/projects", json={"name": "Multi-Portal Health"})
+                ).json()["id"]
+
+                # Verify custom business role_tags work cleanly
+                created_roles = []
+                for name, role, tok in (
+                    ("HQ Admin", "admin", "tok-admin"),
+                    ("Store Pharmacy", "pharmacy", "tok-pharmacy"),
+                    ("Clinic Doctor", "doctor", "tok-doctor"),
+                    ("Care Assistant", "assistant", "tok-assistant"),
+                ):
+                    r = await client.post(
+                        f"/api/v1/projects/{pid}/auth-profiles",
+                        json={
+                            "name": name,
+                            "role_tag": f" {role} ",
+                            "extra_headers_ref": {"Authorization": f"Bearer {tok}"},
+                        },
+                    )
+                    assert r.status_code == 201, r.text
+                    created_roles.append(r.json()["role_tag"])
+                assert created_roles == ["admin", "pharmacy", "doctor", "assistant"]
+
+                # 1. Properly protected admin-only endpoint -> only admin allowed, NO BFLA warning
+                m_safe = await client.post(
+                    f"/api/v1/projects/{pid}/replay-matrix",
+                    json={
+                        "method": "GET",
+                        "url": f"http://127.0.0.1:{port}/api/v1/admin-only",
+                        "include_anonymous": True,
+                    },
+                )
+                assert m_safe.status_code == 200, m_safe.text
+                safe_data = m_safe.json()
+                assert len(safe_data["results"]) == 5  # Anonymous + 4 roles
+                by_role = {e["role_tag"]: e for e in safe_data["results"]}
+                assert by_role["admin"]["verdict"] == "allowed"
+                assert by_role["pharmacy"]["verdict"] == "denied"
+                assert by_role["pharmacy"]["biz_code"] == 40300
+                assert by_role["anonymous"]["verdict"] == "denied"
+                assert safe_data["allowed_count"] == 1
+                assert safe_data["denied_count"] == 4
+                assert safe_data["potential_bfla_warning"] is False
+
+                # 2. Multi-role allowed endpoint (admin + doctor) -> potential_bfla_warning=True!
+                m_bfla = await client.post(
+                    f"/api/v1/projects/{pid}/replay-matrix",
+                    json={
+                        "method": "GET",
+                        "url": f"http://127.0.0.1:{port}/api/v1/bfla-leaked",
+                        "include_anonymous": True,
+                    },
+                )
+                assert m_bfla.status_code == 200, m_bfla.text
+                bfla_data = m_bfla.json()
+                assert bfla_data["allowed_count"] == 2
+                assert bfla_data["denied_count"] == 3
+                assert bfla_data["potential_bfla_warning"] is True
+                assert "tok-admin" not in json.dumps(bfla_data)
+
+                # 3. Anonymous-allowed endpoint -> potential_bfla_warning=True!
+                m_anon = await client.post(
+                    f"/api/v1/projects/{pid}/replay-matrix",
+                    json={
+                        "method": "GET",
+                        "url": f"http://127.0.0.1:{port}/api/v1/public-open",
+                        "include_anonymous": True,
+                    },
+                )
+                assert m_anon.status_code == 200
+                assert m_anon.json()["potential_bfla_warning"] is True
     finally:
         srv.shutdown()
         await asyncio.sleep(0)

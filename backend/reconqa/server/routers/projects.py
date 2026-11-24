@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import os
@@ -30,6 +31,9 @@ from reconqa.models.schemas import (
     ProjectCreate,
     ProjectInventoryResponse,
     ProjectOut,
+    ReplayMatrixEntry,
+    ReplayMatrixRequest,
+    ReplayMatrixResponse,
     ReplayRequest,
     ReplayResponse,
     TargetCreate,
@@ -634,23 +638,19 @@ def _load_credential_headers(profile: AuthProfile, target_host: str) -> dict[str
     return headers
 
 
-@router.post("/projects/{project_id}/replay", response_model=ReplayResponse)
-async def replay_project_endpoint(
-    project_id: str,
-    body: ReplayRequest,
-    db: AsyncSession = Depends(get_db),
-) -> ReplayResponse:
-    """Safely replay a single HTTP request inline with optional server-side credential injection."""
-    await _get_project_or_404(db, project_id)
+_DENIED_BIZ_CODES = {401, 403, 10001, 40001, 40100, 40300}
+_DENIED_MSG_KEYWORDS = ("无权限", "未登录", "unauthorized", "forbidden", "token", "登录过期", "失效")
 
-    method = (body.method or "GET").strip().upper()
+
+def _validate_replay_target(method_raw: str, url_raw: str) -> tuple[str, str, str]:
+    method = (method_raw or "GET").strip().upper()
     if method not in _ALLOWED_REPLAY_METHODS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported HTTP method '{body.method}'. Allowed: {sorted(_ALLOWED_REPLAY_METHODS)}",
+            detail=f"Unsupported HTTP method '{method_raw}'. Allowed: {sorted(_ALLOWED_REPLAY_METHODS)}",
         )
 
-    raw_url = (body.url or "").strip()
+    raw_url = (url_raw or "").strip()
     parsed = urlparse(raw_url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise HTTPException(
@@ -664,22 +664,26 @@ async def replay_project_endpoint(
             status_code=400,
             detail="Requests to cloud metadata or link-local addresses are blocked.",
         )
+    return method, raw_url, target_host
 
-    clamped_timeout = max(1.0, min(30.0, float(body.timeout_sec or 15.0)))
 
-    # Build outgoing headers: credential headers first, explicit user headers override case-insensitively
+async def _execute_single_replay(
+    *,
+    method: str,
+    raw_url: str,
+    target_host: str,
+    user_headers: dict[str, str],
+    query_params: dict[str, str],
+    body: Any,
+    profile: AuthProfile | None,
+    timeout_sec: float,
+) -> tuple[ReplayResponse, int]:
     merged_headers: dict[str, str] = {}
-    if body.credential_id:
-        profile = await db.get(AuthProfile, body.credential_id)
-        if profile is None or profile.project_id != project_id:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Credential '{body.credential_id}' not found in project '{project_id}'",
-            )
+    if profile is not None:
         merged_headers.update(_load_credential_headers(profile, target_host))
 
     lower_to_key = {k.lower(): k for k in merged_headers}
-    for k, v in (body.headers or {}).items():
+    for k, v in (user_headers or {}).items():
         clean_k = str(k).strip()
         if not clean_k or clean_k.startswith(":"):
             continue
@@ -691,15 +695,15 @@ async def replay_project_endpoint(
 
     req_kwargs: dict[str, Any] = {
         "headers": merged_headers,
-        "params": body.query_params or None,
+        "params": query_params or None,
     }
-    if body.body is not None and method not in {"GET", "HEAD"}:
-        if isinstance(body.body, (dict, list)):
-            req_kwargs["json"] = body.body
-        elif isinstance(body.body, str):
-            req_kwargs["content"] = body.body.encode("utf-8")
+    if body is not None and method not in {"GET", "HEAD"}:
+        if isinstance(body, (dict, list)):
+            req_kwargs["json"] = body
+        elif isinstance(body, str):
+            req_kwargs["content"] = body.encode("utf-8")
         else:
-            req_kwargs["json"] = body.body
+            req_kwargs["json"] = body
 
     trust_env = not _should_bypass_env_proxy(target_host)
     t0 = time.perf_counter()
@@ -707,22 +711,25 @@ async def replay_project_endpoint(
         async with httpx.AsyncClient(
             verify=False,
             follow_redirects=False,
-            timeout=clamped_timeout,
+            timeout=timeout_sec,
             trust_env=trust_env,
         ) as client:
             resp = await client.request(method, raw_url, **req_kwargs)
     except httpx.HTTPError as exc:
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return ReplayResponse(
-            status_code=0,
-            status_text="Network Error",
-            duration_ms=elapsed_ms,
-            response_headers={},
-            body_text="",
-            body_json=None,
-            content_type="",
-            truncated=False,
-            error=str(exc),
+        return (
+            ReplayResponse(
+                status_code=0,
+                status_text="Network Error",
+                duration_ms=elapsed_ms,
+                response_headers={},
+                body_text="",
+                body_json=None,
+                content_type="",
+                truncated=False,
+                error=str(exc),
+            ),
+            0,
         )
 
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -741,14 +748,164 @@ async def replay_project_endpoint(
                 body_json = None
 
     resp_headers = {k: v for k, v in resp.headers.items()}
-    return ReplayResponse(
-        status_code=resp.status_code,
-        status_text=resp.reason_phrase or "",
-        duration_ms=elapsed_ms,
-        response_headers=resp_headers,
-        body_text=body_text,
-        body_json=body_json,
-        content_type=content_type,
-        truncated=truncated,
-        error=None,
+    return (
+        ReplayResponse(
+            status_code=resp.status_code,
+            status_text=resp.reason_phrase or "",
+            duration_ms=elapsed_ms,
+            response_headers=resp_headers,
+            body_text=body_text,
+            body_json=body_json,
+            content_type=content_type,
+            truncated=truncated,
+            error=None,
+        ),
+        len(raw_content),
+    )
+
+
+def _classify_matrix_verdict(
+    status_code: int,
+    body_json: Any,
+) -> tuple[int | str | None, str]:
+    biz_code: int | str | None = None
+    if isinstance(body_json, dict) and "code" in body_json:
+        raw_code = body_json.get("code")
+        if isinstance(raw_code, (int, str)) and not isinstance(raw_code, bool):
+            biz_code = raw_code
+
+    if status_code == 0 or status_code >= 500:
+        return biz_code, "error"
+
+    if status_code in (401, 403):
+        return biz_code, "denied"
+
+    if isinstance(biz_code, int) and biz_code in _DENIED_BIZ_CODES:
+        return biz_code, "denied"
+    if isinstance(biz_code, str) and biz_code.isdigit() and int(biz_code) in _DENIED_BIZ_CODES:
+        return biz_code, "denied"
+
+    if isinstance(body_json, dict):
+        msg = str(body_json.get("message") or body_json.get("msg") or "").lower()
+        if any(kw in msg for kw in _DENIED_MSG_KEYWORDS):
+            return biz_code, "denied"
+
+    if 200 <= status_code < 300:
+        return biz_code, "allowed"
+    return biz_code, "denied"
+
+
+@router.post("/projects/{project_id}/replay", response_model=ReplayResponse)
+async def replay_project_endpoint(
+    project_id: str,
+    body: ReplayRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ReplayResponse:
+    """Safely replay a single HTTP request inline with optional server-side credential injection."""
+    await _get_project_or_404(db, project_id)
+    method, raw_url, target_host = _validate_replay_target(body.method, body.url)
+    clamped_timeout = max(1.0, min(30.0, float(body.timeout_sec or 15.0)))
+
+    profile: AuthProfile | None = None
+    if body.credential_id:
+        profile = await db.get(AuthProfile, body.credential_id)
+        if profile is None or profile.project_id != project_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Credential '{body.credential_id}' not found in project '{project_id}'",
+            )
+
+    resp, _ = await _execute_single_replay(
+        method=method,
+        raw_url=raw_url,
+        target_host=target_host,
+        user_headers=body.headers,
+        query_params=body.query_params,
+        body=body.body,
+        profile=profile,
+        timeout_sec=clamped_timeout,
+    )
+    return resp
+
+
+@router.post("/projects/{project_id}/replay-matrix", response_model=ReplayMatrixResponse)
+async def replay_project_endpoint_matrix(
+    project_id: str,
+    body: ReplayMatrixRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ReplayMatrixResponse:
+    """Concurrently replay an endpoint across Anonymous + multiple project role credentials."""
+    await _get_project_or_404(db, project_id)
+    method, raw_url, target_host = _validate_replay_target(body.method, body.url)
+    clamped_timeout = max(1.0, min(30.0, float(body.timeout_sec or 15.0)))
+
+    res = await db.execute(select(AuthProfile).where(AuthProfile.project_id == project_id))
+    all_profiles = list(res.scalars().all())
+    if body.credential_ids:
+        by_id = {p.id: p for p in all_profiles}
+        selected_profiles: list[AuthProfile] = []
+        for cid in body.credential_ids:
+            prof = by_id.get(cid)
+            if prof is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Credential '{cid}' not found in project '{project_id}'",
+                )
+            selected_profiles.append(prof)
+    else:
+        selected_profiles = all_profiles
+
+    targets: list[tuple[str | None, str, str, AuthProfile | None]] = []
+    if body.include_anonymous:
+        targets.append((None, "Anonymous", "anonymous", None))
+    for prof in selected_profiles:
+        targets.append((prof.id, prof.name, prof.role_tag, prof))
+
+    async def _run_entry(
+        cred_id: str | None,
+        cred_name: str,
+        role_tag: str,
+        prof: AuthProfile | None,
+    ) -> ReplayMatrixEntry:
+        resp, raw_size = await _execute_single_replay(
+            method=method,
+            raw_url=raw_url,
+            target_host=target_host,
+            user_headers=body.headers,
+            query_params=body.query_params,
+            body=body.body,
+            profile=prof,
+            timeout_sec=clamped_timeout,
+        )
+        biz_code, verdict = _classify_matrix_verdict(resp.status_code, resp.body_json)
+        return ReplayMatrixEntry(
+            credential_id=cred_id,
+            credential_name=cred_name,
+            role_tag=role_tag,
+            status_code=resp.status_code,
+            biz_code=biz_code,
+            duration_ms=resp.duration_ms,
+            body_size=raw_size,
+            body_preview=(resp.body_text or "")[:500],
+            verdict=verdict,  # type: ignore[arg-type]
+            error=resp.error,
+        )
+
+    entries = list(await asyncio.gather(*(_run_entry(*t) for t in targets)))
+    allowed_count = sum(1 for e in entries if e.verdict == "allowed")
+    denied_count = sum(1 for e in entries if e.verdict == "denied")
+
+    anon_allowed = any(e.role_tag == "anonymous" and e.verdict == "allowed" for e in entries)
+    distinct_allowed_roles = {
+        e.role_tag.strip().lower() for e in entries if e.verdict == "allowed"
+    }
+    potential_bfla = anon_allowed or len(distinct_allowed_roles) >= 2
+
+    return ReplayMatrixResponse(
+        method=method,
+        url=raw_url,
+        results=entries,
+        allowed_count=allowed_count,
+        denied_count=denied_count,
+        potential_bfla_warning=potential_bfla,
     )

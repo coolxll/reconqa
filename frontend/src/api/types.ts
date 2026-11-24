@@ -1,4 +1,4 @@
-export type RoleTag = "account_a" | "account_b" | "guest";
+export type RoleTag = string;
 
 export type TriggerSource = "cli" | "web" | "ci";
 
@@ -736,6 +736,98 @@ export interface ReplayResponse {
   content_type: string;
   truncated: boolean;
   error?: string | null;
+}
+
+export interface ReplayMatrixRequest {
+  method: string;
+  url: string;
+  headers?: Record<string, string>;
+  query_params?: Record<string, string>;
+  body?: unknown;
+  credential_ids?: string[] | null;
+  include_anonymous?: boolean;
+  timeout_sec?: number;
+}
+
+export interface ReplayMatrixEntry {
+  credential_id: string | null;
+  credential_name: string;
+  role_tag: string;
+  status_code: number;
+  biz_code?: number | string | null;
+  duration_ms: number;
+  body_size: number;
+  body_preview: string;
+  verdict: "allowed" | "denied" | "error";
+  error?: string | null;
+}
+
+export interface ReplayMatrixResponse {
+  method: string;
+  url: string;
+  results: ReplayMatrixEntry[];
+  allowed_count: number;
+  denied_count: number;
+  potential_bfla_warning: boolean;
+}
+
+// --- Autonomous Acceptance Glue APIs ---
+
+export interface ExtractCredentialRequest {
+  run_id?: string | null;
+  name?: string | null;
+  role_tag?: RoleTag;
+  target_host?: string | null;
+}
+
+export interface ExtractCredentialResponse {
+  profile: AuthProfile;
+  extracted_header_names: string[];
+  source_run_id: string;
+  source_host: string;
+}
+
+export type ExternalToolName = "java_test" | "schemathesis" | "nuclei" | "k6";
+
+export interface ExecuteExternalToolRequest {
+  tool: ExternalToolName;
+  credential_id?: string | null;
+  base_url?: string | null;
+  sync_scenarios?: boolean;
+  timeout_sec?: number;
+}
+
+export interface ExecuteExternalToolResponse {
+  executed: boolean;
+  tool: string;
+  status: string;
+  duration_ms: number;
+  summary: Record<string, unknown>;
+  stdout_tail: string;
+  synced_scenarios: number;
+  synced_assertions: number;
+  synced_negative_cases: number;
+  error?: string | null;
+}
+
+export type AcceptancePromptAgent = "generic" | "antigravity" | "claude" | "codex" | "openclaw";
+
+export interface AcceptancePromptContextSummary {
+  targets_count: number;
+  credentials_count: number;
+  kb_docs_count: number;
+  coverage_pct: number;
+  p0_p1_effective_pct: number;
+  scenarios_needing_attention: number;
+}
+
+export interface AcceptancePromptResponse {
+  project_id: string;
+  project_name: string;
+  lang: string;
+  agent: string;
+  prompt_markdown: string;
+  context_summary: AcceptancePromptContextSummary;
 }
 
 // --- SSE Events ---

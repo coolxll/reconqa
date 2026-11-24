@@ -37,6 +37,8 @@ _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _VALID_DOC_TYPES = frozenset(
     {"prd", "api_spec", "business_rule", "test_notes", "architecture", "other"}
 )
+_VALID_EXTERNAL_TOOLS = frozenset({"java_test", "schemathesis", "nuclei", "k6"})
+_MAX_REPLAY_TEXT_CHARS = 4096
 _SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 _TERMINAL_RUN_STATUSES = frozenset({"completed", "failed"})
 _URL_RE = re.compile(r"https?://[^\s'\"<>\\]+", re.IGNORECASE)
@@ -360,7 +362,7 @@ def create_mcp_server(
         ),
     )
 
-    # --- 14 Token-Efficient MCP Tools ---
+    # --- 17 Token-Efficient MCP Tools ---
 
     async def _resolve_or_create_project(
         project_id: str | None,
@@ -1095,6 +1097,140 @@ def create_mcp_server(
                 "negative_case_count", len(data.get("negative_cases") or [])
             ),
             "effectiveness_level": data.get("effectiveness_level", "L0"),
+        }
+
+    @mcp.tool()
+    async def reconqa_extract_credential(
+        project_id: str,
+        run_id: str | None = None,
+        name: str | None = None,
+        role_tag: str = "account_a",
+    ) -> dict[str, Any]:
+        """Auto-extract auth headers from a run's HAR traffic into a saved project AuthProfile (never echoes raw secrets)."""
+        payload: dict[str, Any] = {"role_tag": (role_tag or "account_a").strip() or "account_a"}
+        if run_id and run_id.strip():
+            payload["run_id"] = run_id.strip()
+        if name and name.strip():
+            payload["name"] = name.strip()
+
+        data = await client.request_json(
+            "POST",
+            f"/projects/{project_id}/auth-profiles/extract-from-har",
+            json_body=payload,
+        )
+        profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+        return {
+            "profile_id": profile.get("id") or data.get("profile_id"),
+            "name": profile.get("name") or data.get("name", ""),
+            "role_tag": profile.get("role_tag") or data.get("role_tag", payload["role_tag"]),
+            "extracted_header_names": list(data.get("extracted_header_names") or []),
+            "source_run_id": data.get("source_run_id", ""),
+            "source_host": data.get("source_host", ""),
+        }
+
+    @mcp.tool()
+    async def reconqa_replay_endpoint(
+        project_id: str,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        query_params: dict[str, str] | None = None,
+        body: Any = None,
+        credential_id: str | None = None,
+        timeout_sec: float = 15.0,
+    ) -> dict[str, Any]:
+        """Safely replay an HTTP endpoint via ReconQA with optional server-side AuthProfile injection (4KB response cap)."""
+        eff_timeout = max(1.0, min(float(timeout_sec or 15.0), 30.0))
+        payload: dict[str, Any] = {
+            "method": (method or "GET").strip().upper(),
+            "url": url.strip(),
+            "headers": dict(headers or {}),
+            "query_params": dict(query_params or {}),
+            "body": body,
+            "credential_id": credential_id,
+            "timeout_sec": eff_timeout,
+        }
+        data = await client.request_json(
+            "POST",
+            f"/projects/{project_id}/replay",
+            json_body=payload,
+            timeout=eff_timeout + 10.0,
+        )
+
+        raw_body_text = str(data.get("body_text") or "")
+        raw_body_json = data.get("body_json")
+        truncated = bool(data.get("truncated", False))
+
+        safe_body_json: Any = raw_body_json
+        if raw_body_json is not None:
+            try:
+                serialized = json.dumps(raw_body_json, ensure_ascii=False)
+                if len(serialized) > _MAX_REPLAY_TEXT_CHARS:
+                    safe_body_json = None
+                    if not raw_body_text:
+                        raw_body_text = serialized
+                    truncated = True
+            except Exception:
+                safe_body_json = None
+
+        if len(raw_body_text) > _MAX_REPLAY_TEXT_CHARS:
+            safe_body_text = _truncate_str(raw_body_text, _MAX_REPLAY_TEXT_CHARS)
+            truncated = True
+        else:
+            safe_body_text = raw_body_text
+
+        return {
+            "status_code": int(data.get("status_code", 0) or 0),
+            "status_text": str(data.get("status_text") or ""),
+            "duration_ms": float(data.get("duration_ms", 0.0) or 0.0),
+            "content_type": str(data.get("content_type") or ""),
+            "body_json": safe_body_json,
+            "body_text": safe_body_text,
+            "truncated": truncated,
+            "error": data.get("error"),
+        }
+
+    @mcp.tool()
+    async def reconqa_run_external_tool(
+        project_id: str,
+        run_id: str,
+        tool: str,
+        credential_id: str | None = None,
+        base_url: str | None = None,
+        sync_scenarios: bool = True,
+        timeout_sec: int = 120,
+    ) -> dict[str, Any]:
+        """Run an external verification tool ('java_test', 'schemathesis', 'nuclei', 'k6') and auto-sync Scenario L0-L4 status."""
+        norm_tool = (tool or "").strip().lower()
+        if norm_tool not in _VALID_EXTERNAL_TOOLS:
+            raise ValueError(
+                f"Unsupported tool '{tool}'. Expected one of: {', '.join(sorted(_VALID_EXTERNAL_TOOLS))}."
+            )
+        eff_timeout = max(15, min(int(timeout_sec or 120), 300))
+        payload: dict[str, Any] = {
+            "tool": norm_tool,
+            "credential_id": credential_id,
+            "base_url": base_url,
+            "sync_scenarios": sync_scenarios,
+            "timeout_sec": eff_timeout,
+        }
+        data = await client.request_json(
+            "POST",
+            f"/projects/{project_id}/runs/{run_id}/execute-tool",
+            json_body=payload,
+            timeout=float(eff_timeout) + 30.0,
+        )
+        return {
+            "executed": bool(data.get("executed", False)),
+            "tool": str(data.get("tool") or norm_tool),
+            "status": str(data.get("status") or "unknown"),
+            "duration_ms": float(data.get("duration_ms", 0.0) or 0.0),
+            "summary": data.get("summary") or {},
+            "synced_scenarios": int(data.get("synced_scenarios", 0) or 0),
+            "synced_assertions": int(data.get("synced_assertions", 0) or 0),
+            "synced_negative_cases": int(data.get("synced_negative_cases", 0) or 0),
+            "stdout_tail": _truncate_str(str(data.get("stdout_tail") or ""), _MAX_REPLAY_TEXT_CHARS),
+            "error": data.get("error"),
         }
 
     # --- 3 MCP Resources ---

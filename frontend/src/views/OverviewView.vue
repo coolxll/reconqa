@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   ArrowRight,
   BookOpen,
+  Bot,
   CheckCircle2,
   Code2,
   Compass,
@@ -39,6 +40,7 @@ import { useI18n } from "@/i18n";
 import StatusBadge from "@/components/layout/StatusBadge.vue";
 import MetricCard from "@/components/layout/MetricCard.vue";
 import EmptyState from "@/components/layout/EmptyState.vue";
+import AcceptancePromptModal from "@/components/workspace/AcceptancePromptModal.vue";
 
 interface DoctorEntry extends DoctorToolStatus {
   name: string;
@@ -61,6 +63,7 @@ const projectId = computed(
 const loading = ref(true);
 const doctorLoading = ref(true);
 const error = ref<string | null>(null);
+const acceptancePromptOpen = ref(false);
 
 const inventory = ref<ProjectInventoryResponse | null>(null);
 const scenarioSummary = ref<ScenarioListResponse | null>(null);
@@ -299,6 +302,15 @@ onMounted(async () => {
           </div>
 
           <div class="flex shrink-0 flex-wrap items-center gap-2">
+            <button
+              type="button"
+              data-testid="ai-acceptance-prompt-btn"
+              class="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-violet-500 to-indigo-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm ring-1 ring-inset ring-white/20 transition hover:from-violet-400 hover:to-indigo-400"
+              @click="acceptancePromptOpen = true"
+            >
+              <Bot class="h-4 w-4" />
+              <span>{{ t("acceptPrompt.btn") }}</span>
+            </button>
             <router-link
               :to="{ path: workspacePath('runs', projectId), query: { new: '1' } }"
               class="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-400"
@@ -675,5 +687,12 @@ onMounted(async () => {
         </div>
       </section>
     </template>
+
+    <!-- One-Click AI Acceptance Prompt Modal -->
+    <AcceptancePromptModal
+      :open="acceptancePromptOpen"
+      :project-id="projectId"
+      @close="acceptancePromptOpen = false"
+    />
   </div>
 </template>

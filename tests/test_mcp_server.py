@@ -1,4 +1,4 @@
-"""Integration tests for ReconQA MCP Server (14 tools & 3 resources via FastAPI & mocks)."""
+"""Integration tests for ReconQA MCP Server (17 tools & 3 resources via FastAPI & mocks)."""
 
 from __future__ import annotations
 
@@ -27,6 +27,9 @@ EXPECTED_TOOLS = {
     "reconqa_get_project_inventory",
     "reconqa_list_scenarios",
     "reconqa_upsert_scenario",
+    "reconqa_extract_credential",
+    "reconqa_replay_endpoint",
+    "reconqa_run_external_tool",
 }
 
 EXPECTED_RESOURCE_TEMPLATES = {
@@ -501,4 +504,172 @@ async def test_mcp_inventory_and_scenarios_tools_mocked() -> None:
         "POST",
         "/api/v1/projects/proj_1/scenarios",
         {"upsert": "true"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_external_acceptance_tools_mocked() -> None:
+    """Verify extract_credential, replay_endpoint (4KB cap), and run_external_tool via mocks."""
+    captured: list[tuple[str, str, Any]] = []
+    secret_sentinel = "FAKE-TOKEN-VALUE-MUST-NOT-ECHO"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        captured.append((request.method, request.url.path, body))
+
+        if (
+            request.method == "POST"
+            and request.url.path == "/api/v1/projects/proj_1/auth-profiles/extract-from-har"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "profile": {
+                        "id": "cred_1",
+                        "project_id": "proj_1",
+                        "name": body.get("name") or "Auto-Extracted Session (shop.example.com)",
+                        "role_tag": body.get("role_tag", "account_a"),
+                        "storage_state_path": None,
+                        "extra_headers_ref": {"Authorization": secret_sentinel},
+                    },
+                    "extracted_header_names": ["Authorization"],
+                    "source_run_id": body.get("run_id") or "run_9",
+                    "source_host": "shop.example.com",
+                },
+            )
+
+        if request.method == "POST" and request.url.path == "/api/v1/projects/proj_1/replay":
+            oversized = "X" * 8000
+            return httpx.Response(
+                200,
+                json={
+                    "status_code": 200,
+                    "status_text": "OK",
+                    "duration_ms": 42.5,
+                    "response_headers": {"content-type": "application/json"},
+                    "body_text": oversized,
+                    "body_json": {"payload": oversized},
+                    "content_type": "application/json",
+                    "truncated": False,
+                    "error": None,
+                },
+            )
+
+        if (
+            request.method == "POST"
+            and request.url.path == "/api/v1/projects/proj_1/runs/run_9/execute-tool"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "executed": True,
+                    "tool": body["tool"],
+                    "status": "passed",
+                    "duration_ms": 1820.0,
+                    "summary": {"total": 5, "passed": 5, "failed": 0},
+                    "stdout_tail": "Tests run: 5, Failures: 0",
+                    "synced_scenarios": 2,
+                    "synced_assertions": 4,
+                    "synced_negative_cases": 1,
+                    "error": None,
+                },
+            )
+
+        return httpx.Response(404, json={"detail": f"Unhandled mock route: {request.url}"})
+
+    mcp = create_mcp_server("http://127.0.0.1:8000", transport=httpx.MockTransport(handler))
+
+    # 1. reconqa_extract_credential returns metadata only (ZERO raw secret echo!)
+    extracted = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_extract_credential",
+            {
+                "project_id": "proj_1",
+                "run_id": "run_9",
+                "name": "Shop Account A",
+                "role_tag": "account_a",
+            },
+        )
+    )
+    assert extracted == {
+        "profile_id": "cred_1",
+        "name": "Shop Account A",
+        "role_tag": "account_a",
+        "extracted_header_names": ["Authorization"],
+        "source_run_id": "run_9",
+        "source_host": "shop.example.com",
+    }
+    assert secret_sentinel not in json.dumps(extracted)
+
+    # 2. reconqa_replay_endpoint enforces 4KB cap for LLM token safety
+    replayed = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_replay_endpoint",
+            {
+                "project_id": "proj_1",
+                "method": "get",
+                "url": "https://shop.example.com/api/v1/orders",
+                "query_params": {"page": "1"},
+                "credential_id": "cred_1",
+                "timeout_sec": 10.0,
+            },
+        )
+    )
+    assert replayed["status_code"] == 200
+    assert replayed["truncated"] is True
+    assert replayed["body_json"] is None
+    assert len(replayed["body_text"]) <= 4096
+    assert replayed["body_text"].endswith("...")
+
+    # 3. reconqa_run_external_tool forwards payload and returns sync-back counts
+    tool_res = _extract_json_result(
+        await mcp.call_tool(
+            "reconqa_run_external_tool",
+            {
+                "project_id": "proj_1",
+                "run_id": "run_9",
+                "tool": "java_test",
+                "credential_id": "cred_1",
+                "base_url": "https://shop.example.com",
+                "sync_scenarios": True,
+                "timeout_sec": 90,
+            },
+        )
+    )
+    assert tool_res["executed"] is True
+    assert tool_res["tool"] == "java_test"
+    assert tool_res["status"] == "passed"
+    assert tool_res["synced_scenarios"] == 2
+    assert tool_res["synced_assertions"] == 4
+    assert tool_res["synced_negative_cases"] == 1
+    assert "Tests run: 5" in tool_res["stdout_tail"]
+
+    assert captured[0] == (
+        "POST",
+        "/api/v1/projects/proj_1/auth-profiles/extract-from-har",
+        {"role_tag": "account_a", "run_id": "run_9", "name": "Shop Account A"},
+    )
+    assert captured[1] == (
+        "POST",
+        "/api/v1/projects/proj_1/replay",
+        {
+            "method": "GET",
+            "url": "https://shop.example.com/api/v1/orders",
+            "headers": {},
+            "query_params": {"page": "1"},
+            "body": None,
+            "credential_id": "cred_1",
+            "timeout_sec": 10.0,
+        },
+    )
+    assert captured[2] == (
+        "POST",
+        "/api/v1/projects/proj_1/runs/run_9/execute-tool",
+        {
+            "tool": "java_test",
+            "credential_id": "cred_1",
+            "base_url": "https://shop.example.com",
+            "sync_scenarios": True,
+            "timeout_sec": 90,
+        },
     )

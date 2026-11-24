@@ -35,6 +35,7 @@ import SseLogConsole from '@/components/runs/SseLogConsole.vue'
 import OpenApiExplorer from '@/components/runs/OpenApiExplorer.vue'
 import CorrelationPanel from '@/components/runs/CorrelationPanel.vue'
 import ArtifactsPanel from '@/components/runs/ArtifactsPanel.vue'
+import ExternalToolRunnerCard from '@/components/runs/ExternalToolRunnerCard.vue'
 import '@/i18n/locales/runs'
 import { useI18n } from '@/i18n'
 
@@ -723,6 +724,13 @@ onMounted(() => {
             </table>
           </div>
         </div>
+
+        <!-- Real External Tool Runner & Scenario Sync-Back -->
+        <ExternalToolRunnerCard
+          :project-id="run.project_id"
+          :run-id="run.id"
+          @executed="reloadRun"
+        />
 
         <!-- Live SSE Console -->
         <SseLogConsole

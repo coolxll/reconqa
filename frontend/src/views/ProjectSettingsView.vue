@@ -6,10 +6,12 @@ import {
   CheckCircle2,
   Globe,
   KeyRound,
+  Loader2,
   PlayCircle,
   Plus,
   Settings,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Upload,
   X,
@@ -19,6 +21,7 @@ import {
   createTarget,
   deleteAuthProfile,
   deleteTarget,
+  extractCredentialFromHar,
   listAuthProfiles,
   listTargets,
   uploadStorageState,
@@ -45,13 +48,22 @@ const projectId = computed(() =>
     : activeProjectId.value
 );
 
-const initialTab =
-  route.query.tab === "auth"
-    ? "auth"
-    : route.query.tab === "general"
-      ? "general"
-      : "targets";
-const activeTab = ref<"targets" | "auth" | "general">(initialTab);
+function resolveTabFromQuery(raw: unknown): "targets" | "auth" | "general" {
+  if (raw === "auth" || raw === "credentials") return "auth";
+  if (raw === "general") return "general";
+  return "targets";
+}
+
+const activeTab = ref<"targets" | "auth" | "general">(resolveTabFromQuery(route.query.tab));
+
+watch(
+  () => route.query.tab,
+  (next) => {
+    if (next) {
+      activeTab.value = resolveTabFromQuery(next);
+    }
+  }
+);
 
 const targets = ref<Target[]>([]);
 const authProfiles = ref<AuthProfile[]>([]);
@@ -61,10 +73,12 @@ const bannerSuccess = ref<string | null>(null);
 
 // Targets form
 const addingTarget = ref(false);
+const targetPortalLabel = ref("");
 const targetRootDomain = ref("");
 const targetBaseUrl = ref("");
 
 // Credentials form
+const ROLE_PRESETS = ["admin", "pharmacy", "doctor", "assistant", "account_a", "account_b", "guest"] as const;
 const addingProfile = ref(false);
 const profileName = ref("");
 const profileRole = ref<RoleTag>("account_a");
@@ -72,6 +86,7 @@ const headerRefRows = ref<HeaderRefRow[]>([
   { header: "Authorization", envRef: "ENV:RECONQA_ACCOUNT_A_TOKEN" },
 ]);
 const uploadingProfileId = ref<string | null>(null);
+const extractingFromHar = ref(false);
 
 // Delete project confirm
 const confirmingDeleteProject = ref(false);
@@ -108,6 +123,19 @@ function storageStateBasename(fullPath: string | null): string {
   if (!fullPath) return "";
   const parts = fullPath.split(/[\\/]/);
   return parts[parts.length - 1] || fullPath;
+}
+
+function maskHeaderValue(val: string): string {
+  const trimmed = (val ?? "").trim();
+  if (!trimmed) return "—";
+  if (trimmed.startsWith("ENV:")) return trimmed;
+  if (trimmed.length > 10) {
+    return `${trimmed.slice(0, 4)}•••${trimmed.slice(-4)}`;
+  }
+  if (trimmed.length > 4) {
+    return `${trimmed.slice(0, 2)}•••`;
+  }
+  return "••••";
 }
 
 async function loadDetails(): Promise<void> {
@@ -156,12 +184,14 @@ async function handleAddTarget(): Promise<void> {
   if (!projectId.value || !targetRootDomain.value.trim() || !targetBaseUrl.value.trim()) return;
   addingTarget.value = true;
   try {
+    const portalLabel = targetPortalLabel.value.trim();
     const created = await createTarget(projectId.value, {
       root_domain: targetRootDomain.value.trim(),
       base_url: targetBaseUrl.value.trim(),
-      scope_rules: {},
+      scope_rules: portalLabel ? { portal_label: portalLabel } : {},
     });
     targets.value = [...targets.value, created];
+    targetPortalLabel.value = "";
     targetRootDomain.value = "";
     targetBaseUrl.value = "";
     notifySuccess(t("projects.toast.targetAdded", { domain: created.root_domain }));
@@ -170,6 +200,11 @@ async function handleAddTarget(): Promise<void> {
   } finally {
     addingTarget.value = false;
   }
+}
+
+function getTargetPortalLabel(target: Target): string {
+  const raw = target.scope_rules?.portal_label;
+  return typeof raw === "string" ? raw.trim() : "";
 }
 
 async function handleDeleteTarget(targetId: string): Promise<void> {
@@ -218,6 +253,24 @@ async function handleDeleteAuthProfile(profileId: string): Promise<void> {
     notifySuccess(t("projects.toast.profileDeleted"));
   } catch (err) {
     notifyError(err, t("projects.err.deleteProfile"));
+  }
+}
+
+async function handleExtractFromHar(): Promise<void> {
+  if (!projectId.value || extractingFromHar.value) return;
+  extractingFromHar.value = true;
+  try {
+    const res = await extractCredentialFromHar(projectId.value);
+    const exists = authProfiles.value.some((p) => p.id === res.profile.id);
+    authProfiles.value = exists
+      ? authProfiles.value.map((p) => (p.id === res.profile.id ? res.profile : p))
+      : [...authProfiles.value, res.profile];
+    const headersText = res.extracted_header_names.join(", ") || "auth";
+    notifySuccess(t("tryit.extractHarSuccess", { headers: headersText }));
+  } catch (err) {
+    notifyError(err, t("tryit.extractHarErr"));
+  } finally {
+    extractingFromHar.value = false;
   }
 }
 
@@ -356,7 +409,19 @@ onMounted(() => {
       <form class="card p-5" @submit.prevent="handleAddTarget">
         <h3 class="text-sm font-semibold text-slate-900">{{ t("projects.target.formTitle") }}</h3>
         <p class="mt-0.5 text-xs text-slate-500">{{ t("projects.target.formDesc") }}</p>
-        <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-700">
+              {{ t("settings.target.portalLabel") }}
+            </label>
+            <input
+              v-model="targetPortalLabel"
+              data-testid="target-portal-label-input"
+              type="text"
+              :placeholder="t('settings.target.portalPlaceholder')"
+              class="input-field text-xs"
+            />
+          </div>
           <div>
             <label class="mb-1 block text-xs font-medium text-slate-700">
               {{ t("projects.target.rootDomain") }}
@@ -410,8 +475,15 @@ onMounted(() => {
             class="flex flex-col justify-between gap-3 px-5 py-4 sm:flex-row sm:items-center"
           >
             <div class="min-w-0">
-              <div class="flex items-center gap-2">
+              <div class="flex flex-wrap items-center gap-2">
                 <Globe class="h-4 w-4 shrink-0 text-indigo-500" />
+                <span
+                  v-if="getTargetPortalLabel(target)"
+                  data-testid="target-portal-badge"
+                  class="rounded-md bg-indigo-50 px-2 py-0.5 text-xs font-semibold text-indigo-700 ring-1 ring-inset ring-indigo-600/20"
+                >
+                  {{ getTargetPortalLabel(target) }}
+                </span>
                 <span class="truncate font-mono text-sm font-semibold text-slate-900">
                   {{ target.root_domain }}
                 </span>
@@ -504,11 +576,31 @@ onMounted(() => {
             <label class="mb-1 block text-xs font-medium text-slate-700">
               {{ t("projects.auth.roleLabel") }}
             </label>
-            <select v-model="profileRole" class="input-field text-xs">
-              <option value="account_a">{{ t("projects.auth.roleA") }}</option>
-              <option value="account_b">{{ t("projects.auth.roleB") }}</option>
-              <option value="guest">{{ t("projects.auth.roleGuest") }}</option>
-            </select>
+            <input
+              v-model="profileRole"
+              data-testid="auth-role-input"
+              type="text"
+              required
+              :placeholder="t('settings.auth.customRolePlaceholder')"
+              class="input-field font-mono text-xs"
+            />
+            <div class="mt-1.5 flex flex-wrap items-center gap-1">
+              <button
+                v-for="rolePreset in ROLE_PRESETS"
+                :key="rolePreset"
+                type="button"
+                class="rounded px-1.5 py-0.5 font-mono text-[10px] font-medium transition"
+                :class="
+                  profileRole === rolePreset
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                "
+                @click="profileRole = rolePreset"
+              >
+                {{ rolePreset }}
+              </button>
+            </div>
+            <p class="mt-1 text-[10px] text-slate-400">{{ t("settings.auth.rolePresetsHint") }}</p>
           </div>
         </div>
 
@@ -538,7 +630,7 @@ onMounted(() => {
               <input
                 v-model="row.envRef"
                 type="text"
-                placeholder="ENV:RECONQA_ACCOUNT_A_TOKEN"
+                :placeholder="t('settings.auth.valuePlaceholder')"
                 class="input-field !py-1.5 font-mono text-xs"
               />
               <button
@@ -551,6 +643,9 @@ onMounted(() => {
               </button>
             </div>
           </div>
+          <p class="mt-2 text-[11px] leading-relaxed text-slate-500">
+            {{ t("settings.auth.valueSupportHint") }}
+          </p>
         </div>
 
         <div class="mt-4 flex justify-end">
@@ -564,6 +659,17 @@ onMounted(() => {
       <div class="card overflow-hidden">
         <div class="card-header">
           <h3 class="text-sm font-semibold text-slate-900">{{ t("projects.auth.listTitle") }}</h3>
+          <button
+            type="button"
+            data-testid="extract-har-cred-btn"
+            class="btn-secondary !py-1.5 !text-xs"
+            :disabled="extractingFromHar || !projectId"
+            @click="handleExtractFromHar"
+          >
+            <Loader2 v-if="extractingFromHar" class="h-3.5 w-3.5 animate-spin text-indigo-600" />
+            <Sparkles v-else class="h-3.5 w-3.5 text-indigo-600" />
+            <span>{{ extractingFromHar ? t("tryit.extractingHarBtn") : t("tryit.extractHarBtn") }}</span>
+          </button>
         </div>
         <div v-if="loadingDetails" class="p-6 text-center text-xs text-slate-500">
           {{ t("projects.auth.loading") }}
@@ -643,7 +749,7 @@ onMounted(() => {
               >
                 <span class="font-semibold">{{ headerKey }}</span>
                 <span class="text-slate-400">→</span>
-                <span>{{ envVal }}</span>
+                <span data-testid="masked-header-value">{{ maskHeaderValue(envVal) }}</span>
               </span>
             </div>
           </div>

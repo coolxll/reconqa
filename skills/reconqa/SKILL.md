@@ -18,6 +18,8 @@ ReconQA is a **"one-recording, multi-use"** Web/API testing platform backed by a
 | Import pasted cURL / fetch / Raw HTTP / HAR & build OpenAPI + correlations | **MCP** (`reconqa_import_traffic_and_analyze`, `reconqa_upload_har_files`, `reconqa_get_run_summary`) | Auto-links project, runs fast `["merge"]`, exposes `reconqa://` resources |
 | Inspect cumulative project API inventory across Explore + Runs | **MCP** (`reconqa_get_project_inventory`) | Returns merged `har-live` vs `js-static` coverage, prefix stats, and filtered endpoints |
 | Track business scenarios, P0–P3 priorities, and L0–L4 testing effectiveness | **MCP** (`reconqa_list_scenarios`, `reconqa_upsert_scenario`) | Identifies `P0/P1` scenarios lacking assertions/negative cases and compiles business assertions into Java RestAssured tests |
+| Auto-extract auth credentials from HARs & replay endpoints safely | **MCP** (`reconqa_extract_credential`, `reconqa_replay_endpoint`) | Server-side AuthProfile injection (zero secret echo to LLM) + SSRF guard + 4KB response cap |
+| Execute external test/fuzz/security/load runners with auto Scenario sync-back | **MCP** (`reconqa_run_external_tool`) | Runs `java_test`, `schemathesis`, `nuclei`, or `k6` and syncs assertion/negative-case status back into Scenarios (`L0`–`L4`) |
 | Trigger Java codegen, HAR/k6 performance, or security audit on demand | **MCP** (`reconqa_execute_run_modules`, `reconqa_list_findings`) | Progressive execution: run only the capability you need, when you need it |
 | Execute generated Maven tests or Allure report locally | **CLI** (`mvn test`, `allure serve target/allure-results`) | Local build/runtime execution against the generated `java-tests/` workspace |
 | Execute k6 load tests or check local binaries | **CLI** (`k6 run scenario_ramp.js`, `reconqa doctor`) | High-throughput local load generation and host toolchain diagnostics |
@@ -87,13 +89,18 @@ Use this playbook when you have browser automation (or a human co-pilot) and wan
    - ReconQA auto-detects the primary host, links/creates the project, runs fast `["merge"]` (OpenAPI 3.0.3 + correlation chains + JS Coverage Diff), and surfaces the live run immediately in the Vue 3 Web Console.
    - Follow up on demand with `reconqa_execute_run_modules(run_id, ["java_gen" | "perf" | "security"])`.
 
-### Effectiveness Loop (Beyond HTTP 200)
-Capturing `HTTP 200` traffic alone only proves an endpoint responds (`L1`/`L2`); true QA effectiveness verifies **business invariants and negative paths** (`L3`/`L4`):
-1. Read PRDs and business rules from `reconqa://projects/{project_id}/knowledge`, inspect cumulative API coverage via `reconqa_get_project_inventory(project_id)`, and inspect scenario effectiveness via `reconqa_list_scenarios(project_id)`.
-2. Identify **`P0`/`P1` scenarios stuck at `L1` (Captured) or `L2` (Smoke)** (`p0_p1_effective_pct < 100%`).
-3. Enrich each high-priority scenario via `reconqa_upsert_scenario(project_id, slug=..., name=..., description=..., preconditions=..., business_domain=..., priority="P0"|"P1", assertions=[...], negative_cases=[...])`:
-   - Add structured `assertions` (`target_endpoint`, `jsonpath`, `operator`, `expected`, `note`)—ReconQA compiles these directly into Java RestAssured test assertions when you run `reconqa_execute_run_modules(run_id, ["java_gen"])`!
-   - Add `negative_cases` (`auth`, `validation`, `boundary`, `idempotency`, `state_machine`, `security`) so humans and agents systematically close edge-case blind spots.
+### Autonomous 0->1 External-System Acceptance Loop (Beyond HTTP 200)
+Capturing `HTTP 200` traffic alone only proves an endpoint responds (`L1`/`L2`); true acceptance verifies **business invariants, negative paths, security, and load** (`L3`/`L4`) using real external runners:
+1. **Surface & Traffic Capture**: Start with `reconqa_explore_from_seed` and/or Playwright read-only roaming -> `reconqa_upload_har_files(har_paths=["./roam_hars"], wait=True)`.
+2. **Zero-Secret Session Extraction**: Call `reconqa_extract_credential(project_id, run_id=..., role_tag="account_a")` to capture session headers from the recorded HAR into a server-side `AuthProfile` (returns only `profile_id` and header names—raw tokens never enter LLM context).
+3. **Ground & Enrich Scenarios**: Read PRDs from `reconqa://projects/{project_id}/knowledge`, inspect coverage with `reconqa_get_project_inventory(project_id)`, and call `reconqa_list_scenarios(project_id)` to spot `P0`/`P1` scenarios stuck at `L0`/`L1`/`L2`. Enrich them via `reconqa_upsert_scenario(project_id, slug=..., priority="P0"|"P1", assertions=[...], negative_cases=[...])`.
+4. **Spot-Check with Safe Replay**: Use `reconqa_replay_endpoint(project_id, method=..., url=..., credential_id=profile_id)` to validate live payloads, edge cases, and status codes (SSRF-guarded, 4KB LLM response cap).
+5. **Run External Verification Tools with Automatic L0–L4 Sync-Back**:
+   - `reconqa_run_external_tool(project_id, run_id, tool="java_test", credential_id=profile_id)` -> compiles & executes Maven TestNG + RestAssured assertions and auto-updates Scenario `assertions[*].status` (`passed`/`failed`).
+   - `reconqa_run_external_tool(project_id, run_id, tool="schemathesis", credential_id=profile_id)` -> runs OpenAPI boundary/contract fuzzing and auto-updates `validation`/`boundary` negative cases (`covered`/`failed`).
+   - `reconqa_run_external_tool(project_id, run_id, tool="nuclei", credential_id=profile_id)` -> runs bounded security baseline checks and auto-updates `auth`/`security` negative cases.
+   - `reconqa_run_external_tool(project_id, run_id, tool="k6", credential_id=profile_id)` -> executes bounded smoke load tests (`p95_ms`, error rate, check pass rate).
+   - Re-check `reconqa_list_scenarios(project_id)` to confirm `p0_p1_effective_pct` climbed to `L3`/`L4`!
 
 ---
 

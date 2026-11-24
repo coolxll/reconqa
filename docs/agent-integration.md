@@ -155,7 +155,7 @@ If your team runs ReconQA on an internal QA server (e.g. `http://qa-reconqa.exam
 
 ## 4. MCP Tools & Resources Reference
 
-### Tools (14)
+### Tools (17)
 
 | Tool | Key Parameters | Purpose |
 |---|---|---|
@@ -173,6 +173,9 @@ If your team runs ReconQA on an internal QA server (e.g. `http://qa-reconqa.exam
 | `reconqa_get_project_inventory` | `project_id`, `source=None`, `prefix=None`, `limit=80` | Fetch the project's cumulative Master API Inventory (`total_endpoints`, `har_live_count`, `js_static_count`, `coverage_pct`, `by_prefix`, `scenarios`, and filtered endpoints). |
 | `reconqa_list_scenarios` | `project_id`, `priority=None`, `effectiveness_level=None` | List first-class business scenarios with `p0_p1_effective_pct`, `by_priority`, `by_effectiveness`, and per-scenario `L0`–`L4` effectiveness status. |
 | `reconqa_upsert_scenario` | `project_id`, `slug`, `name=None`, `description=None`, `preconditions=None`, `business_domain=None`, `priority=None`, `status=None`, `owner=None`, `tags=None`, `assertions=None`, `negative_cases=None` | Upsert a business scenario (`source="ai-agent"`) with priority, business description, structured JSONPath assertions, and negative/edge test checklists. |
+| `reconqa_extract_credential` | `project_id`, `run_id=None`, `name=None`, `role_tag="account_a"` | Auto-extract auth headers from a run's HAR into a project `AuthProfile` and return `{ profile_id, name, role_tag, extracted_header_names, source_run_id, source_host }` without echoing raw secrets. |
+| `reconqa_replay_endpoint` | `project_id`, `method`, `url`, `headers=None`, `query_params=None`, `body=None`, `credential_id=None`, `timeout_sec=15.0` | Safely replay an HTTP endpoint with optional server-side `AuthProfile` injection and 4KB response truncation for LLM token safety. |
+| `reconqa_run_external_tool` | `project_id`, `run_id`, `tool`, `credential_id=None`, `base_url=None`, `sync_scenarios=True`, `timeout_sec=120` | Run `java_test`, `schemathesis`, `nuclei`, or `k6` against a run and automatically sync assertion / negative-case pass/fail status back into project Scenarios (`L0`–`L4`). |
 
 ### Resources (3)
 
@@ -206,9 +209,11 @@ Pair a browser-capable AI agent with ReconQA's scenario proxy (or browser HAR re
    Call `reconqa_upload_har_files(har_paths=["./roam_hars"], wait=True)`.
    - ReconQA automatically detects the primary host (e.g. `shop.example.com`), links or creates the project, extracts embedded JS bundles, merges all scenarios into **OpenAPI 3.0.3 + Data-Flow Correlations**, and computes **Coverage Diff** (`har-live` vs. static JS endpoints).
    - The new run appears immediately in the Vue 3 Web Console, ready for on-demand **Java TestNG+Allure (`java_gen`)**, **Performance & k6 (`perf`)**, or **Security & IDOR (`security`)** via `reconqa_execute_run_modules` or the Web UI tabs.
-5. **Effectiveness Loop (Beyond HTTP 200)**:
-   - Read Project Knowledge Base PRDs (`reconqa://projects/{project_id}/knowledge`), inspect the cumulative Master API Inventory (`reconqa_get_project_inventory`), and call `reconqa_list_scenarios(project_id)` to spot `P0`/`P1` business scenarios stuck at `L1`/`L2`.
-   - Call `reconqa_upsert_scenario(project_id, slug=..., priority="P0", assertions=[...], negative_cases=[...])` to enrich those scenarios with structured JSONPath business assertions and negative/edge test checklists—ReconQA then compiles real business checks directly into generated Java RestAssured tests!
+5. **Autonomous 0->1 External-System Acceptance Loop (Beyond HTTP 200)**:
+   - Extract session credentials from the ingested HAR without exposing tokens to the LLM via `reconqa_extract_credential(project_id, run_id=...)` -> returns `profile_id` and header names only.
+   - Read Project Knowledge Base PRDs (`reconqa://projects/{project_id}/knowledge`), inspect cumulative Master API Inventory (`reconqa_get_project_inventory`), and call `reconqa_list_scenarios(project_id)` to spot `P0`/`P1` scenarios stuck at `L0`/`L1`/`L2`.
+   - Call `reconqa_upsert_scenario(project_id, slug=..., priority="P0", assertions=[...], negative_cases=[...])` to persist structured JSONPath business assertions and negative/edge checklists, and spot-check endpoints safely with `reconqa_replay_endpoint(project_id, ..., credential_id=profile_id)`.
+   - Execute real external verifiers with `reconqa_run_external_tool(project_id, run_id, tool="java_test" | "schemathesis" | "nuclei" | "k6", credential_id=profile_id, sync_scenarios=True)` so pass/fail results automatically sync back into Scenario `L0`–`L4` effectiveness scores in the Web Console!
 
 ---
 

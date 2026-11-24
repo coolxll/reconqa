@@ -45,9 +45,17 @@ class TargetOut(BaseModel):
 
 class AuthProfileCreate(BaseModel):
     name: str
-    role_tag: Literal["account_a", "account_b", "guest"] = "account_a"
+    role_tag: str = Field(default="account_a", min_length=1, max_length=48)
     storage_state_path: str | None = None
     extra_headers_ref: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("role_tag", mode="before")
+    @classmethod
+    def _clean_role_tag(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("role_tag must not be empty")
+        return text
 
 
 class AuthProfileOut(BaseModel):
@@ -309,6 +317,70 @@ class ScenarioListResponse(BaseModel):
     scenarios: list[ScenarioResponse] = Field(default_factory=list)
 
 
+# --- Autonomous External-System Acceptance Glue DTOs ---
+
+
+class ExtractCredentialRequest(BaseModel):
+    run_id: str | None = None
+    name: str | None = Field(default=None, max_length=128)
+    role_tag: str = Field(default="account_a", min_length=1, max_length=48)
+    target_host: str | None = None
+
+    @field_validator("role_tag", mode="before")
+    @classmethod
+    def _clean_extract_role_tag(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("role_tag must not be empty")
+        return text
+
+
+class ExtractCredentialResponse(BaseModel):
+    profile: AuthProfileOut
+    extracted_header_names: list[str] = Field(default_factory=list)
+    source_run_id: str
+    source_host: str
+
+
+class ExecuteExternalToolRequest(BaseModel):
+    tool: Literal["java_test", "schemathesis", "nuclei", "k6"]
+    credential_id: str | None = None
+    base_url: str | None = None
+    sync_scenarios: bool = True
+    timeout_sec: int = 120
+
+
+class ExecuteExternalToolResponse(BaseModel):
+    executed: bool
+    tool: str
+    status: str
+    duration_ms: float = 0.0
+    summary: dict[str, Any] = Field(default_factory=dict)
+    stdout_tail: str = ""
+    synced_scenarios: int = 0
+    synced_assertions: int = 0
+    synced_negative_cases: int = 0
+    error: str | None = None
+
+
+class AcceptancePromptContextSummary(BaseModel):
+    targets_count: int = 0
+    credentials_count: int = 0
+    kb_docs_count: int = 0
+    coverage_pct: float = 0.0
+    p0_p1_effective_pct: float = 0.0
+    scenarios_needing_attention: int = 0
+
+
+class AcceptancePromptResponse(BaseModel):
+    project_id: str
+    project_name: str
+    lang: Literal["zh", "en"] = "zh"
+    agent: str = "generic"
+    prompt_markdown: str
+    context_summary: AcceptancePromptContextSummary
+
+
 class ReplayRequest(BaseModel):
     method: str = "GET"
     url: str
@@ -329,6 +401,39 @@ class ReplayResponse(BaseModel):
     content_type: str = ""
     truncated: bool = False
     error: str | None = None
+
+
+class ReplayMatrixRequest(BaseModel):
+    method: str = "GET"
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    query_params: dict[str, str] = Field(default_factory=dict)
+    body: Any = None
+    credential_ids: list[str] | None = None
+    include_anonymous: bool = True
+    timeout_sec: float = 15.0
+
+
+class ReplayMatrixEntry(BaseModel):
+    credential_id: str | None = None
+    credential_name: str
+    role_tag: str
+    status_code: int
+    biz_code: int | str | None = None
+    duration_ms: float
+    body_size: int = 0
+    body_preview: str = ""
+    verdict: Literal["allowed", "denied", "error"]
+    error: str | None = None
+
+
+class ReplayMatrixResponse(BaseModel):
+    method: str
+    url: str
+    results: list[ReplayMatrixEntry] = Field(default_factory=list)
+    allowed_count: int = 0
+    denied_count: int = 0
+    potential_bfla_warning: bool = False
 
 
 class RunCreate(BaseModel):
