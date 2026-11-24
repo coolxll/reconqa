@@ -129,6 +129,7 @@ export interface Run {
 }
 
 export interface RunCreate {
+  name?: string | null;
   target_id?: string | null;
   target_url?: string | null;
   modules?: string[];

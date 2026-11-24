@@ -20,11 +20,12 @@ import {
   RefreshCw,
   ShieldAlert,
   Terminal,
+  Trash2,
   XCircle,
 } from 'lucide-vue-next'
 import type { Job, Run } from '@/api/types'
 import { artifactDownloadUrl } from '@/api/client'
-import { getRun, listProjectRuns, startRun } from '@/api/runs'
+import { deleteRun, getRun, getRunTitle, listProjectRuns, shortRunId, startRun } from '@/api/runs'
 import StatusBadge from '@/components/layout/StatusBadge.vue'
 import MetricCard from '@/components/layout/MetricCard.vue'
 import EmptyState from '@/components/layout/EmptyState.vue'
@@ -92,6 +93,8 @@ function resolveValidTab(raw: unknown): TabId {
 const activeTab = ref<TabId>(resolveValidTab(route.query.tab))
 const loading = ref(true)
 const starting = ref(false)
+const deleting = ref(false)
+const confirmingDelete = ref(false)
 const errorMessage = ref('')
 const run = ref<Run | null>(null)
 const siblingRuns = ref<Run[]>([])
@@ -145,6 +148,136 @@ async function handleStartRun() {
   } finally {
     starting.value = false
   }
+}
+
+async function handleDeleteRun() {
+  if (!runId.value || deleting.value) return
+  deleting.value = true
+  errorMessage.value = ''
+  try {
+    await deleteRun(runId.value)
+    await router.push('/runs')
+  } catch (err) {
+    errorMessage.value =
+      err instanceof Error ? err.message : t('runDetail.deleteError')
+    confirmingDelete.value = false
+  } finally {
+    deleting.value = false
+  }
+}
+
+function jobTargetTab(moduleName: string): TabId | null {
+  switch (moduleName) {
+    case 'merge':
+      return 'openapi'
+    case 'java_gen':
+      return 'java'
+    case 'security':
+      return 'security'
+    case 'perf':
+      return 'performance'
+    default:
+      return null
+  }
+}
+
+function asRecord(val: unknown): Record<string, unknown> | null {
+  return val && typeof val === 'object' && !Array.isArray(val)
+    ? (val as Record<string, unknown>)
+    : null
+}
+
+function readNum(...candidates: unknown[]): number | null {
+  for (const c of candidates) {
+    if (typeof c === 'number' && !Number.isNaN(c)) return c
+    if (Array.isArray(c)) return c.length
+  }
+  return null
+}
+
+function formatJobSummary(job: Job): { text: string; isError?: boolean } {
+  const meta = asRecord(job.output_meta)
+  if (!meta || Object.keys(meta).length === 0) {
+    return { text: '—' }
+  }
+  if (typeof meta.error === 'string' && meta.error.trim()) {
+    return { text: meta.error.trim().slice(0, 140), isError: true }
+  }
+  if (meta.skipped === true) {
+    const reason = typeof meta.reason === 'string' ? `: ${meta.reason}` : ''
+    return { text: `${t('runDetail.summary.skipped')}${reason}` }
+  }
+
+  const parts: string[] = []
+  if (job.module === 'merge') {
+    const cov = asRecord(meta.coverage)
+    const eps = readNum(meta.openapi_paths, cov?.total_endpoints)
+    const pct = readNum(cov?.coverage_pct)
+    const chains = readNum(meta.correlation_chains)
+    const vars = readNum(meta.correlation_variables)
+    if (eps !== null) parts.push(t('runDetail.summary.endpoints', { n: eps }))
+    if (pct !== null) parts.push(t('runDetail.summary.coverage', { pct: pct.toFixed(1) }))
+    if (chains !== null && chains > 0) parts.push(t('runDetail.summary.chains', { n: chains }))
+    else if (vars !== null && vars > 0) parts.push(t('runDetail.summary.vars', { n: vars }))
+  } else if (job.module === 'java_gen') {
+    const l1 = readNum(meta.l1_endpoints_count, meta.l1_count)
+    const l2 = readNum(meta.l2_chains_count, meta.l2_chain_count)
+    const l3 = readNum(meta.l3_auth_endpoints_count, meta.l3_count)
+    const files = readNum(meta.files_generated)
+    if (l1 !== null) parts.push(t('runDetail.summary.javaL1', { n: l1 }))
+    if (l2 !== null) parts.push(t('runDetail.summary.javaL2', { n: l2 }))
+    if (l3 !== null) parts.push(t('runDetail.summary.javaL3', { n: l3 }))
+    if (parts.length === 0 && files !== null) {
+      parts.push(t('runDetail.summary.javaFiles', { n: files }))
+    }
+  } else if (job.module === 'security') {
+    const stat = asRecord(meta.static_audit)
+    const statSummary = asRecord(stat?.summary)
+    const auth = asRecord(meta.auth_matrix)
+    const authSummary = asRecord(auth?.summary)
+    const burp = asRecord(meta.burp_export)
+    const nuclei = asRecord(meta.nuclei)
+
+    const staticCount = readNum(statSummary?.findings_count, stat?.findings)
+    const idorCount =
+      (readNum(auth?.confirmed_idor_count, authSummary?.confirmed_idor_count) ?? 0) +
+      (readNum(auth?.suspected_idor_count, authSummary?.suspected_idor_count) ?? 0) +
+      (readNum(auth?.unauth_bypass_count, authSummary?.unauth_bypass_count) ?? 0)
+    const burpCount = readNum(burp?.exported_count, burp?.count, burp?.files)
+    const nucleiCount = readNum(nuclei?.findings_count, nuclei?.findings)
+
+    if (staticCount !== null) parts.push(t('runDetail.summary.secFindings', { n: staticCount }))
+    if (idorCount > 0) parts.push(t('runDetail.summary.secIdor', { n: idorCount }))
+    if (burpCount !== null) parts.push(t('runDetail.summary.secBurp', { n: burpCount }))
+    if (nucleiCount !== null && nucleiCount > 0) {
+      parts.push(t('runDetail.summary.secNuclei', { n: nucleiCount }))
+    }
+  } else if (job.module === 'perf') {
+    const hp = asRecord(meta.har_profiler)
+    const hpSummary = asRecord(hp?.summary)
+    const reqs = readNum(hpSummary?.total_requests, hp?.total_requests)
+    const p95 = readNum(hpSummary?.p95_total_ms)
+    const findingsCount = readNum(hpSummary?.findings_count, hp?.findings)
+    const largeCount = readNum(hp?.largest_responses)
+    if (reqs !== null) parts.push(t('runDetail.summary.perfReqs', { n: reqs }))
+    if (p95 !== null) parts.push(t('runDetail.summary.perfP95', { ms: Math.round(p95) }))
+    if (findingsCount !== null) parts.push(t('runDetail.summary.perfFindings', { n: findingsCount }))
+    else if (largeCount !== null && largeCount > 0) {
+      parts.push(t('runDetail.summary.perfLarge', { n: largeCount }))
+    }
+  } else if (job.module === 'discovery') {
+    const subs = readNum(meta.subdomains_count, meta.subdomains)
+    const hosts = readNum(meta.live_hosts_count, meta.live_hosts)
+    const routes = readNum(meta.spa_routes_count, meta.spa_routes)
+    if (subs !== null) parts.push(t('runDetail.summary.discSubdomains', { n: subs }))
+    if (hosts !== null) parts.push(t('runDetail.summary.discHosts', { n: hosts }))
+    if (routes !== null) parts.push(t('runDetail.summary.discRoutes', { n: routes }))
+  }
+
+  if (parts.length === 0) {
+    return { text: job.status === 'completed' ? t('runDetail.summary.completed') : '—' }
+  }
+  return { text: parts.join(' · ') }
 }
 
 async function copyRunId() {
@@ -284,9 +417,12 @@ onMounted(() => {
                 {{ t('runDetail.breadcrumbRuns') }}
               </router-link>
               <span class="text-slate-300">/</span>
-              <h1 class="font-mono text-base font-bold text-slate-900">
-                {{ run.id }}
+              <h1 class="text-base font-bold text-slate-900">
+                {{ getRunTitle(run) }}
               </h1>
+              <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-500" :title="run.id">
+                {{ shortRunId(run.id) }}
+              </span>
               <button
                 type="button"
                 class="rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
@@ -370,6 +506,38 @@ onMounted(() => {
               <Download class="h-3.5 w-3.5" />
               <span>{{ t('runDetail.downloadK6') }}</span>
             </a>
+
+            <div class="hidden h-5 w-px bg-slate-200 sm:block" />
+
+            <template v-if="confirmingDelete">
+              <button
+                type="button"
+                data-testid="run-detail-delete-confirm"
+                :disabled="deleting"
+                class="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-rose-700 disabled:opacity-50"
+                @click="handleDeleteRun"
+              >
+                <span>{{ t('runDetail.deleteConfirm') }}</span>
+              </button>
+              <button
+                type="button"
+                class="inline-flex items-center rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                @click="confirmingDelete = false"
+              >
+                {{ t('runDetail.deleteCancel') }}
+              </button>
+            </template>
+            <button
+              v-else
+              type="button"
+              data-testid="run-detail-delete-btn"
+              :disabled="run.status === 'running'"
+              class="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-40"
+              @click="confirmingDelete = true"
+            >
+              <Trash2 class="h-3.5 w-3.5" />
+              <span>{{ t('runDetail.deleteRun') }}</span>
+            </button>
           </div>
         </div>
 
@@ -513,11 +681,27 @@ onMounted(() => {
                   <td class="px-4 py-3 font-mono text-slate-700">
                     {{ formatDuration(job.started_at, job.finished_at) }}
                   </td>
-                  <td class="px-5 py-3 font-mono text-[11px] text-slate-500">
-                    <span v-if="job.output_meta && Object.keys(job.output_meta).length > 0">
-                      {{ JSON.stringify(job.output_meta) }}
-                    </span>
-                    <span v-else>—</span>
+                  <td class="px-5 py-3 text-xs">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <span
+                        data-testid="job-output-summary"
+                        :class="
+                          formatJobSummary(job).isError
+                            ? 'text-rose-600 font-medium'
+                            : 'text-slate-700'
+                        "
+                      >
+                        {{ formatJobSummary(job).text }}
+                      </span>
+                      <button
+                        v-if="job.status === 'completed' && jobTargetTab(job.module)"
+                        type="button"
+                        class="shrink-0 font-medium text-indigo-600 transition hover:text-indigo-800 hover:underline"
+                        @click="selectTab(jobTargetTab(job.module)!)"
+                      >
+                        {{ t('runDetail.timeline.viewTab') }}
+                      </button>
+                    </div>
                   </td>
                 </tr>
                 <tr v-if="run.jobs.length === 0">

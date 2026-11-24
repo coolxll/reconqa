@@ -29,7 +29,7 @@ import {
   XCircle,
 } from "lucide-vue-next";
 import { listProjects, listTargets } from "@/api/projects";
-import { listProjectRuns } from "@/api/runs";
+import { getRunTitle, listProjectRuns, shortRunId } from "@/api/runs";
 import { getDoctorStatus, installDoctorTool } from "@/api/reports";
 import type { DoctorInstallResult, DoctorToolStatus, Project, Run, Target } from "@/api/types";
 import { useI18n } from "@/i18n";
@@ -725,10 +725,17 @@ onBeforeUnmount(() => {
               :key="run.id"
               class="transition hover:bg-slate-50/80"
             >
-              <td class="whitespace-nowrap px-5 py-3 font-mono text-xs font-medium text-indigo-700">
-                <router-link :to="`/runs/${run.id}`" class="hover:underline">
-                  {{ run.id.slice(0, 12) }}
+              <td class="px-5 py-3">
+                <router-link
+                  :to="`/runs/${run.id}`"
+                  class="block max-w-[240px] truncate text-xs font-semibold text-slate-900 hover:text-indigo-700 hover:underline"
+                  :title="getRunTitle(run, run.projectName)"
+                >
+                  {{ getRunTitle(run, run.projectName) }}
                 </router-link>
+                <span class="font-mono text-[10px] text-slate-400" :title="run.id">
+                  {{ shortRunId(run.id) }}
+                </span>
               </td>
               <td class="whitespace-nowrap px-4 py-3 text-xs font-medium text-slate-800">
                 {{ run.projectName }}

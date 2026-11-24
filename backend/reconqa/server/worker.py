@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from reconqa.models.db import get_session_factory
 from reconqa.models.tables import Artifact, AuthProfile, Finding, Job, Run, Target
@@ -44,11 +46,36 @@ class InProcessTaskRunner:
         self._history: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._max_history = max_history_per_run
         self._running = False
+        self._db_lock: asyncio.Lock = asyncio.Lock()
+
+    async def _reconcile_inconsistent_jobs(self) -> int:
+        """Self-heal any completed runs whose child jobs were left stuck in running state."""
+        reconciled = 0
+        try:
+            async with self._db_lock:
+                session_factory = get_session_factory()
+                async with session_factory() as session:
+                    res = await session.execute(
+                        select(Job, Run)
+                        .join(Run, Job.run_id == Run.id)
+                        .where(Run.status == "completed", Job.status == "running")
+                    )
+                    now = _utcnow()
+                    for job, run in res.all():
+                        job.status = "completed"
+                        job.finished_at = job.finished_at or run.finished_at or now
+                        reconciled += 1
+                    if reconciled:
+                        await session.commit()
+        except SQLAlchemyError:
+            return 0
+        return reconciled
 
     async def start(self) -> None:
         if self._running and self._worker_task is not None and not self._worker_task.done():
             return
         self._loop = asyncio.get_running_loop()
+        await self._reconcile_inconsistent_jobs()
         self._running = True
         self._worker_task = asyncio.create_task(self._worker_loop(), name="reconqa-task-worker")
 
@@ -126,47 +153,60 @@ class InProcessTaskRunner:
         status: str,
         output_meta: dict[str, Any] | None = None,
     ) -> None:
-        session_factory = get_session_factory()
-        async with session_factory() as session:
-            result = await session.execute(
-                select(Job).where(Job.run_id == run_id, Job.module == module)
-            )
-            job = result.scalar_one_or_none()
-            now = _utcnow()
-            if job is None:
-                job = Job(
-                    run_id=run_id,
-                    module=module,
-                    status=status,
-                    output_meta=output_meta or {},
-                    started_at=now if status == "running" else None,
-                    finished_at=now if status in {"completed", "failed"} else None,
+        async with self._db_lock:
+            session_factory = get_session_factory()
+            async with session_factory() as session:
+                result = await session.execute(
+                    select(Job).where(Job.run_id == run_id, Job.module == module)
                 )
-                session.add(job)
-            else:
-                job.status = status
-                if status == "running":
-                    job.started_at = now
-                if status in {"completed", "failed"}:
-                    job.finished_at = now
-                if output_meta is not None:
-                    job.output_meta = output_meta
-            await session.commit()
+                job = result.scalar_one_or_none()
+                now = _utcnow()
+                if job is None:
+                    job = Job(
+                        run_id=run_id,
+                        module=module,
+                        status=status,
+                        output_meta=output_meta or {},
+                        started_at=now if status == "running" else None,
+                        finished_at=now if status in {"completed", "failed"} else None,
+                    )
+                    session.add(job)
+                else:
+                    # Monotonic transition guard: never downgrade terminal job back to running
+                    if status == "running" and job.status in {"completed", "failed"}:
+                        return
+                    job.status = status
+                    if status == "running":
+                        job.started_at = job.started_at or now
+                    if status in {"completed", "failed"}:
+                        job.finished_at = now
+                    if output_meta is not None:
+                        job.output_meta = output_meta
+                await session.commit()
 
     async def _mark_run_failed(self, run_id: str, error_msg: str) -> None:
-        session_factory = get_session_factory()
-        async with session_factory() as session:
-            run = await session.get(Run, run_id)
-            if run is not None:
-                run.status = "failed"
-                run.finished_at = _utcnow()
-                metrics = dict(run.summary_metrics or {})
-                metrics["error"] = error_msg
-                run.summary_metrics = metrics
-                cfg_snap = dict(run.config_snapshot or {})
-                cfg_snap.pop("pending_modules", None)
-                run.config_snapshot = cfg_snap
-                await session.commit()
+        async with self._db_lock:
+            session_factory = get_session_factory()
+            async with session_factory() as session:
+                now = _utcnow()
+                run = await session.get(Run, run_id)
+                if run is not None:
+                    run.status = "failed"
+                    run.finished_at = now
+                    metrics = dict(run.summary_metrics or {})
+                    metrics["error"] = error_msg
+                    run.summary_metrics = metrics
+                    cfg_snap = dict(run.config_snapshot or {})
+                    cfg_snap.pop("pending_modules", None)
+                    run.config_snapshot = cfg_snap
+
+                    jobs_res = await session.execute(select(Job).where(Job.run_id == run_id))
+                    for job in jobs_res.scalars().all():
+                        if job.status in {"running", "queued"}:
+                            job.status = "failed"
+                            job.finished_at = now
+
+                    await session.commit()
         self._publish(
             run_id,
             {
@@ -260,6 +300,7 @@ class InProcessTaskRunner:
 
         loop = asyncio.get_running_loop()
         module_events: list[tuple[str, str, dict[str, Any]]] = []
+        pending_updates: list[concurrent.futures.Future[None]] = []
 
         def on_log(message: str) -> None:
             self._publish_threadsafe(
@@ -284,40 +325,48 @@ class InProcessTaskRunner:
                     "timestamp": _utcnow().isoformat(),
                 },
             )
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self._update_job_status(run_id, module, status, meta),
                 loop,
             )
+            pending_updates.append(fut)
 
         har_sources_raw = cfg.get("har_sources")
         har_sources = [Path(p) for p in har_sources_raw] if har_sources_raw else None
         config_path_raw = cfg.get("config_path")
         config_path = Path(config_path_raw) if config_path_raw else None
 
-        summary = await asyncio.to_thread(
-            run_pipeline,
-            workspace_dir,
-            target_url=target_url,
-            modules=modules,
-            har_sources=har_sources,
-            config_path=config_path,
-            auth_a=auth_a_path,
-            auth_b=auth_b_path,
-            include_mutations=bool(cfg.get("include_mutations", False)),
-            discovery_mode=str(cfg.get("discovery_mode", "passive")),
-            run_nuclei=bool(cfg.get("run_nuclei", False)),
-            run_k6=bool(cfg.get("run_k6", False)),
-            run_schemathesis=bool(cfg.get("run_schemathesis", False)),
-            log_cb=on_log,
-            auth_a_headers=auth_a_headers,
-            auth_b_headers=auth_b_headers,
-            module_cb=on_module,
-            java_package=cfg.get("java_package"),
-            java_version=str(cfg["java_version"]) if cfg.get("java_version") else None,
-        )
+        try:
+            summary = await asyncio.to_thread(
+                run_pipeline,
+                workspace_dir,
+                target_url=target_url,
+                modules=modules,
+                har_sources=har_sources,
+                config_path=config_path,
+                auth_a=auth_a_path,
+                auth_b=auth_b_path,
+                include_mutations=bool(cfg.get("include_mutations", False)),
+                discovery_mode=str(cfg.get("discovery_mode", "passive")),
+                run_nuclei=bool(cfg.get("run_nuclei", False)),
+                run_k6=bool(cfg.get("run_k6", False)),
+                run_schemathesis=bool(cfg.get("run_schemathesis", False)),
+                log_cb=on_log,
+                auth_a_headers=auth_a_headers,
+                auth_b_headers=auth_b_headers,
+                module_cb=on_module,
+                java_package=cfg.get("java_package"),
+                java_version=str(cfg["java_version"]) if cfg.get("java_version") else None,
+            )
+        finally:
+            if pending_updates:
+                await asyncio.gather(
+                    *(asyncio.wrap_future(f) for f in pending_updates),
+                    return_exceptions=True,
+                )
 
         # Ensure all module statuses & findings/artifacts are persisted cleanly
-        async with session_factory() as session:
+        async with self._db_lock, session_factory() as session:
             seen_final: dict[str, tuple[str, dict[str, Any]]] = {}
             for mod, st, meta in module_events:
                 seen_final[mod] = (st, meta)

@@ -35,6 +35,46 @@ export function getRun(runId: string): Promise<Run> {
   return apiFetch<Run>(`/runs/${encodeURIComponent(runId)}`);
 }
 
+export function deleteRun(runId: string): Promise<{ deleted: boolean; id: string }> {
+  return apiFetch<{ deleted: boolean; id: string }>(
+    `/runs/${encodeURIComponent(runId)}`,
+    { method: "DELETE" }
+  );
+}
+
+export function shortRunId(id: string): string {
+  return `#${id.length > 8 ? id.slice(0, 8) : id}`;
+}
+
+export function getRunTitle(
+  run: Pick<Run, "id" | "trigger_source" | "config_snapshot">,
+  projectName?: string
+): string {
+  const rawName = run.config_snapshot?.run_name;
+  if (typeof rawName === "string" && rawName.trim()) {
+    return rawName.trim();
+  }
+  const sourceTag = (run.trigger_source || "web").toUpperCase();
+  const targetUrl = run.config_snapshot?.target_url;
+  if (typeof targetUrl === "string" && targetUrl.trim()) {
+    try {
+      const host = new URL(targetUrl.trim()).hostname;
+      if (host) {
+        return `${host} · ${sourceTag}`;
+      }
+    } catch {
+      const cleaned = targetUrl.trim().replace(/^https?:\/\//i, "").split("/")[0];
+      if (cleaned) {
+        return `${cleaned} · ${sourceTag}`;
+      }
+    }
+  }
+  if (projectName && projectName.trim()) {
+    return `${projectName.trim()} · ${sourceTag}`;
+  }
+  return `Run ${shortRunId(run.id)}`;
+}
+
 export function uploadRunHars(
   runId: string,
   files: File[],

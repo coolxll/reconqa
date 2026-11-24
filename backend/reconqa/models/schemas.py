@@ -110,6 +110,7 @@ class KnowledgeDocOut(BaseModel):
 
 
 class RunCreate(BaseModel):
+    name: str | None = Field(default=None, max_length=160)
     target_id: str | None = None
     target_url: str | None = None
     modules: list[str] = Field(

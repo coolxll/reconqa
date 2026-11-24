@@ -140,7 +140,7 @@ registerMessages({
     "overview.recent.emptyDesc":
       "创建一个项目并上传手工测试 HAR 录包（或粘贴 Chrome DevTools cURL/fetch），即可一键生成接口、性能与安全报告。",
     "overview.recent.createProject": "创建项目",
-    "overview.table.runId": "任务 ID",
+    "overview.table.runId": "任务名称",
     "overview.table.project": "所属项目",
     "overview.table.status": "状态",
     "overview.table.capabilities": "启用能力",
@@ -486,7 +486,7 @@ registerMessages({
     "overview.recent.emptyDesc":
       "Create a project and upload a manual HAR recording (or paste Chrome DevTools cURL/fetch) to generate Java API tests, k6 performance baselines, and security audits.",
     "overview.recent.createProject": "Create Project",
-    "overview.table.runId": "Run ID",
+    "overview.table.runId": "Test Run",
     "overview.table.project": "Project",
     "overview.table.status": "Status",
     "overview.table.capabilities": "Capabilities",

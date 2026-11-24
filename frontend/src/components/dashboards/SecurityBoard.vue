@@ -56,6 +56,7 @@ interface LeakSignalRow {
   kind: string;
   source: string;
   sample: string;
+  context: string;
   severity: string;
 }
 
@@ -239,6 +240,7 @@ const leakSignals = computed<LeakSignalRow[]>(() => {
           kind,
           source: String(obj.source ?? ""),
           sample: String(obj.sample ?? "***REDACTED***"),
+          context: typeof obj.context === "string" ? obj.context : "",
           severity: String(obj.severity ?? "medium").toLowerCase(),
         });
       }
@@ -252,6 +254,7 @@ const leakSignals = computed<LeakSignalRow[]>(() => {
         kind: String(obj.leak_type ?? obj.kind ?? "secret"),
         source: String(obj.source ?? obj.endpoint ?? ""),
         sample: String(obj.sample ?? obj.redacted_sample ?? "***REDACTED***"),
+        context: typeof obj.context === "string" ? obj.context : "",
         severity: String(obj.severity ?? "high").toLowerCase(),
       });
     }
@@ -1150,7 +1153,7 @@ onBeforeUnmount(() => {
               :key="`${leak.kind}-${leak.source}-${idx}`"
               class="flex items-start justify-between gap-3 px-5 py-3 text-xs"
             >
-              <div class="min-w-0">
+              <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-2">
                   <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-700">
                     {{ leak.kind }}
@@ -1159,6 +1162,13 @@ onBeforeUnmount(() => {
                 </div>
                 <p class="mt-1.5 inline-block rounded bg-slate-900 px-2 py-0.5 font-mono text-[11px] text-amber-300">
                   {{ leak.sample }}
+                </p>
+                <p
+                  v-if="leak.context"
+                  data-testid="leak-context-snippet"
+                  class="mt-1.5 rounded bg-slate-900/5 px-2.5 py-1.5 font-mono text-[11px] leading-relaxed break-all text-slate-700 ring-1 ring-inset ring-slate-200/80"
+                >
+                  {{ leak.context }}
                 </p>
               </div>
               <StatusBadge :status="leak.severity" />
@@ -1290,7 +1300,14 @@ onBeforeUnmount(() => {
                   </td>
                 </tr>
                 <tr v-if="expandedFindingIds.has(f.id)" class="bg-slate-50/70">
-                  <td colspan="5" class="px-6 py-3">
+                  <td colspan="5" class="space-y-2 px-6 py-3">
+                    <div
+                      v-if="typeof f.evidence?.context === 'string' && f.evidence.context"
+                      data-testid="finding-context-snippet"
+                      class="rounded-lg border border-amber-200/80 bg-amber-50/70 px-3 py-2 font-mono text-[11px] leading-relaxed break-all text-slate-800"
+                    >
+                      {{ f.evidence.context }}
+                    </div>
                     <pre
                       class="max-h-48 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-200"
                     >{{ JSON.stringify(f.evidence, null, 2) }}</pre>

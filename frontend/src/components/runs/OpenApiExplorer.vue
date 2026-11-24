@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import {
+  Check,
   ChevronDown,
   ChevronRight,
-  Code2,
+  Copy,
   Download,
   FileCode2,
+  Layers,
+  List,
   Lock,
   Search,
 } from 'lucide-vue-next'
@@ -51,7 +54,6 @@ interface FlattenedEndpoint {
   bizSuccess: BizSuccessRule | null
   perfBaseline: PerfBaseline | null
   customHeaders: Record<string, string>
-  jsSnippet: string
   parameters: OpenApiParameter[]
   requestBody: Record<string, unknown> | null
   responses: Record<string, Record<string, unknown>>
@@ -67,18 +69,32 @@ const spec = ref<Record<string, unknown> | null>(null)
 const searchQuery = ref('')
 const methodFilter = ref('ALL')
 const sourceFilter = ref('ALL')
+const scenarioFilter = ref('ALL')
+const viewMode = ref<'list' | 'scenario'>('list')
 const expandedKeys = ref<Set<string>>(new Set())
+const collapsedGroups = ref<Set<string>>(new Set())
+const panelViewModes = ref<Record<string, 'example' | 'schema'>>({})
+const copiedJsonKey = ref<string | null>(null)
 
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const
-const SOURCES = ['har-live', 'js-static-inferred', 'js-static'] as const
+const SOURCE_PRIORITY: Record<string, number> = {
+  'har-live': 0,
+  'js-static-inferred': 1,
+  'js-static': 2,
+}
 
 async function loadSpec() {
   loading.value = true
   errorMessage.value = ''
   spec.value = null
+  scenarioFilter.value = 'ALL'
+  collapsedGroups.value = new Set()
+  expandedKeys.value = new Set()
   try {
     const data = await getRunOpenApi(props.runId)
     spec.value = (data ?? null) as Record<string, unknown> | null
+    const hasLive = endpoints.value.some((ep) => ep.discoverySource === 'har-live')
+    sourceFilter.value = hasLive ? 'har-live' : 'ALL'
   } catch (err) {
     errorMessage.value =
       err instanceof Error ? err.message : t('openapi.emptyDesc')
@@ -130,7 +146,6 @@ const endpoints = computed<FlattenedEndpoint[]>(() => {
         bizSuccess: (op['x-biz-success'] as BizSuccessRule | null) ?? null,
         perfBaseline: (op['x-perf-baseline'] as PerfBaseline | null) ?? null,
         customHeaders: normalizedCustomHeaders,
-        jsSnippet: String(op['x-js-snippet'] ?? ''),
         parameters: Array.isArray(op.parameters) ? (op.parameters as OpenApiParameter[]) : [],
         requestBody: (op.requestBody as Record<string, unknown> | null) ?? null,
         responses: (op.responses as Record<string, Record<string, unknown>>) ?? {},
@@ -138,7 +153,12 @@ const endpoints = computed<FlattenedEndpoint[]>(() => {
     }
   }
 
-  return rows.sort((a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method))
+  return rows.sort((a, b) => {
+    const pa = SOURCE_PRIORITY[a.discoverySource] ?? 3
+    const pb = SOURCE_PRIORITY[b.discoverySource] ?? 3
+    if (pa !== pb) return pa - pb
+    return a.path.localeCompare(b.path) || a.method.localeCompare(b.method)
+  })
 })
 
 const sourceCounts = computed(() => {
@@ -153,6 +173,35 @@ const sourceCounts = computed(() => {
   return counts
 })
 
+const sourceScopedEndpoints = computed(() => {
+  if (sourceFilter.value === 'ALL') return endpoints.value
+  return endpoints.value.filter((ep) => ep.discoverySource === sourceFilter.value)
+})
+
+const scenarioPills = computed(() => {
+  const allNames = new Set<string>()
+  for (const ep of endpoints.value) {
+    for (const sc of ep.scenarios) {
+      if (sc) allNames.add(sc)
+    }
+  }
+  if (allNames.size === 0) return []
+
+  const counts = new Map<string, number>()
+  for (const name of allNames) counts.set(name, 0)
+  for (const ep of sourceScopedEndpoints.value) {
+    for (const sc of ep.scenarios) {
+      if (counts.has(sc)) {
+        counts.set(sc, (counts.get(sc) ?? 0) + 1)
+      }
+    }
+  }
+
+  return Array.from(counts.entries())
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+    .map(([name, count]) => ({ name, count }))
+})
+
 const filteredEndpoints = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
   return endpoints.value.filter((ep) => {
@@ -160,6 +209,9 @@ const filteredEndpoints = computed(() => {
       return false
     }
     if (sourceFilter.value !== 'ALL' && ep.discoverySource !== sourceFilter.value) {
+      return false
+    }
+    if (scenarioFilter.value !== 'ALL' && !ep.scenarios.includes(scenarioFilter.value)) {
       return false
     }
     if (!q) return true
@@ -172,6 +224,96 @@ const filteredEndpoints = computed(() => {
     )
   })
 })
+
+interface EndpointDisplayGroup {
+  id: string
+  label: string
+  showHeader: boolean
+  endpoints: FlattenedEndpoint[]
+  methodCounts: Array<{ method: string; count: number }>
+}
+
+function summarizeMethods(list: FlattenedEndpoint[]): Array<{ method: string; count: number }> {
+  const order = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']
+  const map = new Map<string, number>()
+  for (const ep of list) {
+    map.set(ep.method, (map.get(ep.method) ?? 0) + 1)
+  }
+  return Array.from(map.entries())
+    .sort(([a], [b]) => {
+      const ia = order.indexOf(a)
+      const ib = order.indexOf(b)
+      if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib)
+      return a.localeCompare(b)
+    })
+    .map(([method, count]) => ({ method, count }))
+}
+
+const displayGroups = computed<EndpointDisplayGroup[]>(() => {
+  if (viewMode.value === 'list') {
+    return [
+      {
+        id: '__list__',
+        label: '',
+        showHeader: false,
+        endpoints: filteredEndpoints.value,
+        methodCounts: [],
+      },
+    ]
+  }
+
+  const byScenario = new Map<string, FlattenedEndpoint[]>()
+  const unassigned: FlattenedEndpoint[] = []
+
+  for (const ep of filteredEndpoints.value) {
+    const matchedScenarios =
+      scenarioFilter.value !== 'ALL'
+        ? ep.scenarios.filter((s) => s === scenarioFilter.value)
+        : ep.scenarios
+    if (matchedScenarios.length === 0) {
+      unassigned.push(ep)
+    } else {
+      for (const sc of matchedScenarios) {
+        const bucket = byScenario.get(sc) ?? []
+        bucket.push(ep)
+        byScenario.set(sc, bucket)
+      }
+    }
+  }
+
+  const groups: EndpointDisplayGroup[] = Array.from(byScenario.entries())
+    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+    .map(([name, list]) => ({
+      id: `sc:${name}`,
+      label: name,
+      showHeader: true,
+      endpoints: list,
+      methodCounts: summarizeMethods(list),
+    }))
+
+  if (unassigned.length > 0) {
+    groups.push({
+      id: '__unassigned__',
+      label: t('openapi.unassignedScenario'),
+      showHeader: true,
+      endpoints: unassigned,
+      methodCounts: summarizeMethods(unassigned),
+    })
+  }
+
+  return groups
+})
+
+function toggleGroupCollapse(groupId: string) {
+  const next = new Set(collapsedGroups.value)
+  if (next.has(groupId)) next.delete(groupId)
+  else next.add(groupId)
+  collapsedGroups.value = next
+}
+
+function toggleScenarioFilter(name: string) {
+  scenarioFilter.value = scenarioFilter.value === name ? 'ALL' : name
+}
 
 function toggleExpand(key: string) {
   const next = new Set(expandedKeys.value)
@@ -213,7 +355,54 @@ function extractJsonExample(container: Record<string, unknown> | null | undefine
   const content = container.content as Record<string, Record<string, unknown>> | undefined
   if (!content) return null
   const jsonContent = content['application/json'] ?? Object.values(content)[0]
-  return jsonContent?.example ?? null
+  if (!jsonContent) return null
+  if (jsonContent.example !== undefined && jsonContent.example !== null) {
+    return jsonContent.example
+  }
+  const examples = jsonContent.examples as Record<string, unknown> | undefined
+  if (examples && typeof examples === 'object') {
+    const first = Object.values(examples)[0]
+    if (first && typeof first === 'object' && 'value' in (first as Record<string, unknown>)) {
+      return (first as Record<string, unknown>).value
+    }
+    if (first !== undefined && first !== null) {
+      return first
+    }
+  }
+  return null
+}
+
+function getPanelMode(
+  epKey: string,
+  section: 'req' | 'resp',
+  hasExample: boolean,
+): 'example' | 'schema' {
+  const mapKey = `${epKey}::${section}`
+  const explicit = panelViewModes.value[mapKey]
+  if (explicit) return explicit
+  return hasExample ? 'example' : 'schema'
+}
+
+function setPanelMode(epKey: string, section: 'req' | 'resp', mode: 'example' | 'schema') {
+  panelViewModes.value = {
+    ...panelViewModes.value,
+    [`${epKey}::${section}`]: mode,
+  }
+}
+
+async function copyJsonPayload(copyKey: string, payload: unknown) {
+  if (payload === null || payload === undefined) return
+  try {
+    await navigator.clipboard.writeText(prettyJson(payload))
+    copiedJsonKey.value = copyKey
+    window.setTimeout(() => {
+      if (copiedJsonKey.value === copyKey) {
+        copiedJsonKey.value = null
+      }
+    }, 1800)
+  } catch {
+    copiedJsonKey.value = copyKey
+  }
 }
 
 function getPrimaryResponse(responses: Record<string, Record<string, unknown>>): {
@@ -345,104 +534,266 @@ onMounted(loadSpec)
           </button>
         </div>
 
-        <!-- Discovery source filter -->
-        <div class="flex items-center gap-1 rounded-lg bg-slate-100 p-1">
+        <!-- Discovery source filter (har-live prioritized first) -->
+        <div class="flex flex-wrap items-center gap-1 rounded-lg bg-slate-100 p-1">
           <button
             type="button"
-            class="rounded-md px-2.5 py-1 text-xs font-medium transition"
-            :class="sourceFilter === 'ALL' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'"
-            @click="sourceFilter = 'ALL'"
+            data-testid="openapi-source-har-live"
+            class="rounded-md px-2.5 py-1 text-xs font-semibold transition"
+            :class="
+              sourceFilter === 'har-live'
+                ? 'bg-emerald-600 text-white shadow-sm'
+                : 'text-emerald-700 hover:bg-emerald-50'
+            "
+            @click="sourceFilter = 'har-live'"
           >
-            {{ t('openapi.allSources') }}
+            {{ t('openapi.source.harLive') }} ({{ sourceCounts['har-live'] }})
           </button>
           <button
-            v-for="src in SOURCES"
-            :key="src"
             type="button"
-            class="rounded-md px-2 py-1 text-xs font-medium transition"
-            :class="sourceFilter === src ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'"
-            @click="sourceFilter = src"
+            data-testid="openapi-source-js-static-inferred"
+            class="rounded-md px-2.5 py-1 text-xs font-medium transition"
+            :class="
+              sourceFilter === 'js-static-inferred'
+                ? 'bg-white text-amber-800 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900'
+            "
+            @click="sourceFilter = 'js-static-inferred'"
           >
-            {{ src }}
+            {{ t('openapi.source.jsInferred') }} ({{ sourceCounts['js-static-inferred'] }})
+          </button>
+          <button
+            type="button"
+            data-testid="openapi-source-js-static"
+            class="rounded-md px-2.5 py-1 text-xs font-medium transition"
+            :class="
+              sourceFilter === 'js-static'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-500 hover:text-slate-800'
+            "
+            @click="sourceFilter = 'js-static'"
+          >
+            {{ t('openapi.source.jsStatic') }} ({{ sourceCounts['js-static'] }})
+          </button>
+          <button
+            type="button"
+            data-testid="openapi-source-ALL"
+            class="rounded-md px-2.5 py-1 text-xs font-medium transition"
+            :class="
+              sourceFilter === 'ALL'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-500 hover:text-slate-900'
+            "
+            @click="sourceFilter = 'ALL'"
+          >
+            {{ t('openapi.allSources') }} ({{ endpoints.length }})
+          </button>
+        </div>
+
+        <!-- View Mode Toggle: List | By Scenario -->
+        <div
+          v-if="scenarioPills.length > 0"
+          class="ml-auto inline-flex items-center gap-1 rounded-lg bg-slate-100 p-1"
+        >
+          <button
+            type="button"
+            data-testid="openapi-view-mode-list"
+            class="inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition"
+            :class="
+              viewMode === 'list'
+                ? 'bg-white text-indigo-700 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900'
+            "
+            @click="viewMode = 'list'"
+          >
+            <List class="h-3.5 w-3.5" />
+            <span>{{ t('openapi.viewModeList') }}</span>
+          </button>
+          <button
+            type="button"
+            data-testid="openapi-view-mode-scenario"
+            class="inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-medium transition"
+            :class="
+              viewMode === 'scenario'
+                ? 'bg-white text-indigo-700 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900'
+            "
+            @click="viewMode = 'scenario'"
+          >
+            <Layers class="h-3.5 w-3.5" />
+            <span>{{ t('openapi.viewModeScenario') }}</span>
           </button>
         </div>
       </div>
 
-      <!-- Interactive Table -->
-      <div class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-        <div class="overflow-x-auto">
-          <table class="min-w-full divide-y divide-slate-200 text-left text-sm">
-            <thead class="bg-slate-50 text-xs font-semibold tracking-wider text-slate-500 uppercase">
-              <tr>
-                <th class="w-9 px-3 py-3" />
-                <th class="w-24 px-3 py-3">{{ t('openapi.col.method') }}</th>
-                <th class="px-3 py-3">{{ t('openapi.col.path') }}</th>
-                <th class="px-3 py-3">{{ t('openapi.col.source') }}</th>
-                <th class="px-3 py-3">{{ t('openapi.col.scenarios') }}</th>
-                <th class="px-3 py-3 text-right">{{ t('openapi.col.perf') }}</th>
-                <th class="w-16 px-3 py-3 text-center">{{ t('openapi.col.auth') }}</th>
-              </tr>
-            </thead>
-            <tbody class="divide-y divide-slate-100">
-              <template v-for="ep in filteredEndpoints" :key="ep.key">
-                <tr
-                  class="cursor-pointer transition hover:bg-slate-50/90"
-                  :class="expandedKeys.has(ep.key) ? 'bg-indigo-50/40' : ''"
-                  @click="toggleExpand(ep.key)"
-                >
-                  <td class="px-3 py-3 text-slate-400">
-                    <ChevronDown v-if="expandedKeys.has(ep.key)" class="h-4 w-4 text-indigo-600" />
-                    <ChevronRight v-else class="h-4 w-4" />
-                  </td>
-                  <td class="px-3 py-3">
-                    <span
-                      class="inline-flex rounded-md px-2 py-0.5 font-mono text-xs font-semibold ring-1 ring-inset"
-                      :class="methodBadgeClass(ep.method)"
-                    >
-                      {{ ep.method }}
-                    </span>
-                  </td>
-                  <td class="px-3 py-3">
-                    <div class="font-mono text-xs font-medium text-slate-900">{{ ep.path }}</div>
-                    <div v-if="ep.operationId" class="mt-0.5 text-[11px] text-slate-400">
-                      {{ ep.operationId }}
-                    </div>
-                  </td>
-                  <td class="px-3 py-3">
-                    <StatusBadge :status="ep.discoverySource" size="sm" />
-                  </td>
-                  <td class="px-3 py-3">
-                    <div class="flex flex-wrap gap-1">
-                      <span
-                        v-for="sc in ep.scenarios"
-                        :key="sc"
-                        class="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600"
-                      >
-                        {{ sc }}
-                      </span>
-                      <span v-if="ep.scenarios.length === 0" class="text-xs text-slate-400">—</span>
-                    </div>
-                  </td>
-                  <td class="px-3 py-3 text-right font-mono text-xs text-slate-600">
-                    <template v-if="ep.perfBaseline && (ep.perfBaseline.count ?? 0) > 0">
-                      <span>p50 {{ ep.perfBaseline.p50_ms }}ms</span>
-                      <span class="mx-1 text-slate-300">/</span>
-                      <span class="text-slate-900">p95 {{ ep.perfBaseline.p95_ms }}ms</span>
-                    </template>
-                    <span v-else class="text-slate-400">—</span>
-                  </td>
-                  <td class="px-3 py-3 text-center">
-                    <Lock
-                      v-if="ep.requiresAuth"
-                      class="mx-auto h-3.5 w-3.5 text-amber-600"
-                      :title="t('openapi.requiresAuthTitle')"
-                    />
-                    <span v-else class="text-xs text-slate-300">—</span>
-                  </td>
-                </tr>
+      <!-- Dedicated Business Scenarios Filter Bar -->
+      <div
+        v-if="scenarioPills.length > 0"
+        data-testid="scenario-filter-bar"
+        class="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm"
+      >
+        <div class="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-600">
+          <Layers class="h-3.5 w-3.5 text-indigo-600" />
+          <span>{{ t('openapi.scenariosFilterLabel') }}:</span>
+        </div>
 
-                <!-- Expanded Operation Drawer -->
-                <tr v-if="expandedKeys.has(ep.key)" class="bg-slate-50/70">
+        <button
+          type="button"
+          data-testid="scenario-pill-all"
+          class="rounded-full px-2.5 py-1 text-xs font-medium transition"
+          :class="
+            scenarioFilter === 'ALL'
+              ? 'bg-indigo-600 text-white shadow-sm'
+              : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900'
+          "
+          @click="scenarioFilter = 'ALL'"
+        >
+          {{ t('openapi.allScenarios') }} ({{ sourceScopedEndpoints.length }})
+        </button>
+
+        <button
+          v-for="sc in scenarioPills"
+          :key="sc.name"
+          type="button"
+          :data-testid="`scenario-pill-${sc.name}`"
+          class="rounded-full px-2.5 py-1 font-mono text-xs font-medium transition"
+          :class="
+            scenarioFilter === sc.name
+              ? 'bg-indigo-600 text-white shadow-sm'
+              : 'bg-indigo-50/70 text-indigo-700 ring-1 ring-inset ring-indigo-200/80 hover:bg-indigo-100'
+          "
+          @click="toggleScenarioFilter(sc.name)"
+        >
+          {{ sc.name }} ({{ sc.count }})
+        </button>
+      </div>
+
+      <!-- Empty state when grouped view has no matches -->
+      <div
+        v-if="displayGroups.length === 0"
+        class="rounded-xl border border-slate-200 bg-white px-6 py-10 text-center text-sm text-slate-500 shadow-sm"
+      >
+        {{ t('openapi.noMatches') }}
+      </div>
+
+      <!-- Interactive Table(s) — Single Card in List Mode, Collapsible Scenario Cards in Grouped Mode -->
+      <div v-else class="space-y-4">
+        <div
+          v-for="group in displayGroups"
+          :key="group.id"
+          :data-testid="group.showHeader ? 'scenario-group-card' : 'openapi-list-card'"
+          class="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm"
+        >
+          <!-- Scenario Group Header -->
+          <button
+            v-if="group.showHeader"
+            type="button"
+            class="flex w-full flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50/80 px-4 py-3 text-left transition hover:bg-slate-100/70"
+            @click="toggleGroupCollapse(group.id)"
+          >
+            <div class="flex min-w-0 items-center gap-2">
+              <ChevronRight
+                v-if="collapsedGroups.has(group.id)"
+                class="h-4 w-4 shrink-0 text-slate-400"
+              />
+              <ChevronDown v-else class="h-4 w-4 shrink-0 text-indigo-600" />
+              <Layers class="h-4 w-4 shrink-0 text-indigo-600" />
+              <span class="truncate font-mono text-sm font-semibold text-slate-900">
+                {{ group.label }}
+              </span>
+              <span class="rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-semibold text-indigo-700">
+                {{ t('openapi.scenarioGroupCount', { count: group.endpoints.length }) }}
+              </span>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-1.5">
+              <span
+                v-for="mc in group.methodCounts"
+                :key="mc.method"
+                class="inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold ring-1 ring-inset"
+                :class="methodBadgeClass(mc.method)"
+              >
+                {{ mc.method }} {{ mc.count }}
+              </span>
+            </div>
+          </button>
+
+          <div v-if="!group.showHeader || !collapsedGroups.has(group.id)" class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-slate-200 text-left text-sm">
+              <thead class="bg-slate-50 text-xs font-semibold tracking-wider text-slate-500 uppercase">
+                <tr>
+                  <th class="w-9 px-3 py-3" />
+                  <th class="w-24 px-3 py-3">{{ t('openapi.col.method') }}</th>
+                  <th class="px-3 py-3">{{ t('openapi.col.path') }}</th>
+                  <th class="px-3 py-3">{{ t('openapi.col.source') }}</th>
+                  <th class="px-3 py-3">{{ t('openapi.col.scenarios') }}</th>
+                  <th class="px-3 py-3 text-right">{{ t('openapi.col.perf') }}</th>
+                  <th class="w-16 px-3 py-3 text-center">{{ t('openapi.col.auth') }}</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y divide-slate-100">
+                <template v-for="ep in group.endpoints" :key="`${group.id}::${ep.key}`">
+                  <tr
+                    class="cursor-pointer transition hover:bg-slate-50/90"
+                    :class="expandedKeys.has(`${group.id}::${ep.key}`) ? 'bg-indigo-50/40' : ''"
+                    @click="toggleExpand(`${group.id}::${ep.key}`)"
+                  >
+                    <td class="px-3 py-3 text-slate-400">
+                      <ChevronDown
+                        v-if="expandedKeys.has(`${group.id}::${ep.key}`)"
+                        class="h-4 w-4 text-indigo-600"
+                      />
+                      <ChevronRight v-else class="h-4 w-4" />
+                    </td>
+                    <td class="px-3 py-3">
+                      <span
+                        class="inline-flex rounded-md px-2 py-0.5 font-mono text-xs font-semibold ring-1 ring-inset"
+                        :class="methodBadgeClass(ep.method)"
+                      >
+                        {{ ep.method }}
+                      </span>
+                    </td>
+                    <td class="px-3 py-3">
+                      <div class="font-mono text-xs font-medium text-slate-900">{{ ep.path }}</div>
+                      <div v-if="ep.operationId" class="mt-0.5 text-[11px] text-slate-400">
+                        {{ ep.operationId }}
+                      </div>
+                    </td>
+                    <td class="px-3 py-3">
+                      <StatusBadge :status="ep.discoverySource" size="sm" />
+                    </td>
+                    <td class="px-3 py-3">
+                      <div class="flex flex-wrap gap-1">
+                        <span
+                          v-for="sc in ep.scenarios"
+                          :key="sc"
+                          class="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600"
+                        >
+                          {{ sc }}
+                        </span>
+                        <span v-if="ep.scenarios.length === 0" class="text-xs text-slate-400">—</span>
+                      </div>
+                    </td>
+                    <td class="px-3 py-3 text-right font-mono text-xs text-slate-600">
+                      <template v-if="ep.perfBaseline && (ep.perfBaseline.count ?? 0) > 0">
+                        <span>p50 {{ ep.perfBaseline.p50_ms }}ms</span>
+                        <span class="mx-1 text-slate-300">/</span>
+                        <span class="text-slate-900">p95 {{ ep.perfBaseline.p95_ms }}ms</span>
+                      </template>
+                      <span v-else class="text-slate-400">—</span>
+                    </td>
+                    <td class="px-3 py-3 text-center">
+                      <Lock
+                        v-if="ep.requiresAuth"
+                        class="mx-auto h-3.5 w-3.5 text-amber-600"
+                        :title="t('openapi.requiresAuthTitle')"
+                      />
+                      <span v-else class="text-xs text-slate-300">—</span>
+                    </td>
+                  </tr>
+
+                  <!-- Expanded Operation Drawer -->
+                  <tr v-if="expandedKeys.has(`${group.id}::${ep.key}`)" class="bg-slate-50/70">
                   <td colspan="7" class="px-6 py-4">
                     <div class="space-y-4">
                       <!-- Metadata strip -->
@@ -532,65 +883,257 @@ onMounted(loadSpec)
                         </div>
                       </div>
 
-                      <!-- Request Body & 200 Response Schema -->
+                      <!-- Request Body & 200 Response (Example | Schema toggle + Copy JSON) -->
                       <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                        <!-- Request Body Card -->
                         <div class="rounded-lg border border-slate-200 bg-white p-3.5">
-                          <h4 class="mb-2 text-xs font-semibold tracking-wide text-slate-600 uppercase">
-                            {{ t('openapi.reqBodyTitle') }}
-                          </h4>
-                          <div v-if="!extractJsonSchema(ep.requestBody)" class="text-xs text-slate-400">
+                          <div class="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                            <h4 class="text-xs font-semibold tracking-wide text-slate-600 uppercase">
+                              {{ t('openapi.reqBodyTitle') }}
+                            </h4>
+                            <div
+                              v-if="extractJsonExample(ep.requestBody) !== null || extractJsonSchema(ep.requestBody)"
+                              class="flex items-center gap-1.5"
+                            >
+                              <div class="inline-flex rounded-md bg-slate-100 p-0.5 text-[11px]">
+                                <button
+                                  type="button"
+                                  data-testid="openapi-req-example-tab"
+                                  class="rounded px-2 py-0.5 font-medium transition"
+                                  :class="
+                                    getPanelMode(ep.key, 'req', extractJsonExample(ep.requestBody) !== null) === 'example'
+                                      ? 'bg-white text-indigo-700 shadow-sm'
+                                      : 'text-slate-500 hover:text-slate-800'
+                                  "
+                                  @click="setPanelMode(ep.key, 'req', 'example')"
+                                >
+                                  {{ t('openapi.viewExample') }}
+                                </button>
+                                <button
+                                  type="button"
+                                  data-testid="openapi-req-schema-tab"
+                                  class="rounded px-2 py-0.5 font-medium transition"
+                                  :class="
+                                    getPanelMode(ep.key, 'req', extractJsonExample(ep.requestBody) !== null) === 'schema'
+                                      ? 'bg-white text-indigo-700 shadow-sm'
+                                      : 'text-slate-500 hover:text-slate-800'
+                                  "
+                                  @click="setPanelMode(ep.key, 'req', 'schema')"
+                                >
+                                  {{ t('openapi.viewSchema') }}
+                                </button>
+                              </div>
+                              <button
+                                v-if="
+                                  (getPanelMode(ep.key, 'req', extractJsonExample(ep.requestBody) !== null) === 'example'
+                                    ? extractJsonExample(ep.requestBody)
+                                    : extractJsonSchema(ep.requestBody)) !== null
+                                "
+                                type="button"
+                                data-testid="openapi-req-copy-btn"
+                                class="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"
+                                @click="
+                                  copyJsonPayload(
+                                    `${ep.key}::req`,
+                                    getPanelMode(ep.key, 'req', extractJsonExample(ep.requestBody) !== null) === 'example'
+                                      ? extractJsonExample(ep.requestBody)
+                                      : extractJsonSchema(ep.requestBody),
+                                  )
+                                "
+                              >
+                                <Check v-if="copiedJsonKey === `${ep.key}::req`" class="h-3 w-3 text-emerald-600" />
+                                <Copy v-else class="h-3 w-3" />
+                                <span>
+                                  {{
+                                    copiedJsonKey === `${ep.key}::req`
+                                      ? t('openapi.copiedJson')
+                                      : t('openapi.copyJson')
+                                  }}
+                                </span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <div
+                            v-if="extractJsonExample(ep.requestBody) === null && !extractJsonSchema(ep.requestBody)"
+                            class="text-xs text-slate-400"
+                          >
                             {{ t('openapi.noReqBody') }}
                           </div>
-                          <pre
-                            v-else
-                            class="max-h-56 overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-[11px] leading-relaxed text-slate-100"
-                          >{{ prettyJson(extractJsonSchema(ep.requestBody)) }}</pre>
-                          <div v-if="extractJsonExample(ep.requestBody)" class="mt-2">
-                            <span class="text-[11px] font-medium text-slate-500">{{ t('openapi.redactedExample') }}</span>
-                            <pre class="mt-1 max-h-36 overflow-auto rounded-lg bg-slate-100 p-2 font-mono text-[11px] text-slate-700">{{ prettyJson(extractJsonExample(ep.requestBody)) }}</pre>
-                          </div>
+                          <template
+                            v-else-if="getPanelMode(ep.key, 'req', extractJsonExample(ep.requestBody) !== null) === 'example'"
+                          >
+                            <div
+                              v-if="extractJsonExample(ep.requestBody) === null"
+                              class="text-xs text-slate-400"
+                            >
+                              {{ t('openapi.noReqExample') }}
+                            </div>
+                            <pre
+                              v-else
+                              data-testid="openapi-req-example-json"
+                              class="max-h-64 overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-[11px] leading-relaxed text-sky-200"
+                            >{{ prettyJson(extractJsonExample(ep.requestBody)) }}</pre>
+                          </template>
+                          <template v-else>
+                            <div
+                              v-if="!extractJsonSchema(ep.requestBody)"
+                              class="text-xs text-slate-400"
+                            >
+                              {{ t('openapi.noReqBody') }}
+                            </div>
+                            <pre
+                              v-else
+                              class="max-h-64 overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-[11px] leading-relaxed text-slate-100"
+                            >{{ prettyJson(extractJsonSchema(ep.requestBody)) }}</pre>
+                          </template>
                         </div>
 
+                        <!-- Response Card -->
                         <div class="rounded-lg border border-slate-200 bg-white p-3.5">
-                          <h4 class="mb-2 text-xs font-semibold tracking-wide text-slate-600 uppercase">
-                            {{ t('openapi.respSchemaTitle', { status: getPrimaryResponse(ep.responses).status }) }}
-                          </h4>
+                          <div class="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                            <h4 class="text-xs font-semibold tracking-wide text-slate-600 uppercase">
+                              {{ t('openapi.respSchemaTitle', { status: getPrimaryResponse(ep.responses).status }) }}
+                            </h4>
+                            <div
+                              v-if="
+                                extractJsonExample(getPrimaryResponse(ep.responses).response) !== null ||
+                                extractJsonSchema(getPrimaryResponse(ep.responses).response)
+                              "
+                              class="flex items-center gap-1.5"
+                            >
+                              <div class="inline-flex rounded-md bg-slate-100 p-0.5 text-[11px]">
+                                <button
+                                  type="button"
+                                  data-testid="openapi-resp-example-tab"
+                                  class="rounded px-2 py-0.5 font-medium transition"
+                                  :class="
+                                    getPanelMode(
+                                      ep.key,
+                                      'resp',
+                                      extractJsonExample(getPrimaryResponse(ep.responses).response) !== null,
+                                    ) === 'example'
+                                      ? 'bg-white text-emerald-700 shadow-sm'
+                                      : 'text-slate-500 hover:text-slate-800'
+                                  "
+                                  @click="setPanelMode(ep.key, 'resp', 'example')"
+                                >
+                                  {{ t('openapi.viewExample') }}
+                                </button>
+                                <button
+                                  type="button"
+                                  data-testid="openapi-resp-schema-tab"
+                                  class="rounded px-2 py-0.5 font-medium transition"
+                                  :class="
+                                    getPanelMode(
+                                      ep.key,
+                                      'resp',
+                                      extractJsonExample(getPrimaryResponse(ep.responses).response) !== null,
+                                    ) === 'schema'
+                                      ? 'bg-white text-indigo-700 shadow-sm'
+                                      : 'text-slate-500 hover:text-slate-800'
+                                  "
+                                  @click="setPanelMode(ep.key, 'resp', 'schema')"
+                                >
+                                  {{ t('openapi.viewSchema') }}
+                                </button>
+                              </div>
+                              <button
+                                v-if="
+                                  (getPanelMode(
+                                    ep.key,
+                                    'resp',
+                                    extractJsonExample(getPrimaryResponse(ep.responses).response) !== null,
+                                  ) === 'example'
+                                    ? extractJsonExample(getPrimaryResponse(ep.responses).response)
+                                    : extractJsonSchema(getPrimaryResponse(ep.responses).response)) !== null
+                                "
+                                type="button"
+                                data-testid="openapi-resp-copy-btn"
+                                class="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"
+                                @click="
+                                  copyJsonPayload(
+                                    `${ep.key}::resp`,
+                                    getPanelMode(
+                                      ep.key,
+                                      'resp',
+                                      extractJsonExample(getPrimaryResponse(ep.responses).response) !== null,
+                                    ) === 'example'
+                                      ? extractJsonExample(getPrimaryResponse(ep.responses).response)
+                                      : extractJsonSchema(getPrimaryResponse(ep.responses).response),
+                                  )
+                                "
+                              >
+                                <Check v-if="copiedJsonKey === `${ep.key}::resp`" class="h-3 w-3 text-emerald-600" />
+                                <Copy v-else class="h-3 w-3" />
+                                <span>
+                                  {{
+                                    copiedJsonKey === `${ep.key}::resp`
+                                      ? t('openapi.copiedJson')
+                                      : t('openapi.copyJson')
+                                  }}
+                                </span>
+                              </button>
+                            </div>
+                          </div>
+
                           <div
-                            v-if="!extractJsonSchema(getPrimaryResponse(ep.responses).response)"
+                            v-if="
+                              extractJsonExample(getPrimaryResponse(ep.responses).response) === null &&
+                              !extractJsonSchema(getPrimaryResponse(ep.responses).response)
+                            "
                             class="text-xs text-slate-400"
                           >
                             {{ t('openapi.noRespSchema') }}
                           </div>
-                          <pre
-                            v-else
-                            class="max-h-56 overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-[11px] leading-relaxed text-emerald-200"
-                          >{{ prettyJson(extractJsonSchema(getPrimaryResponse(ep.responses).response)) }}</pre>
+                          <template
+                            v-else-if="
+                              getPanelMode(
+                                ep.key,
+                                'resp',
+                                extractJsonExample(getPrimaryResponse(ep.responses).response) !== null,
+                              ) === 'example'
+                            "
+                          >
+                            <div
+                              v-if="extractJsonExample(getPrimaryResponse(ep.responses).response) === null"
+                              class="text-xs text-slate-400"
+                            >
+                              {{ t('openapi.noRespExample') }}
+                            </div>
+                            <pre
+                              v-else
+                              data-testid="openapi-resp-example-json"
+                              class="max-h-64 overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-[11px] leading-relaxed text-emerald-200"
+                            >{{ prettyJson(extractJsonExample(getPrimaryResponse(ep.responses).response)) }}</pre>
+                          </template>
+                          <template v-else>
+                            <div
+                              v-if="!extractJsonSchema(getPrimaryResponse(ep.responses).response)"
+                              class="text-xs text-slate-400"
+                            >
+                              {{ t('openapi.noRespSchema') }}
+                            </div>
+                            <pre
+                              v-else
+                              class="max-h-64 overflow-auto rounded-lg bg-slate-900 p-3 font-mono text-[11px] leading-relaxed text-slate-100"
+                            >{{ prettyJson(extractJsonSchema(getPrimaryResponse(ep.responses).response)) }}</pre>
+                          </template>
                         </div>
-                      </div>
-
-                      <!-- x-js-snippet -->
-                      <div
-                        v-if="ep.jsSnippet"
-                        class="rounded-lg border border-slate-200 bg-white p-3.5"
-                      >
-                        <div class="mb-2 flex items-center gap-1.5 text-xs font-semibold tracking-wide text-slate-600 uppercase">
-                          <Code2 class="h-3.5 w-3.5 text-indigo-600" />
-                          <span>{{ t('openapi.jsSnippetTitle') }}</span>
-                        </div>
-                        <pre class="max-h-40 overflow-auto rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-amber-200">{{ ep.jsSnippet }}</pre>
                       </div>
                     </div>
                   </td>
                 </tr>
               </template>
 
-              <tr v-if="filteredEndpoints.length === 0">
-                <td colspan="7" class="px-6 py-10 text-center text-sm text-slate-500">
-                  {{ t('openapi.noMatches') }}
-                </td>
-              </tr>
-            </tbody>
-          </table>
+                <tr v-if="group.endpoints.length === 0">
+                  <td colspan="7" class="px-6 py-10 text-center text-sm text-slate-500">
+                    {{ t('openapi.noMatches') }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </template>

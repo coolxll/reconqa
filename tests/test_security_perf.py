@@ -50,6 +50,75 @@ def test_static_audit_detects_missing_headers_cookies_and_redacts_secrets(
     assert "13800138000" not in json_text, "Raw phone number leaked unredacted in static_audit.json"
 
 
+def test_static_audit_signal_to_noise_dedup_vendor_and_pem_body(
+    fixtures_har_dir: Path, tmp_path: Path
+) -> None:
+    """Verify #124: JS bundle dedup across scenarios, vendor/OSS email skip, and real PEM body requirement."""
+    har_dir = tmp_path / "har"
+    import_hars([fixtures_har_dir], har_dir, extract_js=False)
+
+    js_dir = tmp_path / "js_bundles"
+    scen1 = js_dir / "01_scene_a"
+    scen2 = js_dir / "02_scene_b"
+    scen1.mkdir(parents=True, exist_ok=True)
+    scen2.mkdir(parents=True, exist_ok=True)
+
+    # 1. Identical JS bundle across 2 scenarios -> must be deduplicated to 1 finding
+    dup_bundle = 'const internalDb = "10.99.88.77";\n'
+    (scen1 / "app.dup.js").write_text(dup_bundle, encoding="utf-8")
+    (scen2 / "app.dup.js").write_text(dup_bundle, encoding="utf-8")
+
+    # 2. Vendor bundle + OSS/license author email + bare jsencrypt PEM constant -> MUST NOT be flagged
+    pem_hdr = "-----BEGIN " + "PRIVATE KEY-----"
+    (scen1 / "chunk-elementUI.vendor.js").write_text(
+        f'/* Copyright (c) 2026 author: dev@github.com, phone: 13900139000 */\nconst H = "{pem_hdr}";\n',
+        encoding="utf-8",
+    )
+    (scen1 / "jsencrypt.app.js").write_text(
+        f'/* MIT License @author maintainer@example.org */\nconst PEM_PREFIX = "{pem_hdr}";\n',
+        encoding="utf-8",
+    )
+
+    # 3. Real PEM header WITH Base64 body -> MUST be flagged as critical private_key
+    real_pem_file = scen1 / "leaked.key.js"
+    real_pem_file.write_text(
+        f'const k = "{pem_hdr}\\n' + ("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5" * 2) + '";\n',
+        encoding="utf-8",
+    )
+
+    sec_dir = tmp_path / "sec_s2n"
+    report = run_static_audit(har_dir, sec_dir, js_dir=js_dir)
+    findings = report.get("findings", [])
+
+    # Duplicate JS bundle across 2 scenarios -> only 1 private_ip finding for 10.99.88.77
+    dup_ip_findings = [
+        f for f in findings if "app.dup.js" in str(f.get("endpoint", "")) or "app.dup.js" in str(f.get("evidence", ""))
+    ]
+    assert len(dup_ip_findings) == 1, f"Expected deduplicated 1 finding for dup bundle, got {dup_ip_findings}"
+
+    # Vendor bundle & OSS author emails must NOT be flagged
+    assert not any("chunk-elementUI" in str(f) for f in findings), (
+        f"Vendor bundle should not produce PII/PEM false positives: {findings}"
+    )
+    assert not any("jsencrypt.app.js" in str(f) for f in findings), (
+        f"Bare PEM constant / license email in jsencrypt.app.js should not be flagged: {findings}"
+    )
+
+    # Real PEM header + Base64 body MUST be flagged as critical with redacted context snippet (#125)
+    pem_findings = [
+        f
+        for f in findings
+        if f.get("severity") == "critical" and "leaked.key.js" in str(f)
+    ]
+    assert len(pem_findings) == 1, f"Expected 1 critical finding for real PEM body, got {findings}"
+    ctx = pem_findings[0].get("evidence", {}).get("context", "")
+    assert isinstance(ctx, str) and len(ctx) > 0, f"Expected non-empty redacted context: {pem_findings[0]}"
+    assert "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5" not in ctx, "Raw PEM body leaked into context!"
+
+    dup_ctx = dup_ip_findings[0].get("evidence", {}).get("context", "")
+    assert "internalDb" in dup_ctx, f"Expected surrounding key 'internalDb' in context, got: {dup_ctx!r}"
+
+
 def test_auth_matrix_unauth_idor_and_mutation_safety(
     fixtures_har_dir: Path, tmp_path: Path
 ) -> None:

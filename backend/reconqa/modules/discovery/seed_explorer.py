@@ -39,8 +39,8 @@ _SOURCE_PRIORITY = {
     "seed_curl": 6,
     "openapi_probe": 5,
     "js_static_inferred": 4,
-    "katana": 3,
-    "js_static": 2,
+    "js_static": 3,
+    "katana": 2,
     "urlfinder": 1,
 }
 
@@ -359,10 +359,16 @@ def _add_endpoint(
             "path": clean_path,
             "url": full_url,
             "source": source,
+            "sources": [source],
             "inferred_params": list(dict.fromkeys(params)),
             "snippet": snippet[:300],
         }
         return
+
+    ep_sources = list(existing.get("sources") or [existing["source"]])
+    if source not in ep_sources:
+        ep_sources.append(source)
+    existing["sources"] = ep_sources
 
     if _SOURCE_PRIORITY.get(source, 0) > _SOURCE_PRIORITY.get(existing["source"], 0):
         existing["source"] = source
@@ -373,6 +379,277 @@ def _add_endpoint(
             existing["inferred_params"].append(p)
     if snippet and len(snippet) > len(existing["snippet"]):
         existing["snippet"] = snippet[:300]
+
+
+def extract_seed_root_domain(seed_curl: str | None = None, target_url: str | None = None) -> str:
+    """Quickly resolve registrable root_domain from seed_curl or target_url for deterministic keying."""
+    if seed_curl and seed_curl.strip():
+        m = re.search(r"https?://([^\s/'\"`<>)]+)", seed_curl)
+        if m:
+            host = urlparse(f"http://{m.group(1)}").hostname or ""
+            if host:
+                return _registrable_root_domain(host)
+        h_match = re.search(r"(?mi)^\s*Host\s*:\s*([^\s\r\n]+)", seed_curl)
+        if h_match:
+            host = h_match.group(1).split(":", 1)[0].strip()
+            if host:
+                return _registrable_root_domain(host)
+    if target_url and target_url.strip():
+        raw = target_url.strip()
+        if "://" not in raw:
+            raw = f"https://{raw}"
+        host = urlparse(raw).hostname or ""
+        if host:
+            return _registrable_root_domain(host)
+    return ""
+
+
+def merge_explore_results(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+    *,
+    explore_id: str | None = None,
+) -> dict[str, Any]:
+    """Merge an incoming ExploreResult into an existing root-domain inventory cleanly."""
+    merged_id = explore_id or str(existing.get("explore_id") or incoming.get("explore_id") or "")
+
+    # 1. Endpoints deduplicated by (method.upper(), path)
+    ep_bucket: dict[tuple[str, str], dict[str, Any]] = {}
+    existing_keys: set[tuple[str, str]] = set()
+    for ep in existing.get("discovered_endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        m = str(ep.get("method") or "GET").upper()
+        p = str(ep.get("path") or "/")
+        existing_keys.add((m, p))
+        ep_sources = list(ep.get("sources") or ([ep.get("source")] if ep.get("source") else []))
+        ep_bucket[(m, p)] = {
+            "id": f"{m} {p}",
+            "method": m,
+            "path": p,
+            "url": str(ep.get("url") or ""),
+            "source": str(ep.get("source") or "js_static"),
+            "sources": list(dict.fromkeys(str(s) for s in ep_sources if s)),
+            "inferred_params": list(dict.fromkeys(str(x) for x in (ep.get("inferred_params") or []))),
+            "snippet": str(ep.get("snippet") or "")[:300],
+        }
+
+    new_endpoints_count = 0
+    for ep in incoming.get("discovered_endpoints") or []:
+        if not isinstance(ep, dict):
+            continue
+        m = str(ep.get("method") or "GET").upper()
+        p = str(ep.get("path") or "/")
+        key = (m, p)
+        if key not in existing_keys:
+            new_endpoints_count += 1
+            existing_keys.add(key)
+        src = str(ep.get("source") or "js_static")
+        ep_sources = list(ep.get("sources") or [src])
+        inc_params = [str(x) for x in (ep.get("inferred_params") or []) if str(x).strip()]
+        inc_snippet = str(ep.get("snippet") or "")[:300]
+        inc_url = str(ep.get("url") or "")
+
+        cur = ep_bucket.get(key)
+        if cur is None:
+            ep_bucket[key] = {
+                "id": f"{m} {p}",
+                "method": m,
+                "path": p,
+                "url": inc_url,
+                "source": src,
+                "sources": list(dict.fromkeys(str(s) for s in ep_sources if s)),
+                "inferred_params": list(dict.fromkeys(inc_params)),
+                "snippet": inc_snippet,
+            }
+        else:
+            for s in ep_sources:
+                if s and s not in cur["sources"]:
+                    cur["sources"].append(str(s))
+            if _SOURCE_PRIORITY.get(src, 0) > _SOURCE_PRIORITY.get(cur["source"], 0):
+                cur["source"] = src
+                if inc_url:
+                    cur["url"] = inc_url
+            elif not cur["url"] and inc_url:
+                cur["url"] = inc_url
+            for param in inc_params:
+                if param not in cur["inferred_params"]:
+                    cur["inferred_params"].append(param)
+            if len(inc_snippet) > len(cur["snippet"]):
+                cur["snippet"] = inc_snippet
+
+    merged_endpoints = sorted(
+        ep_bucket.values(),
+        key=lambda e: (-_SOURCE_PRIORITY.get(e["source"], 0), e["path"], e["method"]),
+    )
+
+    # 2. Subdomains union & sorted (normalized list[str]; accepts legacy dict items too)
+    existing_sub_hosts: set[str] = set()
+    for item in existing.get("subdomains") or []:
+        if isinstance(item, dict) and item.get("host"):
+            existing_sub_hosts.add(str(item["host"]).strip().lower())
+        elif isinstance(item, str) and item.strip():
+            existing_sub_hosts.add(item.strip().lower())
+
+    new_subdomains_count = 0
+    all_sub_hosts = set(existing_sub_hosts)
+    for item in incoming.get("subdomains") or []:
+        h = ""
+        if isinstance(item, dict) and item.get("host"):
+            h = str(item["host"]).strip().lower()
+        elif isinstance(item, str) and item.strip():
+            h = item.strip().lower()
+        if not h:
+            continue
+        if h not in existing_sub_hosts:
+            new_subdomains_count += 1
+            existing_sub_hosts.add(h)
+        all_sub_hosts.add(h)
+    merged_subdomains = sorted(all_sub_hosts)
+
+    # 3. Live hosts deduplicated by normalized URL
+    live_map: dict[str, dict[str, Any]] = {}
+    for group in (existing.get("live_hosts") or [], incoming.get("live_hosts") or []):
+        for h_item in group:
+            if not isinstance(h_item, dict):
+                continue
+            raw_u = str(h_item.get("url") or "").strip()
+            if not raw_u:
+                continue
+            pu = urlparse(raw_u)
+            norm_key = f"{pu.scheme.lower()}://{pu.netloc.lower()}{pu.path.rstrip('/')}" if pu.netloc else raw_u.rstrip("/").lower()
+            cur_h = live_map.get(norm_key)
+            tech_list = [str(t) for t in (h_item.get("tech") or []) if str(t).strip()]
+            if cur_h is None:
+                live_map[norm_key] = {
+                    "url": raw_u,
+                    "status_code": h_item.get("status_code"),
+                    "title": str(h_item.get("title") or ""),
+                    "tech": list(dict.fromkeys(tech_list)),
+                }
+            else:
+                if cur_h.get("status_code") is None and h_item.get("status_code") is not None:
+                    cur_h["status_code"] = h_item.get("status_code")
+                if not cur_h.get("title") and h_item.get("title"):
+                    cur_h["title"] = str(h_item["title"])
+                for t in tech_list:
+                    if t not in cur_h["tech"]:
+                        cur_h["tech"].append(t)
+    merged_live_hosts = sorted(live_map.values(), key=lambda x: str(x.get("url", "")))
+
+    # 4. SPA routes, micro-frontends, OpenAPI docs
+    merged_spa_routes = sorted(
+        {str(r) for r in (*(existing.get("spa_routes") or []), *(incoming.get("spa_routes") or [])) if str(r).strip()}
+    )
+
+    mfe_map: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for mfe in (*(existing.get("micro_frontends") or []), *(incoming.get("micro_frontends") or [])):
+        if isinstance(mfe, dict):
+            k = (str(mfe.get("framework") or ""), str(mfe.get("name") or ""), str(mfe.get("entry") or ""))
+            mfe_map[k] = mfe
+    merged_mfe = list(mfe_map.values())
+
+    docs_map: dict[str, dict[str, Any]] = {}
+    for doc in (*(existing.get("openapi_docs_found") or []), *(incoming.get("openapi_docs_found") or [])):
+        if isinstance(doc, dict) and doc.get("url"):
+            u = str(doc["url"])
+            cur_d = docs_map.get(u)
+            if cur_d is None or int(doc.get("endpoints_count", 0) or 0) >= int(cur_d.get("endpoints_count", 0) or 0):
+                docs_map[u] = doc
+    merged_docs = list(docs_map.values())
+
+    # 5. Seed metadata merge
+    ex_seed = dict(existing.get("seed") or {})
+    in_seed = dict(incoming.get("seed") or {})
+    merged_siblings = sorted(
+        {
+            str(s)
+            for s in (*(ex_seed.get("sibling_api_hosts") or []), *(in_seed.get("sibling_api_hosts") or []))
+            if str(s).strip()
+        }
+    )
+    merged_auth_hdrs = sorted(
+        {
+            str(h)
+            for h in (*(ex_seed.get("auth_headers_detected") or []), *(in_seed.get("auth_headers_detected") or []))
+            if str(h).strip()
+        }
+    )
+    merged_seed = {
+        "type": in_seed.get("type") or ex_seed.get("type") or "url",
+        "base_url": in_seed.get("base_url") or ex_seed.get("base_url") or "",
+        "root_domain": ex_seed.get("root_domain") or in_seed.get("root_domain") or "",
+        "seed_url": in_seed.get("seed_url") or ex_seed.get("seed_url") or "",
+        "api_prefix": in_seed.get("api_prefix") or ex_seed.get("api_prefix") or "",
+        "auth_headers_detected": merged_auth_hdrs,
+        "sibling_api_hosts": merged_siblings,
+    }
+
+    # 6. Scan audit history
+    ex_scans = list(existing.get("scans") or [])
+    if not ex_scans and existing.get("created_at"):
+        ex_scans = [
+            {
+                "scan_id": str(existing.get("explore_id") or "scan-1"),
+                "scanned_at": str(existing.get("created_at")),
+                "mode": str(existing.get("mode") or "passive"),
+                "seed_type": str(ex_seed.get("type") or "url"),
+                "seed_url": str(ex_seed.get("seed_url") or ""),
+                "new_endpoints": len(existing.get("discovered_endpoints") or []),
+                "new_subdomains": len(existing.get("subdomains") or []),
+            }
+        ]
+    in_scans = list(incoming.get("scans") or [])
+    if in_scans:
+        latest_scan = dict(in_scans[-1])
+        latest_scan["new_endpoints"] = new_endpoints_count
+        latest_scan["new_subdomains"] = new_subdomains_count
+        merged_scans = [*ex_scans, *in_scans[:-1], latest_scan]
+    else:
+        merged_scans = [
+            *ex_scans,
+            {
+                "scan_id": str(incoming.get("explore_id") or f"scan-{len(ex_scans) + 1}"),
+                "scanned_at": str(incoming.get("created_at") or datetime.now(UTC).isoformat()),
+                "mode": str(incoming.get("mode") or "passive"),
+                "seed_type": str(in_seed.get("type") or "url"),
+                "seed_url": str(in_seed.get("seed_url") or ""),
+                "new_endpoints": new_endpoints_count,
+                "new_subdomains": new_subdomains_count,
+            },
+        ]
+
+    merged_warnings = list(
+        dict.fromkeys([*(existing.get("warnings") or []), *(incoming.get("warnings") or [])])
+    )[-30:]
+
+    created_at = str(existing.get("created_at") or incoming.get("created_at") or datetime.now(UTC).isoformat())
+    updated_at = str(incoming.get("updated_at") or incoming.get("created_at") or datetime.now(UTC).isoformat())
+
+    return {
+        "explore_id": merged_id,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "mode": str(incoming.get("mode") or existing.get("mode") or "passive"),
+        "seed": merged_seed,
+        "summary": {
+            "scans_count": len(merged_scans),
+            "endpoints_count": len(merged_endpoints),
+            "openapi_docs_count": len(merged_docs),
+            "spa_routes_count": len(merged_spa_routes),
+            "subdomains_count": len(merged_subdomains),
+            "live_hosts_count": len(merged_live_hosts),
+        },
+        "scans_count": len(merged_scans),
+        "scans": merged_scans,
+        "discovered_endpoints": merged_endpoints,
+        "openapi_docs_found": merged_docs,
+        "spa_routes": merged_spa_routes,
+        "micro_frontends": merged_mfe,
+        "subdomains": merged_subdomains,
+        "live_hosts": merged_live_hosts,
+        "warnings": merged_warnings,
+    }
 
 
 def _probe_openapi_on_origin(
@@ -504,7 +781,7 @@ def explore_from_seed(
     openapi_docs_found: list[dict[str, Any]] = []
     spa_routes: list[str] = []
     micro_frontends: list[dict[str, Any]] = []
-    subdomains: list[dict[str, Any]] = []
+    subdomains_set: set[str] = set()
     live_hosts: list[dict[str, Any]] = []
     sibling_api_hosts: list[str] = []
 
@@ -833,9 +1110,7 @@ def explore_from_seed(
             for rec in read_jsonl(disc_dir / "subdomains.jsonl"):
                 host = rec.get("host") or rec.get("domain")
                 if host:
-                    subdomains.append(
-                        {"host": str(host), "source": str(rec.get("source") or "subfinder")}
-                    )
+                    subdomains_set.add(str(host).strip().lower())
 
             seen_live_urls = {str(h.get("url") or "") for h in live_hosts}
             for rec in read_jsonl(disc_dir / "live_hosts.jsonl"):
@@ -881,6 +1156,7 @@ def explore_from_seed(
         except Exception as exc:
             warnings.append(f"Optional PD discovery step failed: {exc}")
 
+    subdomains = sorted(subdomains_set)
     discovered_endpoints = sorted(
         endpoints_bucket.values(),
         key=lambda ep: (-_SOURCE_PRIORITY.get(ep["source"], 0), ep["path"], ep["method"]),
@@ -889,6 +1165,7 @@ def explore_from_seed(
     result: dict[str, Any] = {
         "explore_id": exp_id,
         "created_at": created_at,
+        "updated_at": created_at,
         "mode": mode,
         "seed": {
             "type": seed_type,
@@ -900,12 +1177,25 @@ def explore_from_seed(
             "sibling_api_hosts": sibling_api_hosts,
         },
         "summary": {
+            "scans_count": 1,
             "endpoints_count": len(discovered_endpoints),
             "openapi_docs_count": len(openapi_docs_found),
             "spa_routes_count": len(spa_routes),
             "subdomains_count": len(subdomains),
             "live_hosts_count": len(live_hosts),
         },
+        "scans_count": 1,
+        "scans": [
+            {
+                "scan_id": exp_id,
+                "scanned_at": created_at,
+                "mode": mode,
+                "seed_type": seed_type,
+                "seed_url": seed_url,
+                "new_endpoints": len(discovered_endpoints),
+                "new_subdomains": len(subdomains),
+            }
+        ],
         "discovered_endpoints": discovered_endpoints,
         "openapi_docs_found": openapi_docs_found,
         "spa_routes": spa_routes,

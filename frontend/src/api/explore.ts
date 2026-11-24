@@ -10,6 +10,7 @@ export interface ExploreRequest {
   probe_openapi_docs?: boolean;
   crawl_js?: boolean;
   depth?: number;
+  merge?: boolean;
 }
 
 export interface ExploreSeedInfo {
@@ -19,6 +20,7 @@ export interface ExploreSeedInfo {
   seed_url: string;
   api_prefix: string;
   auth_headers_detected: string[];
+  sibling_api_hosts?: string[];
 }
 
 export interface ExploreSummary {
@@ -27,6 +29,7 @@ export interface ExploreSummary {
   spa_routes_count: number;
   subdomains_count: number;
   live_hosts_count: number;
+  scans_count?: number;
 }
 
 export interface DiscoveredEndpoint {
@@ -35,6 +38,7 @@ export interface DiscoveredEndpoint {
   path: string;
   url: string;
   source: string;
+  sources?: string[];
   inferred_params: string[];
   snippet: string;
 }
@@ -45,12 +49,25 @@ export interface OpenApiDocFound {
   endpoints_count: number;
 }
 
+export interface ExploreScanRecord {
+  scan_id: string;
+  scanned_at: string;
+  mode: string;
+  seed_type: string;
+  seed_url?: string;
+  new_endpoints: number;
+  new_subdomains: number;
+}
+
 export interface ExploreResult {
   explore_id: string;
   created_at: string;
+  updated_at?: string;
   mode: string;
   seed: ExploreSeedInfo;
   summary: ExploreSummary;
+  scans_count?: number;
+  scans?: ExploreScanRecord[];
   discovered_endpoints: DiscoveredEndpoint[];
   openapi_docs_found: OpenApiDocFound[];
   spa_routes: string[];
@@ -63,12 +80,14 @@ export interface ExploreResult {
 export interface ExploreListItem {
   explore_id: string;
   created_at: string;
+  updated_at?: string;
   mode: string;
   seed?: Partial<ExploreSeedInfo>;
   summary?: Partial<ExploreSummary>;
   base_url?: string;
   root_domain?: string;
   endpoints_count?: number;
+  scans_count?: number;
   [key: string]: unknown;
 }
 
@@ -99,6 +118,15 @@ export async function listExplores(): Promise<ExploreListItem[]> {
 
 export function getExplore(exploreId: string): Promise<ExploreResult> {
   return apiFetch<ExploreResult>(`/explore/${encodeURIComponent(exploreId)}`);
+}
+
+export function deleteExplore(
+  exploreId: string
+): Promise<{ deleted: boolean; explore_id: string }> {
+  return apiFetch<{ deleted: boolean; explore_id: string }>(
+    `/explore/${encodeURIComponent(exploreId)}`,
+    { method: "DELETE" }
+  );
 }
 
 export function promoteExploreToRun(

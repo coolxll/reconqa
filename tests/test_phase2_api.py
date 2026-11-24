@@ -541,5 +541,130 @@ async def test_phase2_doctor_java_report_import_text_and_delete_auth_profile(
             mis_oa = (await client.get(f"/api/v1/runs/{mis_run_id}/openapi?format=json")).json()
             assert "/api/v1/ping" in mis_oa.get("paths", {})
 
+            # 10. Human-readable auto run_name & DELETE /api/v1/runs/{run_id} (#118)
+            assert mis_done["config_snapshot"].get("run_name"), f"Expected auto run_name: {mis_done['config_snapshot']}"
+            mis_ws = Path(mis_done["workspace_dir"])
+            assert mis_ws.is_dir()
+
+            r_del_run = await client.delete(f"/api/v1/runs/{mis_run_id}")
+            assert r_del_run.status_code == 200, r_del_run.text
+            assert r_del_run.json().get("deleted") is True
+            assert not mis_ws.exists(), f"Expected run workspace removed: {mis_ws}"
+
+            r_del_run_again = await client.delete(f"/api/v1/runs/{mis_run_id}")
+            assert r_del_run_again.status_code == 404
+
+    if db_mod._engine is not None:
+        await db_mod._engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_worker_monotonic_job_state_and_startup_self_heal(
+    fixtures_har_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test (#110): monotonic job transitions, startup self-heal, and zero stuck running jobs."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "worker_race_test.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+
+    from sqlalchemy import select
+
+    from reconqa.models import db as db_mod
+    from reconqa.models.tables import Job, Project, Run
+    from reconqa.server.worker import InProcessTaskRunner
+
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+    await db_mod.init_db()
+
+    # 1. Seed a completed run with a stuck 'running' child job (simulating pre-fix DB state)
+    session_factory = db_mod.get_session_factory()
+    async with session_factory() as session:
+        proj = Project(slug="race-proj", name="Race Proj")
+        session.add(proj)
+        await session.flush()
+
+        run = Run(
+            project_id=proj.id,
+            status="completed",
+            trigger_source="web",
+            workspace_dir=str(ws_dir / "runs" / "stuck1"),
+            config_snapshot={"modules": ["merge", "perf"]},
+        )
+        session.add(run)
+        await session.flush()
+        run_id = run.id
+
+        job_merge = Job(run_id=run.id, module="merge", status="completed")
+        job_perf = Job(run_id=run.id, module="perf", status="running")
+        session.add_all([job_merge, job_perf])
+        await session.commit()
+
+    # 2. Startup self-healing must reconcile stuck 'running' child job of 'completed' run
+    runner = InProcessTaskRunner()
+    await runner.start()
+    try:
+        async with session_factory() as session:
+            repaired = (
+                await session.execute(
+                    select(Job).where(Job.run_id == run_id, Job.module == "perf")
+                )
+            ).scalar_one()
+            assert repaired.status == "completed", f"Expected self-healed completed, got {repaired.status}"
+            assert repaired.finished_at is not None
+
+        # 3. Monotonic guard: stale 'running' update MUST NOT downgrade a 'completed' job
+        await runner._update_job_status(run_id, "perf", "running")
+        async with session_factory() as session:
+            after_stale = (
+                await session.execute(
+                    select(Job).where(Job.run_id == run_id, Job.module == "perf")
+                )
+            ).scalar_one()
+            assert after_stale.status == "completed", (
+                f"Stale running update downgraded completed job to {after_stale.status}"
+            )
+    finally:
+        await runner.stop()
+
+    # 4. Fast full pipeline run via FastAPI: ALL jobs in RunOut must finish 'completed' (zero stuck 'running')
+    from reconqa.server.app import create_app
+
+    fastapi_app = create_app()
+    async with fastapi_app.router.lifespan_context(fastapi_app):
+        transport = httpx.ASGITransport(app=fastapi_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            r_p = await client.post("/api/v1/projects", json={"name": "Fast Race Check"})
+            assert r_p.status_code in (200, 201)
+            pid = r_p.json()["id"]
+
+            r_r = await client.post(
+                f"/api/v1/projects/{pid}/runs?auto_start=false",
+                json={"modules": ["merge", "perf", "security"], "trigger_source": "web"},
+            )
+            assert r_r.status_code in (200, 201)
+            rid = r_r.json()["id"]
+
+            files = [("files", (p.name, p.read_bytes(), "application/json")) for p in sorted(fixtures_har_dir.glob("*.har"))]
+            assert (await client.post(f"/api/v1/runs/{rid}/hars", files=files)).status_code in (200, 201)
+            assert (await client.post(f"/api/v1/runs/{rid}/start")).status_code in (200, 202)
+
+            final_run: dict = {}
+            for _ in range(100):
+                final_run = (await client.get(f"/api/v1/runs/{rid}")).json()
+                if final_run["status"] in ("completed", "failed"):
+                    break
+                await asyncio.sleep(0.05)
+
+            assert final_run["status"] == "completed", final_run
+            job_statuses = {j["module"]: j["status"] for j in final_run["jobs"]}
+            assert job_statuses == {
+                "merge": "completed",
+                "perf": "completed",
+                "security": "completed",
+            }, f"Stuck/wrong job statuses after fast run: {job_statuses}"
+
     if db_mod._engine is not None:
         await db_mod._engine.dispose()

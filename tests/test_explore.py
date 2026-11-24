@@ -312,3 +312,114 @@ const STATIC_IMG = "/static/images/logo.png";
     assert "/system/menu/tree" in discovered_paths, f"Unquoted app.js missed: {discovered_paths}"
     assert "/workflow/order/approve" in discovered_paths, f"Webpack lazy chunk missed: {discovered_paths}"
 
+
+@pytest.mark.asyncio
+async def test_explore_merges_multiple_scans_by_root_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify #111: Pass 1 (seed_curl) + Pass 2 (target_url) on same root_domain merge into 1 domain inventory."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "explore_merge_test.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+
+    from reconqa.config import Settings
+    from reconqa.models import db as db_mod
+    from reconqa.modules.discovery import seed_explorer
+
+    monkeypatch.setattr(Settings, "resolve_bin", lambda self, name: None)
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+
+    # Stub run_discovery to emit subdomains on pass 2 deterministically
+    call_counter = {"n": 0}
+
+    def fake_run_discovery(target: str, out_dir: Path, **kwargs: Any) -> dict[str, Any]:
+        call_counter["n"] += 1
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if call_counter["n"] >= 2:
+            (out_dir / "subdomains.jsonl").write_text(
+                '{"host":"admin.shop.example.test"}\n{"host":"api.shop.example.test"}\n',
+                encoding="utf-8",
+            )
+            (out_dir / "urlfinder_urls.jsonl").write_text(
+                '{"url":"https://api.shop.example.test/api/v1/legacy/report"}\n',
+                encoding="utf-8",
+            )
+        return {"warnings": []}
+
+    monkeypatch.setattr(seed_explorer, "run_discovery", fake_run_discovery)
+
+    from reconqa.server.app import create_app
+
+    fastapi_app = create_app()
+    async with fastapi_app.router.lifespan_context(fastapi_app):
+        transport = httpx.ASGITransport(app=fastapi_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            # Pass 1: seed_curl on admin.shop.example.test
+            r1 = await client.post(
+                "/api/v1/explore",
+                json={
+                    "seed_curl": (
+                        "curl 'https://admin.shop.example.test/api/v1/orders/list' "
+                        "-H 'Accept: application/json'"
+                    ),
+                    "mode": "passive",
+                    "probe_openapi_docs": False,
+                    "crawl_js": False,
+                },
+            )
+            assert r1.status_code in (200, 201), r1.text
+            d1 = r1.json()
+            id1 = d1["explore_id"]
+            assert d1["summary"]["scans_count"] == 1
+
+            # Pass 2: target_url on api.shop.example.test (SAME registrable root_domain: example.test!)
+            r2 = await client.post(
+                "/api/v1/explore",
+                json={
+                    "seed_curl": (
+                        "curl 'https://api.shop.example.test/api/v1/payments/status' "
+                        "-H 'Accept: application/json'"
+                    ),
+                    "mode": "passive",
+                    "probe_openapi_docs": False,
+                    "crawl_js": False,
+                },
+            )
+            assert r2.status_code in (200, 201), r2.text
+            d2 = r2.json()
+            id2 = d2["explore_id"]
+
+            # Must merge into the SAME domain-keyed explore_id
+            assert id2 == id1, f"Expected same domain explore_id, got {id1} vs {id2}"
+            assert d2["summary"]["scans_count"] == 2
+            assert len(d2.get("scans", [])) == 2
+
+            merged_paths = {e["path"] for e in d2["discovered_endpoints"]}
+            assert "/api/v1/orders/list" in merged_paths
+            assert "/api/v1/payments/status" in merged_paths
+            assert "admin.shop.example.test" in d2.get("subdomains", [])
+            assert "api.shop.example.test" in d2.get("subdomains", [])
+
+            # GET /api/v1/explore returns ONLY 1 consolidated domain entry with scans_count == 2
+            r_list = await client.get("/api/v1/explore")
+            assert r_list.status_code == 200
+            items = r_list.json()
+            assert len(items) == 1, f"Expected 1 merged domain entry, got {items}"
+            assert items[0]["explore_id"] == id1
+            assert items[0]["scans_count"] == 2
+
+            # DELETE /api/v1/explore/{explore_id}: 200 first time, 404 second time
+            r_del = await client.delete(f"/api/v1/explore/{id1}")
+            assert r_del.status_code == 200, r_del.text
+            assert r_del.json().get("deleted") is True
+            assert (await client.get("/api/v1/explore")).json() == []
+
+            r_del2 = await client.delete(f"/api/v1/explore/{id1}")
+            assert r_del2.status_code == 404
+
+    if db_mod._engine is not None:
+        await db_mod._engine.dispose()
+

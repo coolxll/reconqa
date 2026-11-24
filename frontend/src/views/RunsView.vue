@@ -15,6 +15,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Search,
   SlidersHorizontal,
   Sparkles,
   Terminal,
@@ -31,9 +32,12 @@ import {
 } from '@/api/projects'
 import {
   createRun,
+  deleteRun,
+  getRunTitle,
   importRunText,
   listProjectRuns,
   reuseRunHars,
+  shortRunId,
   startRun,
   uploadRunHars,
 } from '@/api/runs'
@@ -78,6 +82,9 @@ const projects = ref<Project[]>([])
 const runs = ref<RunWithProject[]>([])
 const selectedProjectFilter = ref<string>('all')
 const statusFilter = ref<string>('all')
+const runSearch = ref('')
+const confirmDeleteRunId = ref<string | null>(null)
+const deletingRunId = ref<string | null>(null)
 
 // Minimal 2-Step New Analysis Drawer state (Core Ingest/Merge only; capabilities run on demand in RunDetail)
 const drawerOpen = ref(false)
@@ -101,6 +108,7 @@ const wizardTargets = ref<Target[]>([])
 const wizardProjectRuns = ref<Run[]>([])
 const loadingProjectContext = ref(false)
 const wizardTargetId = ref('')
+const customRunName = ref('')
 
 const submitting = ref(false)
 const submitStepLabel = ref('')
@@ -171,6 +179,7 @@ const autoMatchedProject = computed<Project | null>(() =>
 )
 
 const filteredRuns = computed(() => {
+  const q = runSearch.value.trim().toLowerCase()
   return runs.value.filter((r) => {
     if (selectedProjectFilter.value !== 'all' && r.project_id !== selectedProjectFilter.value) {
       return false
@@ -178,9 +187,38 @@ const filteredRuns = computed(() => {
     if (statusFilter.value !== 'all' && r.status !== statusFilter.value) {
       return false
     }
+    if (q) {
+      const title = getRunTitle(r, r.project_name).toLowerCase()
+      const projName = (r.project_name || projectMap.value.get(r.project_id)?.name || '').toLowerCase()
+      const targetUrl = String(r.config_snapshot?.target_url ?? '').toLowerCase()
+      const idLower = r.id.toLowerCase()
+      if (
+        !title.includes(q) &&
+        !projName.includes(q) &&
+        !targetUrl.includes(q) &&
+        !idLower.includes(q)
+      ) {
+        return false
+      }
+    }
     return true
   })
 })
+
+async function handleDeleteRun(runId: string) {
+  if (deletingRunId.value) return
+  deletingRunId.value = runId
+  errorMessage.value = ''
+  try {
+    await deleteRun(runId)
+    runs.value = runs.value.filter((r) => r.id !== runId)
+    confirmDeleteRunId.value = null
+  } catch (err) {
+    errorMessage.value = err instanceof Error ? err.message : t('runs.table.deleteError')
+  } finally {
+    deletingRunId.value = null
+  }
+}
 
 async function loadProjectsAndRuns() {
   loading.value = true
@@ -276,6 +314,7 @@ function openWizard() {
   submitStepLabel.value = ''
   projectMode.value = 'auto'
   inlineNewProjectName.value = ''
+  customRunName.value = ''
   if (selectedProjectFilter.value !== 'all') {
     wizardProjectId.value = selectedProjectFilter.value
   } else if (!wizardProjectId.value && projects.value.length > 0) {
@@ -446,12 +485,14 @@ async function handleLaunchRun() {
 
     // Fast Core Analysis only (merge -> OpenAPI + Correlation + Coverage).
     // API Automation, Performance & Security are triggered on demand inside RunDetailView!
+    const trimmedName = customRunName.value.trim()
     const payload = {
+      name: trimmedName || undefined,
       target_id: targetId,
       target_url: targetUrl,
       modules: ['merge'],
       trigger_source: 'web' as const,
-      config: {},
+      config: trimmedName ? { run_name: trimmedName } : {},
     }
 
     submitStepLabel.value = t('runs.wizard.statusCreatingPending')
@@ -494,6 +535,7 @@ async function handleLaunchRun() {
     pasteContent.value = ''
     reuseScenariosText.value = ''
     inlineNewProjectName.value = ''
+    customRunName.value = ''
     drawerOpen.value = false
     await router.push({ name: 'run-detail', params: { runId: created.id } })
   } catch (err) {
@@ -538,10 +580,6 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
-}
-
-function shortId(id: string): string {
-  return id.length > 10 ? id.slice(0, 10) : id
 }
 
 onMounted(async () => {
@@ -601,6 +639,17 @@ onMounted(async () => {
               {{ proj.name }}
             </option>
           </select>
+        </div>
+
+        <div class="relative min-w-[200px] flex-1 sm:max-w-xs">
+          <Search class="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-slate-400" />
+          <input
+            v-model="runSearch"
+            type="text"
+            data-testid="runs-search-input"
+            :placeholder="t('runs.filter.searchPlaceholder')"
+            class="w-full rounded-lg border border-slate-300 bg-white py-1.5 pl-8 pr-3 text-xs text-slate-800 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+          />
         </div>
 
         <div class="flex items-center gap-1 rounded-lg bg-slate-100 p-1">
@@ -704,14 +753,21 @@ onMounted(async () => {
               @click="router.push({ name: 'run-detail', params: { runId: run.id } })"
             >
               <td class="px-5 py-3.5">
-                <div class="font-mono text-xs font-semibold text-indigo-700" :title="run.id">
-                  {{ shortId(run.id) }}
-                </div>
                 <div
-                  v-if="run.config_snapshot?.target_url"
-                  class="mt-0.5 max-w-[180px] truncate text-[11px] text-slate-400"
+                  class="max-w-[260px] truncate text-sm font-semibold text-slate-900"
+                  :title="getRunTitle(run, run.project_name)"
                 >
-                  {{ run.config_snapshot.target_url }}
+                  {{ getRunTitle(run, run.project_name) }}
+                </div>
+                <div class="mt-0.5 flex items-center gap-1.5 font-mono text-[11px] text-slate-400">
+                  <span :title="run.id">{{ shortRunId(run.id) }}</span>
+                  <span
+                    v-if="run.config_snapshot?.target_url"
+                    class="max-w-[180px] truncate"
+                    :title="String(run.config_snapshot.target_url)"
+                  >
+                    · {{ run.config_snapshot.target_url }}
+                  </span>
                 </div>
               </td>
               <td v-if="selectedProjectFilter === 'all'" class="px-4 py-3.5 text-xs font-medium text-slate-700">
@@ -760,11 +816,50 @@ onMounted(async () => {
               <td class="px-4 py-3.5 text-xs text-slate-500">
                 {{ formatDateTime(run.started_at) }}
               </td>
-              <td class="px-5 py-3.5 text-right">
-                <span class="inline-flex items-center gap-1 text-xs font-medium text-indigo-600">
-                  {{ t('runs.table.open') }}
-                  <ArrowRight class="h-3.5 w-3.5" />
-                </span>
+              <td class="px-5 py-3.5 text-right" @click.stop>
+                <div class="inline-flex items-center justify-end gap-2">
+                  <template v-if="confirmDeleteRunId === run.id">
+                    <button
+                      type="button"
+                      data-testid="delete-run-confirm"
+                      :disabled="deletingRunId === run.id"
+                      class="rounded bg-rose-600 px-2 py-1 text-[11px] font-medium text-white hover:bg-rose-700 disabled:opacity-50"
+                      @click="handleDeleteRun(run.id)"
+                    >
+                      {{ t('runs.table.deleteConfirm') }}
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded bg-slate-100 px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-200"
+                      @click="confirmDeleteRunId = null"
+                    >
+                      {{ t('runs.table.deleteCancel') }}
+                    </button>
+                  </template>
+                  <template v-else>
+                    <router-link
+                      :to="{ name: 'run-detail', params: { runId: run.id } }"
+                      class="inline-flex items-center gap-1 text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                    >
+                      {{ t('runs.table.open') }}
+                      <ArrowRight class="h-3.5 w-3.5" />
+                    </router-link>
+                    <button
+                      type="button"
+                      data-testid="delete-run-btn"
+                      :disabled="run.status === 'running'"
+                      :title="
+                        run.status === 'running'
+                          ? t('runs.table.deleteDisabledRunning')
+                          : t('runs.table.deleteTitle')
+                      "
+                      class="rounded p-1.5 text-slate-400 transition hover:bg-rose-50 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-35"
+                      @click="confirmDeleteRunId = run.id"
+                    >
+                      <Trash2 class="h-3.5 w-3.5" />
+                    </button>
+                  </template>
+                </div>
               </td>
             </tr>
           </tbody>
@@ -1035,7 +1130,7 @@ onMounted(async () => {
                         class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-indigo-500 focus:outline-none"
                       >
                         <option v-for="r in wizardProjectRuns" :key="r.id" :value="r.id">
-                          {{ shortId(r.id) }} · {{ r.status }} · {{ formatDateTime(r.started_at) }}
+                          {{ getRunTitle(r) }} ({{ shortRunId(r.id) }}) · {{ r.status }} · {{ formatDateTime(r.started_at) }}
                         </option>
                       </select>
                     </div>
@@ -1213,9 +1308,21 @@ onMounted(async () => {
                   </div>
                 </div>
               </div>
+              <!-- Optional Custom Run Name -->
+              <div class="border-t border-slate-100 pt-3">
+                <label class="block text-xs font-medium text-slate-700">
+                  {{ t('runs.wizard.runNameLabel') }}
+                  <span class="font-normal text-slate-400">{{ t('runs.wizard.optional') }}</span>
+                </label>
+                <input
+                  v-model="customRunName"
+                  data-testid="wizard-run-name-input"
+                  type="text"
+                  :placeholder="t('runs.wizard.runNamePlaceholder')"
+                  class="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+                />
+              </div>
             </section>
-
-            <!-- Concise 1-line note explaining on-demand capability execution inside RunDetail -->
             <div
               data-testid="wizard-deferred-note"
               class="flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-600"

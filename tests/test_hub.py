@@ -171,3 +171,115 @@ def test_coverage_diff_identifies_uncovered_js_endpoints(
     diff_text = (hub_dir / "coverage_diff.json").read_text(encoding="utf-8")
     assert "/api/v1/coupons/claim" in diff_text
     assert "/api/v1/user/preferences" in diff_text
+
+
+def test_correlation_filters_preexisting_session_auth_token_but_keeps_real_login_and_ids(
+    tmp_path: Path,
+) -> None:
+    """Verify #121: pre-existing session accessToken echoed by /my-info is filtered & redacted,
+    while real newly-minted /login token and business IDs still correlate."""
+    har_dir = tmp_path / "har_auth_noise"
+    har_dir.mkdir(parents=True, exist_ok=True)
+    preexisting_tok = "preexisting_session_jwt_9988776655"
+    fresh_login_tok = "fresh_minted_login_token_1122334455"
+
+    def _entry(ts: str, method: str, url: str, headers: list[dict], resp_obj: dict) -> dict:
+        body = json.dumps(resp_obj)
+        return {
+            "startedDateTime": ts,
+            "time": 40.0,
+            "request": {
+                "method": method,
+                "url": url,
+                "httpVersion": "HTTP/1.1",
+                "headers": headers,
+                "queryString": [],
+                "cookies": [],
+            },
+            "response": {
+                "status": 200,
+                "statusText": "OK",
+                "httpVersion": "HTTP/1.1",
+                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                "cookies": [],
+                "content": {"size": len(body), "mimeType": "application/json", "text": body},
+            },
+            "timings": {"send": 1, "wait": 30, "receive": 9},
+        }
+
+    # Scenario 1: Pre-existing token already in Step 0 Authorization header, echoed by /system/p/my-info
+    har_preexisting = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                _entry(
+                    "2026-01-15T11:00:01.000Z",
+                    "GET",
+                    "https://shop.example.test/api/v1/home",
+                    [{"name": "Authorization", "value": f"Bearer {preexisting_tok}"}],
+                    {"code": 0, "data": {"banner": "welcome"}},
+                ),
+                _entry(
+                    "2026-01-15T11:00:02.000Z",
+                    "GET",
+                    "https://shop.example.test/system/p/my-info",
+                    [{"name": "Authorization", "value": f"Bearer {preexisting_tok}"}],
+                    {"code": 0, "data": {"accessToken": preexisting_tok, "userId": "USR-44556"}},
+                ),
+                _entry(
+                    "2026-01-15T11:00:03.000Z",
+                    "GET",
+                    "https://shop.example.test/api/v1/orders/list?userId=USR-44556",
+                    [{"name": "Authorization", "value": f"Bearer {preexisting_tok}"}],
+                    {"code": 0, "data": {"list": []}},
+                ),
+            ],
+        }
+    }
+    (har_dir / "01_preexisting.har").write_text(json.dumps(har_preexisting), encoding="utf-8")
+
+    # Scenario 2: Real fresh login issuing a brand-new token used afterwards
+    har_fresh = {
+        "log": {
+            "version": "1.2",
+            "entries": [
+                _entry(
+                    "2026-01-15T11:05:01.000Z",
+                    "POST",
+                    "https://shop.example.test/api/auth/login",
+                    [{"name": "Content-Type", "value": "application/json"}],
+                    {"code": 0, "data": {"accessToken": fresh_login_tok}},
+                ),
+                _entry(
+                    "2026-01-15T11:05:02.000Z",
+                    "GET",
+                    "https://shop.example.test/api/v1/profile/me",
+                    [{"name": "Authorization", "value": f"Bearer {fresh_login_tok}"}],
+                    {"code": 0, "data": {"name": "Alice"}},
+                ),
+            ],
+        }
+    }
+    (har_dir / "02_fresh_login.har").write_text(json.dumps(har_fresh), encoding="utf-8")
+
+    out_dir = tmp_path / "hub_auth_noise"
+    report = analyze_correlations(har_dir, out_dir)
+    corr_json = (out_dir / "correlation.json").read_text(encoding="utf-8")
+
+    # Pre-existing session token MUST NOT appear as a correlated variable AND raw token MUST NOT leak into filtered_constants
+    var_samples = {
+        v.get("producer", {}).get("sample")
+        for v in report.get("variables", [])
+        if isinstance(v, dict)
+    }
+    assert preexisting_tok not in var_samples, f"Pre-existing session token should be filtered: {report}"
+    assert preexisting_tok not in json.dumps(report.get("filtered_constants", [])), (
+        "Raw pre-existing session token must be REDACTED in filtered_constants!"
+    )
+    assert any("session-auth" in str(fc) or "accessToken" in str(fc) for fc in report.get("filtered_constants", []))
+
+    # Business userId AND fresh /api/auth/login token MUST still correlate
+    assert "USR-44556" in corr_json, f"Expected business userId USR-44556 to correlate: {report}"
+    assert fresh_login_tok in var_samples or "fresh_minted_login_token" in corr_json, (
+        f"Expected real newly-minted login token to correlate: {report}"
+    )

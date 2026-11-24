@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Compass,
   FileCode2,
+  GitMerge,
   Globe,
   History,
   KeyRound,
@@ -18,8 +19,10 @@ import {
   Search,
   Sparkles,
   Terminal,
+  Trash2,
 } from "lucide-vue-next";
 import {
+  deleteExplore,
   getExplore,
   listExplores,
   promoteExploreToRun,
@@ -58,6 +61,8 @@ const depth = ref(2);
 // Execution & history state
 const running = ref(false);
 const loadingHistory = ref(false);
+const deleting = ref(false);
+const confirmingDelete = ref(false);
 const promoting = ref(false);
 const error = ref<string | null>(null);
 const historyItems = ref<ExploreListItem[]>([]);
@@ -216,12 +221,19 @@ function formatShortTime(iso: string | undefined): string {
 function historyOptionLabel(item: ExploreListItem): string {
   const domain =
     item.seed?.root_domain ||
-    item.seed?.base_url ||
     item.root_domain ||
+    item.seed?.base_url ||
     item.base_url ||
     "target";
   const count = item.summary?.endpoints_count ?? item.endpoints_count ?? 0;
-  const timeStr = formatShortTime(item.created_at);
+  const scans = item.scans_count ?? item.summary?.scans_count;
+  if (typeof scans === "number" && scans > 0) {
+    if (scans === 1) {
+      return t("explore.historyOptionSingleScanFmt", { domain, count });
+    }
+    return t("explore.historyOptionScansFmt", { domain, count, scans });
+  }
+  const timeStr = formatShortTime(item.updated_at || item.created_at);
   if (timeStr) {
     return t("explore.historyOptionFmt", { domain, count, time: timeStr });
   }
@@ -232,6 +244,7 @@ function startNewExplore(): void {
   selectedHistoryId.value = "";
   result.value = null;
   error.value = null;
+  confirmingDelete.value = false;
   selectedEndpointIds.value = new Set();
   expandedEndpointIds.value = new Set();
 }
@@ -316,6 +329,7 @@ async function fetchHistoryAndProjects(): Promise<void> {
 }
 
 async function onSelectHistory(exploreId: string): Promise<void> {
+  confirmingDelete.value = false;
   if (!exploreId) {
     startNewExplore();
     return;
@@ -329,6 +343,36 @@ async function onSelectHistory(exploreId: string): Promise<void> {
     error.value = err instanceof Error ? err.message : t("explore.errorLoad");
   } finally {
     loadingHistory.value = false;
+  }
+}
+
+async function handleDeleteExplore(): Promise<void> {
+  const targetId = selectedHistoryId.value || result.value?.explore_id;
+  if (!targetId || deleting.value) return;
+  deleting.value = true;
+  error.value = null;
+  try {
+    await deleteExplore(targetId);
+    confirmingDelete.value = false;
+    const updatedList = await listExplores().catch(() =>
+      historyItems.value.filter((item) => item.explore_id !== targetId)
+    );
+    historyItems.value = updatedList;
+    if (updatedList.length > 0) {
+      const nextId = updatedList[0].explore_id;
+      try {
+        const full = await getExplore(nextId);
+        applyResult(full);
+      } catch {
+        startNewExplore();
+      }
+    } else {
+      startNewExplore();
+    }
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : t("explore.errorDelete");
+  } finally {
+    deleting.value = false;
   }
 }
 
@@ -453,6 +497,45 @@ onMounted(() => {
           <Plus class="h-3.5 w-3.5" />
           <span>{{ t("explore.newExploreBtn") }}</span>
         </button>
+
+        <template v-if="selectedHistoryId">
+          <div
+            v-if="confirmingDelete"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2 py-1 text-xs"
+          >
+            <span class="font-medium text-rose-800">{{ t("explore.deleteConfirmText") }}</span>
+            <button
+              type="button"
+              data-testid="explore-delete-confirm"
+              class="rounded bg-rose-600 px-2 py-0.5 font-medium text-white hover:bg-rose-700 disabled:opacity-50"
+              :disabled="deleting"
+              @click="handleDeleteExplore"
+            >
+              {{ deleting ? t("explore.deletingBtn") : t("explore.deleteConfirmBtn") }}
+            </button>
+            <button
+              type="button"
+              class="rounded bg-white px-2 py-0.5 font-medium text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50"
+              :disabled="deleting"
+              @click="confirmingDelete = false"
+            >
+              {{ t("explore.deleteCancelBtn") }}
+            </button>
+          </div>
+          <button
+            v-else
+            type="button"
+            data-testid="explore-delete-btn"
+            class="btn-danger py-1 text-xs"
+            :title="t('explore.deleteTitle')"
+            :disabled="loadingHistory || deleting"
+            @click="confirmingDelete = true"
+          >
+            <Trash2 class="h-3.5 w-3.5" />
+            <span>{{ t("explore.deleteBtn") }}</span>
+          </button>
+        </template>
+
         <button
           type="button"
           class="btn-secondary py-1 text-xs"
@@ -522,6 +605,15 @@ onMounted(() => {
       </div>
 
       <div class="space-y-4 p-5">
+        <!-- Auto-Merge by Root Domain Hint -->
+        <div
+          data-testid="explore-merge-hint"
+          class="inline-flex items-center gap-1.5 rounded-lg border border-indigo-100 bg-indigo-50/50 px-3 py-1.5 text-[11px] font-medium text-indigo-800"
+        >
+          <GitMerge class="h-3.5 w-3.5 shrink-0 text-indigo-600" />
+          <span>{{ t("explore.mergeHintBadge") }}</span>
+        </div>
+
         <!-- Tab 1: Seed cURL -->
         <div v-if="inputMode === 'curl'" class="space-y-3">
           <p class="text-xs text-slate-500">{{ t("explore.curlHint") }}</p>
@@ -704,38 +796,76 @@ onMounted(() => {
     <!-- Results Workbench -->
     <template v-else-if="result">
       <!-- Seed Summary Strip -->
-      <div class="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-5 py-3 text-xs shadow-sm">
-        <div class="flex flex-wrap items-center gap-3">
-          <span class="rounded-md bg-indigo-50 px-2 py-0.5 font-mono font-semibold text-indigo-700">
-            {{ result.explore_id.slice(0, 12) }}
-          </span>
-          <span v-if="result.seed.base_url" class="font-mono text-slate-800">
-            {{ result.seed.base_url }}
-          </span>
-          <span v-if="result.seed.api_prefix" class="text-slate-500">
-            {{ t("explore.seedBannerPrefix") }}:
-            <code class="ml-1 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-slate-700">
-              {{ result.seed.api_prefix }}
-            </code>
-          </span>
-          <span
-            v-for="hdr in result.seed.auth_headers_detected || []"
-            :key="hdr"
-            class="rounded-full bg-emerald-50 px-2 py-0.5 font-mono text-[11px] font-medium text-emerald-700 ring-1 ring-emerald-600/20"
-          >
-            {{ hdr }}
-          </span>
+      <div class="space-y-2.5 rounded-xl border border-slate-200 bg-white px-5 py-3 text-xs shadow-sm">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="flex flex-wrap items-center gap-3">
+            <span class="rounded-md bg-indigo-50 px-2 py-0.5 font-mono font-semibold text-indigo-700">
+              {{ result.seed.root_domain || result.explore_id.slice(0, 12) }}
+            </span>
+            <span v-if="result.seed.base_url" class="font-mono text-slate-800">
+              {{ result.seed.base_url }}
+            </span>
+            <span v-if="result.seed.api_prefix" class="text-slate-500">
+              {{ t("explore.seedBannerPrefix") }}:
+              <code class="ml-1 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-slate-700">
+                {{ result.seed.api_prefix }}
+              </code>
+            </span>
+            <span
+              v-for="hdr in result.seed.auth_headers_detected || []"
+              :key="hdr"
+              class="rounded-full bg-emerald-50 px-2 py-0.5 font-mono text-[11px] font-medium text-emerald-700 ring-1 ring-emerald-600/20"
+            >
+              {{ hdr }}
+            </span>
+          </div>
+
+          <div v-if="(result.openapi_docs_found || []).length > 0" class="flex flex-wrap items-center gap-1.5">
+            <span class="text-slate-500">{{ t("explore.seedBannerOpenApi") }}:</span>
+            <span
+              v-for="doc in result.openapi_docs_found"
+              :key="doc.url"
+              class="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 font-mono text-[11px] text-emerald-800 ring-1 ring-emerald-200"
+            >
+              <FileCode2 class="h-3 w-3" />
+              <span>{{ doc.title || doc.url }} ({{ doc.endpoints_count }})</span>
+            </span>
+          </div>
         </div>
 
-        <div v-if="(result.openapi_docs_found || []).length > 0" class="flex flex-wrap items-center gap-1.5">
-          <span class="text-slate-500">{{ t("explore.seedBannerOpenApi") }}:</span>
+        <!-- Accumulated Scans Strip (when multiple scans merged into this domain inventory) -->
+        <div
+          v-if="result.scans && result.scans.length > 1"
+          data-testid="explore-scans-strip"
+          class="flex flex-wrap items-center gap-2 border-t border-slate-100 pt-2.5"
+        >
+          <span class="inline-flex items-center gap-1 text-[11px] font-medium text-slate-500">
+            <GitMerge class="h-3 w-3 text-indigo-500" />
+            <span>{{ t("explore.scansHistoryTitle", { count: result.scans.length }) }}:</span>
+          </span>
           <span
-            v-for="doc in result.openapi_docs_found"
-            :key="doc.url"
-            class="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 font-mono text-[11px] text-emerald-800 ring-1 ring-emerald-200"
+            v-for="scan in result.scans"
+            :key="scan.scan_id"
+            class="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] text-slate-700"
           >
-            <FileCode2 class="h-3 w-3" />
-            <span>{{ doc.title || doc.url }} ({{ doc.endpoints_count }})</span>
+            <span class="font-medium text-slate-900">
+              {{ scan.seed_type === "curl" ? t("explore.scanTypeCurl") : t("explore.scanTypeUrl") }}
+            </span>
+            <span v-if="scan.new_endpoints > 0" class="font-mono text-indigo-700">
+              {{ t("explore.scanDeltaEndpoints", { n: scan.new_endpoints }) }}
+            </span>
+            <span v-if="scan.new_subdomains > 0" class="font-mono text-emerald-700">
+              {{ t("explore.scanDeltaSubdomains", { n: scan.new_subdomains }) }}
+            </span>
+            <span
+              v-if="scan.new_endpoints === 0 && scan.new_subdomains === 0"
+              class="text-slate-400"
+            >
+              {{ t("explore.scanNoDelta") }}
+            </span>
+            <span v-if="scan.scanned_at" class="font-mono text-[10px] text-slate-400">
+              · {{ formatShortTime(scan.scanned_at) }}
+            </span>
           </span>
         </div>
       </div>

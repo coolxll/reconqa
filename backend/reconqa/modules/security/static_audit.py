@@ -8,6 +8,7 @@ written to reports or logs.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -47,7 +48,10 @@ HARDCODED_SECRET_RE = re.compile(
 PROVIDER_TOKEN_RE = re.compile(
     r"\b(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{16,})\b"
 )
-PEM_KEY_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+PEM_KEY_RE = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"
+    r"(?:\s|\\r|\\n)+[A-Za-z0-9+/=]{32,}"
+)
 STACK_SQL_RE = re.compile(
     r"(Exception in thread|NullPointerException|SQLException|SQL syntax|"
     r"ORA-\d{5}|Traceback \(most recent call last\)|"
@@ -57,11 +61,47 @@ STACK_SQL_RE = re.compile(
 
 EMAIL_FALSE_POSITIVE_DOMAINS = (
     "example.com",
-    "w3.org",
-    "schema.org",
+    "example.org",
+    "github.com",
+    "users.noreply.github.com",
+    "npmjs.com",
     "npmjs.org",
+    "w3.org",
+    "apache.org",
+    "schema.org",
     "webpack.js",
 )
+
+_VENDOR_JS_TOKENS = (
+    "elementui",
+    "element-ui",
+    "element-plus",
+    "chunk-libs",
+    "chunk-vendors",
+    "vendor",
+    "echarts",
+    "lodash",
+    "tinymce",
+    "moment",
+    "xlsx",
+    "quill",
+    "pdf",
+    "monaco",
+)
+
+_OSS_LICENSE_KEYWORDS = (
+    "copyright",
+    "license",
+    "@author",
+    "author:",
+    "mit ",
+    "contributors",
+)
+
+
+def _is_vendor_js_name(name_or_path: str) -> bool:
+    low = Path(name_or_path).name.lower()
+    return any(tok in low for tok in _VENDOR_JS_TOKENS)
 
 
 def _iter_har_files(har_dir: Path) -> list[Path]:
@@ -125,64 +165,147 @@ def _mask_ip(ip: str) -> str:
     return "***REDACTED***"
 
 
+def _sanitize_context_window(snippet: str) -> str:
+    """Mask any adjacent secrets/PII inside a before/after context slice and collapse whitespace."""
+    s = re.sub(r"\s+", " ", snippet)
+    s = PEM_KEY_RE.sub("-----BEGIN ***REDACTED*** PRIVATE KEY-----", s)
+    s = JWT_RE.sub(lambda m: f"eyJ***...***{m.group(3)[-4:]}", s)
+    s = PROVIDER_TOKEN_RE.sub(lambda m: _mask_secret(m.group(1)), s)
+    s = HARDCODED_SECRET_RE.sub(
+        lambda m: m.group(0).replace(m.group(2), _mask_secret(m.group(2))),
+        s,
+    )
+    s = CN_MOBILE_RE.sub(lambda m: f"{m.group(1)}****{m.group(2)}", s)
+    s = EMAIL_RE.sub(lambda m: _mask_email(m.group(1), m.group(2).lower()), s)
+    s = PRIVATE_IP_RE.sub(lambda m: _mask_ip(m.group(1)), s)
+    return s
+
+
+def _build_redacted_context(
+    text: str,
+    start: int,
+    end: int,
+    masked_match: str,
+    window: int = 45,
+) -> str:
+    """Build a compact redacted surrounding context snippet (~45 chars before/after).
+
+    Sanitizes a wider margin (+120 chars) before trimming so adjacent key/value
+    secrets that straddle the 45-char boundary are still fully redacted.
+    """
+    margin = window + 120
+    wide_before_start = max(0, start - margin)
+    wide_after_end = min(len(text), end + margin)
+
+    sanitized_before = _sanitize_context_window(text[wide_before_start:start])
+    sanitized_after = _sanitize_context_window(text[end:wide_after_end])
+
+    before = sanitized_before[-window:] if len(sanitized_before) > window else sanitized_before
+    after = sanitized_after[:window] if len(sanitized_after) > window else sanitized_after
+
+    prefix = "..." if (wide_before_start > 0 or len(sanitized_before) > window) else ""
+    suffix = "..." if (wide_after_end < len(text) or len(sanitized_after) > window) else ""
+    return f"{prefix}{before}{masked_match}{after}{suffix}".strip()
+
+
 def _scan_text_for_leaks(
     text: str,
     source_label: str,
     leaks: dict[str, list[dict[str, str]]],
     seen_keys: set[tuple[str, str, str]],
+    *,
+    is_js: bool = False,
+    is_vendor_js: bool = False,
+    observed_target_hosts: set[str] | None = None,
 ) -> None:
     if not text:
         return
 
-    def _add(kind: str, sample: str, severity: str) -> None:
+    def _add(kind: str, sample: str, severity: str, context: str = "") -> None:
         key = (kind, source_label, sample)
         if key in seen_keys:
             return
         seen_keys.add(key)
         leaks[kind].append(
-            {"source": source_label, "sample": sample, "severity": severity}
+            {
+                "source": source_label,
+                "sample": sample,
+                "severity": severity,
+                "context": context,
+            }
         )
 
-    for m in CN_MOBILE_RE.finditer(text):
-        _add("cn_mobile", f"{m.group(1)}****{m.group(2)}", "medium")
-        break
+    if not is_vendor_js:
+        for m in CN_MOBILE_RE.finditer(text):
+            masked = f"{m.group(1)}****{m.group(2)}"
+            ctx = _build_redacted_context(text, m.start(), m.end(), masked)
+            _add("cn_mobile", masked, "medium", ctx)
+            break
 
-    for m in EMAIL_RE.finditer(text):
-        local, domain = m.group(1), m.group(2).lower()
-        if any(domain.endswith(fp) for fp in EMAIL_FALSE_POSITIVE_DOMAINS):
-            continue
-        if domain.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")):
-            continue
-        _add("email", _mask_email(local, domain), "low")
-        break
+        for m in EMAIL_RE.finditer(text):
+            local, domain = m.group(1), m.group(2).lower()
+            if any(
+                domain == fp or domain.endswith("." + fp)
+                for fp in EMAIL_FALSE_POSITIVE_DOMAINS
+            ):
+                continue
+            if domain.endswith((".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".css", ".js")):
+                continue
+            if is_js:
+                ctx_check = text[max(0, m.start() - 120) : min(len(text), m.end() + 120)].lower()
+                if any(kw in ctx_check for kw in _OSS_LICENSE_KEYWORDS):
+                    continue
+            masked = _mask_email(local, domain)
+            ctx = _build_redacted_context(text, m.start(), m.end(), masked)
+            _add("email", masked, "low", ctx)
+            break
 
     for m in PRIVATE_IP_RE.finditer(text):
-        _add("private_ip", _mask_ip(m.group(1)), "low")
+        masked = _mask_ip(m.group(1))
+        ctx = _build_redacted_context(text, m.start(), m.end(), masked)
+        _add("private_ip", masked, "low", ctx)
         break
 
     for m in TEST_STAGING_URL_RE.finditer(text):
-        _add("test_staging_url", m.group(0)[:80], "low")
+        matched_url = m.group(0)
+        matched_host = (urlparse(matched_url).hostname or "").lower()
+        if observed_target_hosts and matched_host in observed_target_hosts:
+            continue
+        sample = matched_url[:80]
+        ctx = _build_redacted_context(text, m.start(), m.end(), sample)
+        _add("test_staging_url", sample, "low", ctx)
         break
 
     for m in HARDCODED_SECRET_RE.finditer(text):
         key_name, val = m.group(1), m.group(2)
         if val.lower() in {"placeholder", "changeme", "undefined", "null", "false", "true"}:
             continue
-        _add("hardcoded_secret", f"{key_name}={_mask_secret(val)}", "high")
+        masked_val = _mask_secret(val)
+        ctx = _build_redacted_context(text, m.start(2), m.end(2), masked_val)
+        _add("hardcoded_secret", f"{key_name}={masked_val}", "high", ctx)
 
     for m in PROVIDER_TOKEN_RE.finditer(text):
-        _add("hardcoded_secret", _mask_secret(m.group(1)), "high")
+        masked = _mask_secret(m.group(1))
+        ctx = _build_redacted_context(text, m.start(), m.end(), masked)
+        _add("hardcoded_secret", masked, "high", ctx)
 
-    if PEM_KEY_RE.search(text):
-        _add("hardcoded_secret", "-----BEGIN ***REDACTED*** PRIVATE KEY-----", "critical")
+    pem_match = PEM_KEY_RE.search(text)
+    if pem_match:
+        masked_pem = "-----BEGIN ***REDACTED*** PRIVATE KEY-----"
+        ctx = _build_redacted_context(text, pem_match.start(), pem_match.end(), masked_pem)
+        _add("hardcoded_secret", masked_pem, "critical", ctx)
 
     for m in JWT_RE.finditer(text):
         token_tail = m.group(3)[-4:]
-        _add("jwt_token", f"eyJ***...***{token_tail}", "high")
+        masked = f"eyJ***...***{token_tail}"
+        ctx = _build_redacted_context(text, m.start(), m.end(), masked)
+        _add("jwt_token", masked, "high", ctx)
         break
 
     for m in STACK_SQL_RE.finditer(text):
-        _add("stack_trace_sql_error", m.group(0)[:80], "medium")
+        sample = m.group(0)[:80]
+        ctx = _build_redacted_context(text, m.start(), m.end(), sample)
+        _add("stack_trace_sql_error", sample, "medium", ctx)
         break
 
 
@@ -207,12 +330,22 @@ def run_static_audit(
 
     total_entries = 0
     scanned_js_files = 0
+    observed_target_hosts: set[str] = set()
 
+    parsed_hars: list[dict[str, Any]] = []
     for hp in har_files:
         try:
             har_data = json.loads(hp.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             continue
+        parsed_hars.append(har_data)
+        for entry in har_data.get("log", {}).get("entries", []):
+            url = str((entry.get("request") or {}).get("url") or "")
+            host = (urlparse(url).hostname or "").lower()
+            if host and _domain_matches(host, target_domain):
+                observed_target_hosts.add(host)
+
+    for har_data in parsed_hars:
         for entry in har_data.get("log", {}).get("entries", []):
             req = entry.get("request") or {}
             resp = entry.get("response") or {}
@@ -336,9 +469,14 @@ def run_static_audit(
                             )
 
             # Sensitive leak scan on textual/API/JS responses
-            is_text_like = any(
-                k in mime for k in ("json", "javascript", "ecmascript", "html", "xml", "text")
-            ) or path.lower().endswith(".js")
+            is_js_resp = (
+                "javascript" in mime
+                or "ecmascript" in mime
+                or path.lower().endswith((".js", ".mjs", ".cjs"))
+            )
+            is_text_like = is_js_resp or any(
+                k in mime for k in ("json", "html", "xml", "text")
+            )
             if is_text_like:
                 body_text = _decode_har_content(content)
                 if body_text:
@@ -347,24 +485,40 @@ def run_static_audit(
                         f"{host}{path[:80]}",
                         leaks,
                         seen_leak_keys,
+                        is_js=is_js_resp,
+                        is_vendor_js=is_js_resp and _is_vendor_js_name(path),
+                        observed_target_hosts=observed_target_hosts,
                     )
 
-    # Scan standalone JS bundle directory (explicit or auto-detected under har_dir/js_bundles)
+    # Scan standalone JS bundle directory (deduplicated by content SHA-256 across scenarios)
     effective_js_dir = js_dir
     if effective_js_dir is None and har_dir.is_dir() and (har_dir / "js_bundles").is_dir():
         effective_js_dir = har_dir / "js_bundles"
 
     if effective_js_dir and effective_js_dir.is_dir():
+        seen_js_hashes: set[str] = set()
         for js_file in sorted(effective_js_dir.rglob("*.js")):
             if not js_file.is_file():
                 continue
-            scanned_js_files += 1
             try:
-                js_text = js_file.read_text(encoding="utf-8", errors="replace")
+                raw_bytes = js_file.read_bytes()
             except Exception:
                 continue
-            rel = str(js_file.relative_to(effective_js_dir))
-            _scan_text_for_leaks(js_text, f"js:{rel}", leaks, seen_leak_keys)
+            digest = hashlib.sha256(raw_bytes).hexdigest()
+            if digest in seen_js_hashes:
+                continue
+            seen_js_hashes.add(digest)
+            scanned_js_files += 1
+            js_text = raw_bytes.decode("utf-8", errors="replace")
+            _scan_text_for_leaks(
+                js_text,
+                f"js:{js_file.name}",
+                leaks,
+                seen_leak_keys,
+                is_js=True,
+                is_vendor_js=_is_vendor_js_name(js_file.name),
+                observed_target_hosts=observed_target_hosts,
+            )
 
     # Normalize host_headers coverage and assemble normalized findings
     host_headers_out: dict[str, dict[str, Any]] = {}
@@ -442,6 +596,7 @@ def run_static_audit(
                         "leak_type": kind,
                         "source": item["source"],
                         "redacted_sample": item["sample"],
+                        "context": item.get("context", ""),
                     },
                 }
             )

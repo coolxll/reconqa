@@ -186,6 +186,8 @@ async def create_run(
     modules = list(body.modules or DEFAULT_MODULES)
     config_snapshot: dict[str, Any] = dict(body.config or {})
     config_snapshot["modules"] = modules
+    if body.name and body.name.strip():
+        config_snapshot["run_name"] = body.name.strip()
     if body.target_url:
         config_snapshot["target_url"] = body.target_url
 
@@ -279,6 +281,15 @@ async def upload_run_hars(
     har_paths = sorted(har_dir.glob("*.har"))
     await _sync_run_target_url_from_hars(db, run, har_paths, target_domain)
     har_files = [p.name for p in har_paths]
+
+    cfg = dict(run.config_snapshot or {})
+    if not str(cfg.get("run_name") or "").strip() and har_paths:
+        first_stem = scenario if (scenario and len(har_paths) == 1) else har_paths[0].stem
+        suffix = f" (+{len(har_paths) - 1})" if len(har_paths) > 1 else ""
+        cfg["run_name"] = f"HAR · {first_stem}{suffix}"
+        run.config_snapshot = cfg
+        await db.commit()
+
     return {
         "run_id": run_id,
         "import_result": import_res,
@@ -318,8 +329,27 @@ async def import_run_text(
 
     await _upsert_har_artifacts(db, run)
     imported_har = Path(result["har_path"]) if result.get("har_path") else None
-    har_candidates = [imported_har] if imported_har and imported_har.is_file() else sorted(har_dir.glob("*.har"))
+    har_candidates = (
+        [imported_har] if imported_har and imported_har.is_file() else sorted(har_dir.glob("*.har"))
+    )
     await _sync_run_target_url_from_hars(db, run, har_candidates, body.target_domain)
+
+    cfg = dict(run.config_snapshot or {})
+    if not str(cfg.get("run_name") or "").strip():
+        fmt_map = {
+            "curl": "cURL",
+            "fetch": "fetch",
+            "raw_http": "Raw HTTP",
+            "har_json": "HAR",
+        }
+        fmt_label = fmt_map.get(str(result.get("detected_format") or "").lower(), "Traffic")
+        origin = _detect_primary_origin(har_candidates)
+        host = (urlparse(origin).hostname or "") if origin else ""
+        label_target = host or str(result.get("scenario") or body.scenario or "capture")
+        cfg["run_name"] = f"{fmt_label} · {label_target}"
+        run.config_snapshot = cfg
+        await db.commit()
+
     return result
 
 
@@ -372,6 +402,13 @@ async def reuse_run_hars(
             shutil.copytree(src_js_dir, dst_js_dir, dirs_exist_ok=True)
 
     await _upsert_har_artifacts(db, target_run)
+    cfg = dict(target_run.config_snapshot or {})
+    if not str(cfg.get("run_name") or "").strip() and reused:
+        first_stem = Path(reused[0]).stem
+        suffix = f" (+{len(reused) - 1})" if len(reused) > 1 else ""
+        cfg["run_name"] = f"HAR · {first_stem}{suffix}"
+        target_run.config_snapshot = cfg
+        await db.commit()
     total_hars = len(list(dst_har_dir.glob("*.har")))
     return {
         "run_id": run_id,
@@ -454,6 +491,28 @@ async def execute_run_modules(
 @router.get("/runs/{run_id}", response_model=RunOut)
 async def get_run(run_id: str, db: AsyncSession = Depends(get_db)) -> Run:
     return await _get_run_with_jobs(db, run_id)
+
+
+@router.delete("/runs/{run_id}")
+async def delete_run(run_id: str, db: AsyncSession = Depends(get_db)) -> dict[str, object]:
+    """Delete a run (cascading jobs/findings/artifacts) and clean up its workspace directory."""
+    run = await db.get(Run, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+    if run.status == "running":
+        raise HTTPException(status_code=409, detail="Cannot delete a run that is currently running")
+
+    ws_str = run.workspace_dir or ""
+    await db.delete(run)
+    await db.commit()
+
+    if ws_str:
+        runs_root = (settings.data_dir.resolve() / "runs").resolve()
+        ws_path = Path(ws_str).resolve()
+        if runs_root in ws_path.parents and ws_path.is_dir():
+            shutil.rmtree(ws_path, ignore_errors=True)
+
+    return {"deleted": True, "id": run_id}
 
 
 def _format_sse(event_name: str, data: dict[str, Any]) -> str:

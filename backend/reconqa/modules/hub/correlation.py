@@ -115,6 +115,21 @@ _IGNORED_CORRELATION_HEADERS = {
 
 _HIGH_FREQ_THRESHOLD = 0.60
 
+_AUTH_HEADER_NAMES = {
+    "authorization",
+    "cookie",
+    "token",
+    "x-token",
+    "x-auth-token",
+    "x-access-token",
+    "access-token",
+}
+
+_AUTH_PRODUCER_PATH_RE = re.compile(
+    r"(login|signin|sign-in|oauth|token|authenticate|session|sso)",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class _ProducerRecord:
@@ -335,6 +350,40 @@ def _sanitize_step_headers(headers: dict[str, str]) -> dict[str, str]:
     return clean
 
 
+def _collect_auth_header_usage(
+    entries: list[HarEntry],
+) -> tuple[dict[str, int], dict[str, set[int]]]:
+    """Track earliest request step and total request coverage for auth header tokens."""
+    earliest_step: dict[str, int] = {}
+    steps_by_val: dict[str, set[int]] = defaultdict(set)
+
+    for entry in entries:
+        for h_name, raw_val in entry.request_headers.items():
+            lower = h_name.lower()
+            if lower not in _AUTH_HEADER_NAMES:
+                continue
+            candidates: list[str] = []
+            cleaned = raw_val.strip()
+            if lower == "authorization" and cleaned.lower().startswith("bearer "):
+                candidates.append(cleaned[7:].strip())
+            elif lower == "cookie":
+                for part in cleaned.split(";"):
+                    if "=" in part:
+                        _, c_val = part.split("=", 1)
+                        candidates.append(c_val.strip())
+            candidates.append(cleaned)
+
+            for raw_cand in candidates:
+                val = _normalize_candidate_value(raw_cand)
+                if val is None:
+                    continue
+                if val not in earliest_step or entry.index < earliest_step[val]:
+                    earliest_step[val] = entry.index
+                steps_by_val[val].add(entry.index)
+
+    return earliest_step, steps_by_val
+
+
 def _find_high_frequency_constants(entries: list[HarEntry]) -> list[str]:
     """Identify high-frequency static constants appearing in >60% of JSON responses."""
     json_entries = [e for e in entries if e.response_json is not None]
@@ -456,6 +505,8 @@ def analyze_correlations(
 
     filtered_constants = _find_high_frequency_constants(entries)
     filtered_set = set(filtered_constants)
+    earliest_auth_step, auth_steps_by_val = _collect_auth_header_usage(entries)
+    total_requests = max(1, len(entries))
 
     # Chronological producer index: value -> first _ProducerRecord
     producers_by_val: dict[str, _ProducerRecord] = {}
@@ -529,6 +580,27 @@ def analyze_correlations(
     for val in matched_vals:
         prod = producers_by_val[val]
         consumers = matches_by_val[val]
+
+        # Filter pre-existing session auth tokens echoed by profile/info endpoints
+        all_auth_consumers = all(
+            c.location == "header" and c.param.lower() in _AUTH_HEADER_NAMES
+            for c in consumers
+        )
+        if all_auth_consumers:
+            first_auth_step = earliest_auth_step.get(val)
+            is_preexisting = first_auth_step is not None and first_auth_step <= prod.step
+            auth_ratio = len(auth_steps_by_val.get(val, set())) / total_requests
+            is_non_auth_session_wide = (
+                not _AUTH_PRODUCER_PATH_RE.search(prod.path) and auth_ratio >= 0.50
+            )
+            if is_preexisting or is_non_auth_session_wide:
+                key_label = _to_var_identifier(prod.key_name) or "token"
+                reason = "pre-existing" if is_preexisting else "session-wide"
+                redacted_label = f"session-auth:{key_label} ({reason})"
+                if redacted_label not in filtered_constants:
+                    filtered_constants.append(redacted_label)
+                continue
+
         var_name = _choose_var_name(prod, consumers, used_var_names)
         confidence = _compute_confidence(prod, consumers)
 
