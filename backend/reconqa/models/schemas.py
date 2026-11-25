@@ -98,11 +98,67 @@ class TargetOut(BaseModel):
     scope_rules: dict[str, Any]
 
 
+AuthType = Literal["headers", "bearer", "cookie", "basic", "login_api", "form_login"]
+ExploreAuthType = Literal[
+    "none", "profile", "headers", "bearer", "cookie", "basic", "login_api", "form_login"
+]
+
+
+class ExploreAuthConfig(BaseModel):
+    auth_type: ExploreAuthType = "none"
+    credential_id: str | None = None
+    token: str | None = None
+    token_header: str = "Authorization"
+    token_prefix: str = "Bearer "
+    cookie: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    username: str | None = None
+    password: str | None = None
+    login_url: str | None = None
+    login_method: str = "POST"
+    login_content_type: Literal["json", "form"] = "json"
+    username_field: str = "username"
+    password_field: str = "password"
+    extra_fields: dict[str, Any] = Field(default_factory=dict)
+    token_jsonpath: str | None = None
+    username_selector: str | None = None
+    password_selector: str | None = None
+    submit_selector: str | None = None
+    verify_url: str | None = None
+    scope_domains: list[str] = Field(default_factory=list)
+    save_as_profile: bool = False
+    profile_name: str | None = None
+    role_tag: str = "account_a"
+
+
+class ExploreVerifyAuthRequest(BaseModel):
+    project_id: str | None = None
+    credential_id: str | None = None
+    auth: ExploreAuthConfig | None = None
+    verify_url: str | None = None
+    target_url: str | None = None
+
+
+class ExploreVerifyAuthResponse(BaseModel):
+    valid: bool
+    verdict: Literal["valid", "denied", "error"]
+    auth_mode: str = "none"
+    header_names: list[str] = Field(default_factory=list)
+    status_code: int = 0
+    biz_code: int | str | None = None
+    redirected_to: str | None = None
+    duration_ms: float = 0.0
+    message: str = ""
+    warnings: list[str] = Field(default_factory=list)
+
+
 class AuthProfileCreate(BaseModel):
     name: str
     role_tag: str = Field(default="account_a", min_length=1, max_length=48)
+    auth_type: AuthType = "headers"
     storage_state_path: str | None = None
     extra_headers_ref: dict[str, str] = Field(default_factory=dict)
+    login_config: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("role_tag", mode="before")
     @classmethod
@@ -124,6 +180,59 @@ def _mask_header_ref_value(raw_val: str) -> str:
     return f"{val[:4]}•••{val[-4:]}"
 
 
+_SENSITIVE_LOGIN_CONFIG_KEYWORDS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "cookie",
+    "api_key",
+    "api-key",
+    "apikey",
+    "authorization",
+)
+_NON_SECRET_LOGIN_CONFIG_KEYS = frozenset(
+    {
+        "token_header",
+        "token_prefix",
+        "token_jsonpath",
+        "password_field",
+        "password_selector",
+    }
+)
+
+
+def _mask_login_config_recursive(obj: Any, *, mask_all_leaves: bool = False) -> Any:
+    if isinstance(obj, dict):
+        masked: dict[str, Any] = {}
+        for k, v in obj.items():
+            key_str = str(k)
+            key_low = key_str.lower()
+            if key_low == "extra_fields":
+                masked[key_str] = _mask_login_config_recursive(v, mask_all_leaves=True)
+                continue
+            is_sensitive = mask_all_leaves or (
+                key_low not in _NON_SECRET_LOGIN_CONFIG_KEYS
+                and any(kw in key_low for kw in _SENSITIVE_LOGIN_CONFIG_KEYWORDS)
+            )
+            if is_sensitive and not isinstance(v, (dict, list)):
+                masked[key_str] = _mask_header_ref_value("" if v is None else str(v))
+            else:
+                masked[key_str] = _mask_login_config_recursive(
+                    v, mask_all_leaves=mask_all_leaves
+                )
+        return masked
+    if isinstance(obj, list):
+        return [
+            _mask_header_ref_value("" if item is None else str(item))
+            if (mask_all_leaves and not isinstance(item, (dict, list)))
+            else _mask_login_config_recursive(item, mask_all_leaves=mask_all_leaves)
+            for item in obj
+        ]
+    return obj
+
+
 class AuthProfileOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -131,13 +240,40 @@ class AuthProfileOut(BaseModel):
     project_id: str
     name: str
     role_tag: str
+    auth_type: str = "headers"
     storage_state_path: str | None
     extra_headers_ref: dict[str, str]
+    login_config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("auth_type", mode="before")
+    @classmethod
+    def _coerce_auth_type(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        return text or "headers"
+
+    @field_validator("login_config", mode="before")
+    @classmethod
+    def _coerce_login_config(cls, value: Any) -> dict[str, Any]:
+        return dict(value) if isinstance(value, dict) else {}
 
     @field_validator("extra_headers_ref", mode="after")
     @classmethod
     def _mask_extra_headers(cls, value: dict[str, str]) -> dict[str, str]:
         return {str(k): _mask_header_ref_value(str(v)) for k, v in (value or {}).items()}
+
+    @field_validator("login_config", mode="after")
+    @classmethod
+    def _mask_login_config(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _mask_login_config_recursive(value or {})
+
+
+class AuthProfileTestLoginResponse(BaseModel):
+    ok: bool
+    auth_type: str
+    header_names: list[str] = Field(default_factory=list)
+    status_code: int | None = None
+    message: str = ""
+    profile: AuthProfileOut
 
 
 KnowledgeDocType = Literal[

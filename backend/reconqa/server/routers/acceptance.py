@@ -1066,11 +1066,29 @@ async def generate_acceptance_prompt(
         if targets
         else ("- （暂无已配置目标，请先在项目设置或 Explore 阶段补充）" if lang == "zh" else "- (No targets configured yet)")
     )
+    def _format_cred_line(c: AuthProfile) -> str:
+        auth_type = str(getattr(c, "auth_type", None) or "headers").strip()
+        hdr_names = ", ".join(sorted((c.extra_headers_ref or {}).keys())) or "none"
+        has_state = "yes" if c.storage_state_path else "no"
+        meta_parts = [
+            f"id: `{c.id}`",
+            f"role: `{c.role_tag}`",
+            f"auth_type: `{auth_type}`",
+            f"headers: `{hdr_names}`",
+            f"storage_state: `{has_state}`",
+        ]
+        login_cfg = getattr(c, "login_config", None)
+        if isinstance(login_cfg, dict) and auth_type in {"login_api", "form_login", "basic"}:
+            login_url = str(login_cfg.get("login_url") or "").strip()
+            username = str(login_cfg.get("username") or "").strip()
+            if login_url:
+                meta_parts.append(f"login_url: `{login_url}`")
+            if username:
+                meta_parts.append(f"username: `{username}`")
+        return f"- **{c.name}** ({', '.join(meta_parts)})"
+
     cred_lines = (
-        "\n".join(
-            f"- **{c.name}** (id: `{c.id}`, role: `{c.role_tag}`, headers: `{', '.join(sorted((c.extra_headers_ref or {}).keys())) or 'storage_state'}`)"
-            for c in credentials
-        )
+        "\n".join(_format_cred_line(c) for c in credentials)
         if credentials
         else (
             "- （暂无已保存凭据 — 可在录制后调用 `reconqa_extract_credential` 从 HAR 自动提取）"
@@ -1172,6 +1190,11 @@ async def generate_acceptance_prompt(
    `record_har_path="<portal>_<module>.har"`（按门户 + 业务模块拆分多个小 `.har` 文件，例如 `admin_orders.har`、`portal_users.har`，**切勿把所有页面录成一个超大 HAR**）。
 2. 系统化漫游未覆盖菜单、列表筛选、分页、详情页与核心只读业务流，确保捕获真实 API 请求与响应结构；遇到登录、验证码或二次认证时立即暂停并请人工协助。
 
+### 鉴权态 Playwright 探索指引（Authenticated Playwright Exploration）
+1. 先调用 `reconqa_list_auth_profiles(project_id="{project.id}")` 盘点项目已保存的脱敏凭据元数据（`auth_type`、`header_names`、`has_storage_state`、`login_url`、`username`，绝不输出明文密码/Token）。
+2. 若目标门户已有关联的 `storage_state`，启动 Playwright 上下文时直接加载该 `storage_state`；若需使用非明文环境引用 Header 或遭遇登录墙/密码/OTP/验证码，请立即暂停并请求人工协助登录，**绝不绕过验证码或 MFA**。
+3. 后续静态/接口探索与在线验证请直接复用已保存的 `credential_id` 调用 `reconqa_explore_from_seed(project_id="{project.id}", credential_id="<credential_id>", ...)` 和 `reconqa_replay_endpoint(project_id="{project.id}", credential_id="<credential_id>", ...)`。
+
 ### 步骤 3：自动上传合并并回报覆盖率增量
 1. 调用 `reconqa_upload_har_files(project_id="{project.id}", har_paths=["<portal>_<module>.har", ...], wait=True)` 批量上传录制好的 `.har` 文件并触发快速 `merge` 合并分析。
 2. 如捕获到新的有效会话，可调用 `reconqa_extract_credential(project_id="{project.id}")` 自动更新脱敏鉴权凭据（绝不回显明文）。
@@ -1214,6 +1237,11 @@ You are running a focused **Playwright HAR Exploration & Auto-Upload Loop** for 
 ### Step 2: Drive External Playwright for Modular `.har` Recording
 1. Across the selected portals above, launch Playwright contexts with `record_har_path="<portal>_<module>.har"` to record clean, modular per-portal/per-module `.har` files (e.g. `admin_orders.har`, `portal_users.har` — **avoid recording one giant monolithic HAR**).
 2. Roam uncovered navigation menus, filters, pagination, and read-only detail flows to capture authentic request/response payloads; pause and ask the human immediately on login, CAPTCHA, or MFA gates.
+
+### Authenticated Playwright Exploration
+1. Call `reconqa_list_auth_profiles(project_id="{project.id}")` first to inspect saved credential metadata (`auth_type`, `header_names`, `has_storage_state`, `login_url`, `username` — zero raw secrets).
+2. If a profile has an attached `storage_state`, load it into the Playwright context; inject only non-sensitive header references, and if you encounter a login wall, password prompt, OTP, or CAPTCHA, pause immediately and ask the human operator (never bypass CAPTCHA/MFA).
+3. Reuse the saved `credential_id` across subsequent authenticated discovery and verification calls via `reconqa_explore_from_seed(project_id="{project.id}", credential_id="<credential_id>", ...)` and `reconqa_replay_endpoint(project_id="{project.id}", credential_id="<credential_id>", ...)`.
 
 ### Step 3: Upload, Analyze & Report Coverage Delta
 1. Call `reconqa_upload_har_files(project_id="{project.id}", har_paths=["<portal>_<module>.har", ...], wait=True)` to upload the recorded `.har` files and trigger fast `merge` hub analysis.

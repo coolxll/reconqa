@@ -10,15 +10,43 @@ from typing import Any
 from urllib.parse import urlparse
 
 from reconqa.config import settings
+from reconqa.modules.discovery.auth_resolver import _host_in_scope, redact_secrets
 from reconqa.modules.discovery.spa_parser import extract_spa_routes
 from reconqa.utils.io import ensure_dir, write_json, write_jsonl
 from reconqa.utils.proc import run_cmd_sync
 
 _PROXY_CRED_RE = re.compile(r"((?:https?|socks5h?)://)([^/\s@]+)@", re.IGNORECASE)
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "host",
+        "content-length",
+        "connection",
+        "transfer-encoding",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "upgrade",
+    }
+)
 
 
 def _redact_proxy_creds(text: str) -> str:
     return _PROXY_CRED_RE.sub(r"\1***@", text)
+
+
+def _sanitize_headers_for_cli(extra_headers: dict[str, str] | None) -> list[tuple[str, str]]:
+    cleaned: list[tuple[str, str]] = []
+    for k, v in (extra_headers or {}).items():
+        name = str(k or "").strip()
+        val = str(v or "").strip()
+        if not name or not val or name.startswith(":"):
+            continue
+        if name.lower() in _HOP_BY_HOP_HEADERS:
+            continue
+        cleaned.append((name, val))
+    return cleaned
 
 
 def _resolve_pd_proxies() -> tuple[str | None, str | None, str | None]:
@@ -83,6 +111,25 @@ def _parse_jsonl_output(stdout: str, fallback_key: str) -> list[dict[str, Any]]:
     return records
 
 
+def _strip_katana_sensitive_fields(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip raw HTTP request dumps and auth headers from katana JSONL records before saving to disk."""
+    sanitized: list[dict[str, Any]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        clean = dict(rec)
+        clean.pop("raw", None)
+        clean.pop("headers", None)
+        req = clean.get("request")
+        if isinstance(req, dict):
+            clean_req = dict(req)
+            clean_req.pop("raw", None)
+            clean_req.pop("headers", None)
+            clean["request"] = clean_req
+        sanitized.append(clean)
+    return sanitized
+
+
 def run_discovery(
     target: str,
     out_dir: Path,
@@ -92,6 +139,9 @@ def run_discovery(
     crawl_time: str = "5m",
     concurrency: int = 10,
     timeout: int | None = None,
+    extra_headers: dict[str, str] | None = None,
+    allowed_root_domain: str = "",
+    scope_domains: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run passive/active discovery using ProjectDiscovery CLIs + SPA route extraction.
 
@@ -101,6 +151,13 @@ def run_discovery(
     domain, target_url = _normalize_target(target)
     eff_timeout = timeout if timeout is not None else settings.default_cmd_timeout
     normalized_mode = (mode or "passive").lower().strip()
+    cli_headers = _sanitize_headers_for_cli(extra_headers)
+    header_secrets = [v for _, v in cli_headers]
+    eff_allowed_root = (allowed_root_domain or domain).strip().lower()
+
+    def _clean_stderr(raw_err: str) -> str:
+        redacted = redact_secrets(_redact_proxy_creds(raw_err.strip()), header_secrets)
+        return redacted[:200]
 
     warnings: list[str] = []
     tools_used: dict[str, str] = {}
@@ -232,15 +289,24 @@ def run_discovery(
             ]
             if any_proxy:
                 kat_cmd.extend(["-proxy", any_proxy])
+            target_in_scope = _host_in_scope(
+                domain, eff_allowed_root, scope_domains=scope_domains
+            )
+            if cli_headers and target_in_scope:
+                kat_cmd.append("-or")
+                for h_name, h_val in cli_headers:
+                    kat_cmd.extend(["-H", f"{h_name}: {h_val}"])
             res = run_cmd_sync(kat_cmd, timeout=eff_timeout)
             if res.timed_out:
                 warnings.append(f"katana timed out after {eff_timeout}s")
             elif res.returncode != 0 and not res.stdout.strip():
                 warnings.append(
                     f"katana exited with code {res.returncode}: "
-                    f"{_redact_proxy_creds(res.stderr.strip()[:200])}"
+                    f"{_clean_stderr(res.stderr)}"
                 )
             records = _parse_jsonl_output(res.stdout, "endpoint")
+            if cli_headers:
+                records = _strip_katana_sensitive_fields(records)
             out_path = write_jsonl(out_dir / "katana_urls.jsonl", records)
             artifacts["katana_urls"] = str(out_path)
             counts["katana_urls"] = len(records)
@@ -256,7 +322,7 @@ def run_discovery(
         if httpx_bin:
             tools_used["httpx"] = httpx_bin
             probe_targets = sorted(discovered_hosts | {target_url})[:300]
-            hx_cmd = [
+            base_hx_cmd = [
                 httpx_bin,
                 "-silent",
                 "-json",
@@ -270,22 +336,59 @@ def run_discovery(
                 str(concurrency),
             ]
             if short_timeout:
-                hx_cmd.extend(["-timeout", "5"])
+                base_hx_cmd.extend(["-timeout", "5"])
             if any_proxy:
-                hx_cmd.extend(["-http-proxy", any_proxy])
-            res = run_cmd_sync(
-                hx_cmd,
-                timeout=eff_timeout,
-                input_text="\n".join(probe_targets) + "\n",
-            )
-            if res.timed_out:
-                warnings.append(f"httpx timed out after {eff_timeout}s")
-            elif res.returncode != 0 and not res.stdout.strip():
-                warnings.append(
-                    f"httpx exited with code {res.returncode}: "
-                    f"{_redact_proxy_creds(res.stderr.strip()[:200])}"
+                base_hx_cmd.extend(["-http-proxy", any_proxy])
+
+            def _target_host_of(raw_t: str) -> str:
+                return (
+                    (urlparse(raw_t).hostname or raw_t).lower()
+                    if "://" in raw_t
+                    else raw_t.split("/", 1)[0].split(":", 1)[0].lower()
                 )
-            records = _parse_jsonl_output(res.stdout, "url")
+
+            if cli_headers:
+                in_scope_targets = [
+                    t
+                    for t in probe_targets
+                    if _host_in_scope(_target_host_of(t), eff_allowed_root, scope_domains=scope_domains)
+                ]
+                out_scope_targets = [
+                    t
+                    for t in probe_targets
+                    if not _host_in_scope(
+                        _target_host_of(t), eff_allowed_root, scope_domains=scope_domains
+                    )
+                ]
+            else:
+                in_scope_targets = []
+                out_scope_targets = probe_targets
+
+            records: list[dict[str, Any]] = []
+            batches: list[tuple[list[str], bool]] = []
+            if in_scope_targets:
+                batches.append((in_scope_targets, True))
+            if out_scope_targets:
+                batches.append((out_scope_targets, False))
+
+            for batch_targets, attach_auth in batches:
+                hx_cmd = list(base_hx_cmd)
+                if attach_auth:
+                    for h_name, h_val in cli_headers:
+                        hx_cmd.extend(["-H", f"{h_name}: {h_val}"])
+                res = run_cmd_sync(
+                    hx_cmd,
+                    timeout=eff_timeout,
+                    input_text="\n".join(batch_targets) + "\n",
+                )
+                if res.timed_out:
+                    warnings.append(f"httpx timed out after {eff_timeout}s")
+                elif res.returncode != 0 and not res.stdout.strip():
+                    warnings.append(
+                        f"httpx exited with code {res.returncode}: "
+                        f"{_clean_stderr(res.stderr)}"
+                    )
+                records.extend(_parse_jsonl_output(res.stdout, "url"))
             out_path = write_jsonl(out_dir / "live_hosts.jsonl", records)
             artifacts["live_hosts"] = str(out_path)
             counts["live_hosts"] = len(records)
@@ -302,6 +405,7 @@ def run_discovery(
     counts["spa_routes"] = spa_result["total_routes"]
     counts["micro_frontends"] = len(spa_result["micro_frontends"])
 
+    redacted_warnings = [redact_secrets(_redact_proxy_creds(w), header_secrets) for w in warnings]
     summary: dict[str, Any] = {
         "target": target,
         "domain": domain,
@@ -309,7 +413,7 @@ def run_discovery(
         "mode": normalized_mode,
         "out_dir": str(out_dir),
         "tools_used": tools_used,
-        "warnings": warnings,
+        "warnings": redacted_warnings,
         "counts": counts,
         "artifacts": artifacts,
         "spa_routes": spa_result,

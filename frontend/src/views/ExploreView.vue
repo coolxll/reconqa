@@ -9,8 +9,11 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ClipboardPaste,
   Clock,
   Compass,
+  Eye,
+  EyeOff,
   FileCode2,
   GitMerge,
   Globe,
@@ -21,6 +24,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  ShieldCheck,
   Sparkles,
   Terminal,
   Trash2,
@@ -34,14 +38,24 @@ import {
   listExplores,
   promoteExploreToRun,
   startExploreJob,
+  verifyExploreAuth,
   type DiscoveredEndpoint,
+  type ExploreAuthConfig,
+  type ExploreAuthType,
   type ExploreJob,
   type ExploreListItem,
   type ExploreMode,
   type ExploreResult,
+  type ExploreVerifyAuthResponse,
 } from "@/api/explore";
-import { discoverProjectPortals, listProjects, listTargets } from "@/api/projects";
-import type { DiscoveredPortal, Project, Target } from "@/api/types";
+import {
+  discoverProjectPortals,
+  listAuthProfiles,
+  listProjects,
+  listTargets,
+} from "@/api/projects";
+import type { AuthProfile, DiscoveredPortal, Project, Target } from "@/api/types";
+import { parseAuthPaste } from "@/utils/authPasteParser";
 import { useWorkspace } from "@/stores/workspace";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import MetricCard from "@/components/layout/MetricCard.vue";
@@ -60,7 +74,7 @@ const AUTH_HEADER_PATTERN = /^(authorization|cookie|x-auth-token|x-api-key|x-tok
 const route = useRoute();
 const router = useRouter();
 const { t } = useI18n();
-const { activeProjectId, ensureLoaded, setActiveProject } = useWorkspace();
+const { activeProjectId, ensureLoaded, setActiveProject, workspacePath } = useWorkspace();
 
 const projectId = computed(
   () =>
@@ -137,6 +151,421 @@ const discoveredPortals = ref<DiscoveredPortal[] | null>(null);
 const discoveredRootDomain = ref("");
 const portalNotice = ref<string | null>(null);
 const harPromptOpen = ref(false);
+
+// Explore Auth Credentials state
+const AUTH_MODE_GROUPS: ReadonlyArray<{
+  groupKey: string;
+  modes: ReadonlyArray<ExploreAuthType>;
+}> = [
+  { groupKey: "groupBase", modes: ["none", "profile"] },
+  { groupKey: "groupStatic", modes: ["bearer", "cookie", "headers"] },
+  { groupKey: "groupDynamic", modes: ["basic", "login_api", "form_login"] },
+];
+const ROLE_TAG_SUGGESTIONS = ["account_a", "account_b", "admin", "doctor", "pharmacy", "guest"] as const;
+
+const projectAuthProfiles = ref<AuthProfile[]>([]);
+const authPanelOpen = ref(true);
+const authMode = ref<ExploreAuthType>("none");
+const selectedAuthProfileId = ref("");
+const bearerHeader = ref("Authorization");
+const bearerPrefix = ref("Bearer ");
+const bearerToken = ref("");
+const showBearerToken = ref(false);
+const cookieValue = ref("");
+const showCookie = ref(false);
+const basicUsername = ref("");
+const basicPassword = ref("");
+const showBasicPassword = ref(false);
+const loginApiUrl = ref("");
+const loginApiMethod = ref<"POST" | "PUT" | "PATCH">("POST");
+const loginApiContentType = ref<"json" | "form">("json");
+const loginApiUsernameField = ref("username");
+const loginApiPasswordField = ref("password");
+const loginApiUsername = ref("");
+const loginApiPassword = ref("");
+const showLoginApiPassword = ref(false);
+const loginApiTokenJsonpath = ref("");
+const loginApiTokenHeader = ref("Authorization");
+const loginApiTokenPrefix = ref("Bearer ");
+const loginApiExtraFields = ref<Record<string, unknown> | undefined>(undefined);
+const formLoginUrl = ref("");
+const formLoginUsername = ref("");
+const formLoginPassword = ref("");
+const showFormLoginPassword = ref(false);
+const showFormSelectors = ref(false);
+const formUsernameSelector = ref("");
+const formPasswordSelector = ref("");
+const formSubmitSelector = ref("");
+const customHeaderRows = ref<Array<{ key: string; value: string }>>([{ key: "", value: "" }]);
+const showCustomHeaderValues = ref(false);
+const saveAsProfile = ref(false);
+const saveProfileName = ref("");
+const saveProfileRoleTag = ref("account_a");
+const authSuccessNotice = ref<string | null>(null);
+let lastNotifiedSavedProfileId = "";
+
+// Burp-style Smart Paste state
+const smartPasteOpen = ref(false);
+const smartPasteText = ref("");
+const smartPasteNotice = ref<string | null>(null);
+const smartPasteError = ref<string | null>(null);
+
+// Burp-style Pre-flight Session Validity Check state
+const verifyUrl = ref("");
+const verifyingAuth = ref(false);
+const verifyResult = ref<ExploreVerifyAuthResponse | null>(null);
+const verifyError = ref<string | null>(null);
+let verifySeq = 0;
+
+function resetInlineAuthState(): void {
+  verifySeq += 1;
+  authMode.value = "none";
+  selectedAuthProfileId.value = "";
+  bearerHeader.value = "Authorization";
+  bearerPrefix.value = "Bearer ";
+  bearerToken.value = "";
+  showBearerToken.value = false;
+  cookieValue.value = "";
+  showCookie.value = false;
+  basicUsername.value = "";
+  basicPassword.value = "";
+  showBasicPassword.value = false;
+  loginApiUrl.value = "";
+  loginApiMethod.value = "POST";
+  loginApiContentType.value = "json";
+  loginApiUsernameField.value = "username";
+  loginApiPasswordField.value = "password";
+  loginApiUsername.value = "";
+  loginApiPassword.value = "";
+  showLoginApiPassword.value = false;
+  loginApiTokenJsonpath.value = "";
+  loginApiTokenHeader.value = "Authorization";
+  loginApiTokenPrefix.value = "Bearer ";
+  loginApiExtraFields.value = undefined;
+  formLoginUrl.value = "";
+  formLoginUsername.value = "";
+  formLoginPassword.value = "";
+  showFormLoginPassword.value = false;
+  showFormSelectors.value = false;
+  formUsernameSelector.value = "";
+  formPasswordSelector.value = "";
+  formSubmitSelector.value = "";
+  customHeaderRows.value = [{ key: "", value: "" }];
+  showCustomHeaderValues.value = false;
+  saveAsProfile.value = false;
+  saveProfileName.value = "";
+  saveProfileRoleTag.value = "account_a";
+  authSuccessNotice.value = null;
+  smartPasteOpen.value = false;
+  smartPasteText.value = "";
+  smartPasteNotice.value = null;
+  smartPasteError.value = null;
+  verifyUrl.value = "";
+  verifyingAuth.value = false;
+  verifyResult.value = null;
+  verifyError.value = null;
+}
+
+watch(authMode, () => {
+  verifySeq += 1;
+  verifyingAuth.value = false;
+  verifyResult.value = null;
+  verifyError.value = null;
+});
+
+const activeAuthSummary = computed<string>(() => {
+  if (authMode.value === "none") return "";
+  if (authMode.value === "profile") {
+    const prof = projectAuthProfiles.value.find((p) => p.id === selectedAuthProfileId.value);
+    return prof ? `${prof.name} (${prof.role_tag})` : t("explore.auth.mode.profile");
+  }
+  return t(`explore.auth.mode.${authMode.value}`);
+});
+
+const resultAuthBadgeText = computed<string>(() => {
+  const seed = result.value?.seed;
+  if (!seed) return "";
+  const mode = (seed.auth_mode || "").trim();
+  const headers = seed.auth_headers_detected || [];
+  if (mode === "profile" && seed.auth_profile_name) {
+    return `profile · ${seed.auth_profile_name}`;
+  }
+  if (mode && mode !== "none") {
+    return headers.length > 0 ? `${mode} (${headers.join(", ")})` : mode;
+  }
+  if (headers.length > 0) {
+    return headers.join(", ");
+  }
+  return "";
+});
+
+function buildExploreAuthPayload(options?: { forVerify?: boolean }): {
+  credential_id?: string | null;
+  auth?: ExploreAuthConfig | null;
+  error?: string;
+} {
+  const mode = authMode.value;
+  if (mode === "none") {
+    return {};
+  }
+
+  if (mode === "profile") {
+    if (!selectedAuthProfileId.value) {
+      return { error: t("explore.auth.errMissingProfile") };
+    }
+    return {
+      credential_id: selectedAuthProfileId.value,
+      auth: {
+        auth_type: "profile",
+        credential_id: selectedAuthProfileId.value,
+        verify_url: verifyUrl.value.trim() || undefined,
+      },
+    };
+  }
+
+  const saveFields = options?.forVerify
+    ? { save_as_profile: false }
+    : projectId.value && saveAsProfile.value
+      ? {
+          save_as_profile: true,
+          profile_name: saveProfileName.value.trim() || undefined,
+          role_tag: saveProfileRoleTag.value.trim() || "account_a",
+        }
+      : {};
+  const commonVerify = verifyUrl.value.trim() ? { verify_url: verifyUrl.value.trim() } : {};
+
+  if (mode === "bearer") {
+    const token = bearerToken.value.trim();
+    if (!token) return { error: t("explore.auth.errMissingToken") };
+    return {
+      auth: {
+        auth_type: "bearer",
+        token,
+        token_header: bearerHeader.value.trim() || "Authorization",
+        token_prefix: bearerPrefix.value,
+        ...commonVerify,
+        ...saveFields,
+      },
+    };
+  }
+
+  if (mode === "cookie") {
+    const cookie = cookieValue.value.trim();
+    if (!cookie) return { error: t("explore.auth.errMissingCookie") };
+    return {
+      auth: {
+        auth_type: "cookie",
+        cookie,
+        ...commonVerify,
+        ...saveFields,
+      },
+    };
+  }
+
+  if (mode === "basic") {
+    const username = basicUsername.value.trim();
+    const password = basicPassword.value;
+    if (!username || !password) return { error: t("explore.auth.errMissingBasic") };
+    return {
+      auth: {
+        auth_type: "basic",
+        username,
+        password,
+        ...commonVerify,
+        ...saveFields,
+      },
+    };
+  }
+
+  if (mode === "login_api") {
+    const url = loginApiUrl.value.trim();
+    const username = loginApiUsername.value.trim();
+    const password = loginApiPassword.value;
+    if (!url || !username || !password) return { error: t("explore.auth.errMissingLoginApi") };
+    return {
+      auth: {
+        auth_type: "login_api",
+        login_url: url,
+        login_method: loginApiMethod.value,
+        login_content_type: loginApiContentType.value,
+        username_field: loginApiUsernameField.value.trim() || "username",
+        password_field: loginApiPasswordField.value.trim() || "password",
+        username,
+        password,
+        extra_fields: loginApiExtraFields.value,
+        token_jsonpath: loginApiTokenJsonpath.value.trim() || null,
+        token_header: loginApiTokenHeader.value.trim() || "Authorization",
+        token_prefix: loginApiTokenPrefix.value,
+        ...commonVerify,
+        ...saveFields,
+      },
+    };
+  }
+
+  if (mode === "form_login") {
+    const url = formLoginUrl.value.trim();
+    const username = formLoginUsername.value.trim();
+    const password = formLoginPassword.value;
+    if (!url || !username || !password) return { error: t("explore.auth.errMissingFormLogin") };
+    return {
+      auth: {
+        auth_type: "form_login",
+        login_url: url,
+        username,
+        password,
+        username_selector: formUsernameSelector.value.trim() || null,
+        password_selector: formPasswordSelector.value.trim() || null,
+        submit_selector: formSubmitSelector.value.trim() || null,
+        ...commonVerify,
+        ...saveFields,
+      },
+    };
+  }
+
+  // headers
+  const headers: Record<string, string> = {};
+  for (const row of customHeaderRows.value) {
+    const k = row.key.trim();
+    const v = row.value.trim();
+    if (k && v) headers[k] = v;
+  }
+  if (Object.keys(headers).length === 0) {
+    return { error: t("explore.auth.errMissingHeaders") };
+  }
+  return {
+    auth: {
+      auth_type: "headers",
+      headers,
+      ...commonVerify,
+      ...saveFields,
+    },
+  };
+}
+
+function normalizeLoginMethod(method: string | undefined): "POST" | "PUT" | "PATCH" {
+  const upper = (method || "POST").toUpperCase();
+  if (upper === "PUT" || upper === "PATCH") return upper;
+  return "POST";
+}
+
+function handleSmartPasteParse(): void {
+  smartPasteError.value = null;
+  smartPasteNotice.value = null;
+  const parsed = parseAuthPaste(smartPasteText.value);
+  if (!parsed.ok) {
+    smartPasteError.value =
+      parsed.errorKey === "empty"
+        ? t("explore.auth.smartPasteErrEmpty")
+        : t("explore.auth.smartPasteErrNone");
+    return;
+  }
+
+  authPanelOpen.value = true;
+  authMode.value = parsed.mode;
+  verifyResult.value = null;
+  verifyError.value = null;
+
+  if (parsed.mode === "login_api") {
+    loginApiUrl.value = parsed.loginUrl ?? "";
+    loginApiMethod.value = normalizeLoginMethod(parsed.loginMethod);
+    loginApiContentType.value = parsed.loginContentType ?? "json";
+    loginApiUsernameField.value = parsed.usernameField ?? "username";
+    loginApiPasswordField.value = parsed.passwordField ?? "password";
+    loginApiUsername.value = parsed.username ?? "";
+    loginApiPassword.value = parsed.password ?? "";
+    loginApiExtraFields.value = parsed.extraFields;
+    smartPasteNotice.value = t("explore.auth.smartPasteExtractedLogin", {
+      method: loginApiMethod.value,
+      url: parsed.loginUrl || "",
+    });
+  } else {
+    loginApiExtraFields.value = undefined;
+    loginApiMethod.value = "POST";
+    if (parsed.mode === "basic") {
+      basicUsername.value = parsed.username ?? "";
+      basicPassword.value = parsed.password ?? "";
+      smartPasteNotice.value = t("explore.auth.smartPasteExtractedBasic", {
+        user: parsed.username ?? "",
+      });
+    } else if (parsed.mode === "bearer") {
+      bearerHeader.value = parsed.tokenHeader || "Authorization";
+      bearerPrefix.value = parsed.tokenPrefix ?? "Bearer ";
+      bearerToken.value = parsed.token ?? "";
+      smartPasteNotice.value = t("explore.auth.smartPasteExtractedBearer", {
+        header: bearerHeader.value,
+      });
+    } else if (parsed.mode === "cookie") {
+      cookieValue.value = parsed.cookie ?? "";
+      smartPasteNotice.value = t("explore.auth.smartPasteExtractedCookie");
+    } else if (parsed.mode === "headers" && parsed.headers) {
+      customHeaderRows.value = Object.entries(parsed.headers).map(([key, value]) => ({
+        key,
+        value,
+      }));
+      smartPasteNotice.value = t("explore.auth.smartPasteExtractedHeaders", {
+        count: parsed.headerNames.length,
+        headers: parsed.headerNames.join(", "),
+      });
+    }
+  }
+
+  if (parsed.mode !== "login_api" && parsed.detectedUrl && !verifyUrl.value.trim()) {
+    verifyUrl.value = parsed.detectedUrl;
+  }
+  smartPasteText.value = "";
+  smartPasteOpen.value = false;
+}
+
+async function handleVerifyAuth(): Promise<void> {
+  if (verifyingAuth.value || authMode.value === "none") return;
+  verifyError.value = null;
+  verifyResult.value = null;
+
+  const built = buildExploreAuthPayload({ forVerify: true });
+  if (built.error) {
+    verifyError.value = built.error;
+    return;
+  }
+
+  let fallbackTarget = "";
+  if (inputMode.value === "curl" && parsedSeedPreview.value.baseUrl) {
+    fallbackTarget = parsedSeedPreview.value.baseUrl;
+  } else if (inputMode.value === "url") {
+    const firstLine = targetUrl.value
+      .split(/[\r\n,]+/)
+      .map((s) => s.trim())
+      .find(Boolean);
+    if (firstLine) fallbackTarget = firstLine;
+  }
+  if (!fallbackTarget && projectTargets.value.length > 0) {
+    const firstSelected = projectTargets.value.find((tItem) =>
+      selectedPortalIds.value.has(tItem.id)
+    );
+    fallbackTarget = (firstSelected ?? projectTargets.value[0]).base_url;
+  }
+
+  const mySeq = ++verifySeq;
+  const pidSnapshot = projectId.value || null;
+  verifyingAuth.value = true;
+  try {
+    const res = await verifyExploreAuth({
+      verify_url: verifyUrl.value.trim() || null,
+      target_url: fallbackTarget || null,
+      project_id: pidSnapshot,
+      credential_id: built.credential_id ?? null,
+      auth: built.auth ?? null,
+    });
+    if (mySeq !== verifySeq || (projectId.value || null) !== pidSnapshot) return;
+    verifyResult.value = res;
+  } catch (err) {
+    if (mySeq !== verifySeq || (projectId.value || null) !== pidSnapshot) return;
+    verifyError.value = err instanceof Error ? err.message : t("explore.auth.verifyErrReq");
+  } finally {
+    if (mySeq === verifySeq && (projectId.value || null) === pidSnapshot) {
+      verifyingAuth.value = false;
+    }
+  }
+}
 
 // Result explorer state
 const activeResultTab = ref<"endpoints" | "spa" | "assets" | "warnings">("endpoints");
@@ -404,6 +833,33 @@ function applyResult(res: ExploreResult): void {
     discoveredPortals.value = res.discovered_portals;
     discoveredRootDomain.value = res.seed?.root_domain || "";
   }
+  if (res.saved_auth_profile) {
+    const saved = res.saved_auth_profile;
+    const exists = projectAuthProfiles.value.some((p) => p.id === saved.id);
+    projectAuthProfiles.value = exists
+      ? projectAuthProfiles.value.map((p) => (p.id === saved.id ? saved : p))
+      : [...projectAuthProfiles.value, saved];
+    if (projectId.value) {
+      void listAuthProfiles(projectId.value)
+        .then((fresh) => {
+          projectAuthProfiles.value = fresh;
+        })
+        .catch(() => {
+          // keep optimistic update
+        });
+    }
+    if (lastNotifiedSavedProfileId !== saved.id) {
+      lastNotifiedSavedProfileId = saved.id;
+      const toastMsg = t("explore.auth.savedProfileToast", {
+        name: saved.name,
+        role: saved.role_tag,
+      });
+      authSuccessNotice.value = toastMsg;
+      window.setTimeout(() => {
+        if (authSuccessNotice.value === toastMsg) authSuccessNotice.value = null;
+      }, 6000);
+    }
+  }
 }
 
 async function handleDiscoverSiblingPortals(): Promise<void> {
@@ -485,10 +941,11 @@ async function fetchHistoryAndProjects(resetSelection = false): Promise<void> {
     confirmingDelete.value = false;
   }
   const pid = projectId.value || null;
-  const [histRes, projRes, targetsRes] = await Promise.allSettled([
+  const [histRes, projRes, targetsRes, profilesRes] = await Promise.allSettled([
     listExplores(pid),
     listProjects(),
     pid ? listTargets(pid) : Promise.resolve([] as Target[]),
+    pid ? listAuthProfiles(pid) : Promise.resolve([] as AuthProfile[]),
   ]);
   if ((projectId.value || null) !== pid) return;
   if (histRes.status === "fulfilled") {
@@ -516,6 +973,18 @@ async function fetchHistoryAndProjects(resetSelection = false): Promise<void> {
   } else {
     projectTargets.value = [];
     selectedPortalIds.value = new Set();
+  }
+  if (profilesRes.status === "fulfilled") {
+    projectAuthProfiles.value = profilesRes.value;
+    if (
+      selectedAuthProfileId.value &&
+      !profilesRes.value.some((p) => p.id === selectedAuthProfileId.value)
+    ) {
+      selectedAuthProfileId.value = "";
+    }
+  } else {
+    projectAuthProfiles.value = [];
+    selectedAuthProfileId.value = "";
   }
   loadingHistory.value = false;
 }
@@ -627,6 +1096,12 @@ async function finalizeCompletedJob(job: ExploreJob, pidSnapshot: string | null)
   const updatedList = await listExplores(pidSnapshot).catch(() => historyItems.value);
   if ((projectId.value || null) !== pidSnapshot) return;
   historyItems.value = updatedList;
+  if (pidSnapshot && (finalResult?.saved_auth_profile || finalResult?.seed?.auth_profile_id)) {
+    const freshProfiles = await listAuthProfiles(pidSnapshot).catch(() => projectAuthProfiles.value);
+    if ((projectId.value || null) === pidSnapshot) {
+      projectAuthProfiles.value = freshProfiles;
+    }
+  }
 
   clearCompletionHideTimer();
   completionHideTimer = window.setTimeout(() => {
@@ -726,6 +1201,12 @@ async function handleRunExplore(): Promise<void> {
     return;
   }
 
+  const authPayload = buildExploreAuthPayload();
+  if (authPayload.error) {
+    error.value = authPayload.error;
+    return;
+  }
+
   running.value = true;
   try {
     const job = await startExploreJob({
@@ -737,6 +1218,8 @@ async function handleRunExplore(): Promise<void> {
       probe_openapi_docs: probeOpenApiDocs.value,
       crawl_js: crawlJs.value,
       depth: depth.value,
+      credential_id: authPayload.credential_id ?? null,
+      auth: authPayload.auth ?? null,
     });
     attachAndPollJob(job, false);
   } catch (err) {
@@ -750,6 +1233,13 @@ async function handleExploreSelectedPortals(): Promise<void> {
     return;
   }
   error.value = null;
+
+  const authPayload = buildExploreAuthPayload();
+  if (authPayload.error) {
+    error.value = authPayload.error;
+    return;
+  }
+
   runningPortals.value = true;
   try {
     const job = await startExploreJob({
@@ -760,6 +1250,8 @@ async function handleExploreSelectedPortals(): Promise<void> {
       probe_openapi_docs: probeOpenApiDocs.value,
       crawl_js: crawlJs.value,
       depth: depth.value,
+      credential_id: authPayload.credential_id ?? null,
+      auth: authPayload.auth ?? null,
     });
     attachAndPollJob(job, true);
   } catch (err) {
@@ -821,6 +1313,9 @@ watch(projectId, () => {
   discoveredPortals.value = null;
   discoveredRootDomain.value = "";
   portalNotice.value = null;
+  seedCurl.value = "";
+  targetUrl.value = "";
+  resetInlineAuthState();
   void fetchHistoryAndProjects(true);
   void checkAndResumeActiveJob();
 });
@@ -963,6 +1458,13 @@ onBeforeUnmount(() => {
             <h2 class="text-sm font-semibold text-slate-900">{{ t("explore.portalsTitle") }}</h2>
             <span class="rounded-full bg-indigo-100 px-2 py-0.5 font-mono text-[11px] font-semibold text-indigo-700">
               {{ projectTargets.length }}
+            </span>
+            <span
+              v-if="authMode !== 'none'"
+              class="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20"
+            >
+              <KeyRound class="h-3 w-3" />
+              <span>{{ t("explore.auth.portalsActiveBadge", { detail: activeAuthSummary }) }}</span>
             </span>
           </div>
           <p class="mt-0.5 text-xs text-slate-500">{{ t("explore.portalsSubtitle") }}</p>
@@ -1233,6 +1735,777 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
+        <!-- Collapsible Auth Credentials Section (Burp-style grouped modes + Smart Paste + Verify) -->
+        <div
+          data-testid="explore-auth-panel"
+          class="overflow-hidden rounded-xl border border-slate-200 bg-slate-50/60"
+        >
+          <!-- Panel Header -->
+          <div class="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5">
+            <button
+              type="button"
+              data-testid="explore-auth-toggle"
+              class="flex flex-wrap items-center gap-2 text-left text-xs font-semibold text-slate-800 hover:text-indigo-700"
+              @click="authPanelOpen = !authPanelOpen"
+            >
+              <ChevronDown v-if="authPanelOpen" class="h-3.5 w-3.5 text-slate-400" />
+              <ChevronRight v-else class="h-3.5 w-3.5 text-slate-400" />
+              <KeyRound class="h-3.5 w-3.5 text-indigo-600" />
+              <span>{{ t("explore.auth.panelTitle") }}</span>
+              <span
+                class="rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset"
+                :class="
+                  authMode === 'none'
+                    ? 'bg-white text-slate-500 ring-slate-200'
+                    : 'bg-emerald-50 text-emerald-700 ring-emerald-600/20'
+                "
+              >
+                {{
+                  authMode === "none"
+                    ? t("explore.auth.panelSummaryNone")
+                    : t("explore.auth.panelSummaryActive", { detail: activeAuthSummary })
+                }}
+              </span>
+            </button>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <span
+                class="inline-flex items-center gap-1 rounded-full bg-white px-2.5 py-0.5 text-[10px] font-medium text-slate-500 ring-1 ring-inset ring-slate-200"
+              >
+                <ShieldCheck class="h-3 w-3 text-emerald-600" />
+                <span>{{ t("explore.auth.securityBadge") }}</span>
+              </span>
+              <button
+                type="button"
+                data-testid="explore-smart-paste-toggle"
+                class="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[11px] font-medium text-indigo-700 transition hover:bg-indigo-50"
+                @click="
+                  smartPasteOpen = !smartPasteOpen;
+                  if (smartPasteOpen) authPanelOpen = true;
+                "
+              >
+                <ClipboardPaste class="h-3 w-3" />
+                <span>{{ t("explore.auth.smartPasteBtn") }}</span>
+              </button>
+            </div>
+          </div>
+
+          <div v-if="authPanelOpen" class="space-y-3 border-t border-slate-200/80 bg-white px-4 py-3">
+            <!-- Burp-Style Smart Paste Inline Box -->
+            <div
+              v-if="smartPasteOpen"
+              class="space-y-2 rounded-lg border border-indigo-200 bg-indigo-50/40 p-3"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-xs font-semibold text-indigo-900">
+                  {{ t("explore.auth.smartPasteTitle") }}
+                </span>
+                <button
+                  type="button"
+                  class="text-slate-400 hover:text-slate-600"
+                  @click="smartPasteOpen = false"
+                >
+                  <X class="h-3.5 w-3.5" />
+                </button>
+              </div>
+              <textarea
+                v-model="smartPasteText"
+                data-testid="explore-smart-paste-input"
+                rows="3"
+                class="input-field bg-white font-mono text-[11px] leading-relaxed"
+                :placeholder="t('explore.auth.smartPastePlaceholder')"
+              />
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <p v-if="smartPasteError" class="text-[11px] font-medium text-rose-600">
+                  {{ smartPasteError }}
+                </p>
+                <span v-else class="text-[11px] text-slate-500">
+                  {{ t("explore.auth.appliesToAllHint") }}
+                </span>
+                <button
+                  type="button"
+                  data-testid="explore-smart-paste-apply"
+                  class="btn-primary !px-3 !py-1 !text-xs"
+                  @click="handleSmartPasteParse"
+                >
+                  <Sparkles class="h-3 w-3" />
+                  <span>{{ t("explore.auth.smartPasteApply") }}</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- Smart Paste Extraction Success Summary -->
+            <div
+              v-if="smartPasteNotice"
+              class="flex items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-800"
+            >
+              <span class="flex items-center gap-1.5">
+                <CheckCircle2 class="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                <span>{{ smartPasteNotice }}</span>
+              </span>
+              <button
+                type="button"
+                class="text-emerald-600 hover:text-emerald-800"
+                @click="smartPasteNotice = null"
+              >
+                <X class="h-3.5 w-3.5" />
+              </button>
+            </div>
+
+            <!-- Burp-Friendly Grouped Mode Pills -->
+            <div class="flex flex-wrap items-center gap-y-2 gap-x-3">
+              <div
+                v-for="(grp, gIdx) in AUTH_MODE_GROUPS"
+                :key="grp.groupKey"
+                class="flex flex-wrap items-center gap-1.5"
+                :class="gIdx > 0 ? 'border-l border-slate-200 pl-3' : ''"
+              >
+                <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                  {{ t(`explore.auth.${grp.groupKey}`) }}
+                </span>
+                <button
+                  v-for="mode in grp.modes"
+                  :key="mode"
+                  type="button"
+                  :data-testid="`explore-auth-mode-${mode}`"
+                  class="rounded-full px-2.5 py-1 text-xs font-medium transition"
+                  :class="
+                    authMode === mode
+                      ? 'bg-indigo-600 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900'
+                  "
+                  @click="authMode = mode"
+                >
+                  {{ t(`explore.auth.mode.${mode}`) }}
+                </button>
+              </div>
+            </div>
+
+            <!-- Mode: Saved Project AuthProfile -->
+            <div v-if="authMode === 'profile'" class="space-y-2 pt-1">
+              <template v-if="!projectId">
+                <p class="text-xs text-slate-500">{{ t("explore.auth.noProjectProfileHint") }}</p>
+              </template>
+              <template v-else-if="projectAuthProfiles.length === 0">
+                <p class="text-xs text-slate-600">
+                  {{ t("explore.auth.noProfilesHint") }}
+                  <RouterLink
+                    :to="`${workspacePath('settings', projectId)}?tab=auth`"
+                    class="font-semibold text-indigo-600 hover:underline"
+                  >
+                    {{ t("explore.auth.manageProfilesLink") }} →
+                  </RouterLink>
+                </p>
+              </template>
+              <template v-else>
+                <div class="flex flex-wrap items-end gap-3">
+                  <div class="min-w-[260px] flex-1">
+                    <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                      {{ t("explore.auth.selectProfileLabel") }}
+                    </label>
+                    <select
+                      v-model="selectedAuthProfileId"
+                      data-testid="explore-auth-profile-select"
+                      class="input-field !py-1.5 text-xs"
+                    >
+                      <option value="">{{ t("explore.auth.selectProfilePlaceholder") }}</option>
+                      <option
+                        v-for="prof in projectAuthProfiles"
+                        :key="prof.id"
+                        :value="prof.id"
+                      >
+                        {{ prof.name }} ({{ prof.role_tag }} · {{ prof.auth_type || "headers" }})
+                      </option>
+                    </select>
+                  </div>
+                  <RouterLink
+                    :to="`${workspacePath('settings', projectId)}?tab=auth`"
+                    class="pb-1.5 text-xs font-medium text-indigo-600 hover:underline"
+                  >
+                    {{ t("explore.auth.manageProfilesLink") }} →
+                  </RouterLink>
+                </div>
+              </template>
+            </div>
+
+            <!-- Mode: Bearer / Token -->
+            <div v-else-if="authMode === 'bearer'" class="grid grid-cols-1 gap-3 pt-1 sm:grid-cols-12">
+              <div class="sm:col-span-3">
+                <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                  {{ t("explore.auth.tokenHeaderLabel") }}
+                </label>
+                <input
+                  v-model="bearerHeader"
+                  type="text"
+                  placeholder="Authorization"
+                  class="input-field !py-1.5 font-mono text-xs"
+                />
+              </div>
+              <div class="sm:col-span-2">
+                <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                  {{ t("explore.auth.tokenPrefixLabel") }}
+                </label>
+                <input
+                  v-model="bearerPrefix"
+                  type="text"
+                  placeholder="Bearer "
+                  class="input-field !py-1.5 font-mono text-xs"
+                />
+              </div>
+              <div class="sm:col-span-7">
+                <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                  {{ t("explore.auth.tokenValueLabel") }}
+                </label>
+                <div class="relative">
+                  <input
+                    v-model="bearerToken"
+                    data-testid="explore-auth-token-input"
+                    :type="showBearerToken ? 'text' : 'password'"
+                    :placeholder="t('explore.auth.tokenValuePlaceholder')"
+                    class="input-field !py-1.5 pr-8 font-mono text-xs"
+                  />
+                  <button
+                    type="button"
+                    class="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                    :title="showBearerToken ? t('explore.auth.hideSecret') : t('explore.auth.showSecret')"
+                    @click="showBearerToken = !showBearerToken"
+                  >
+                    <EyeOff v-if="showBearerToken" class="h-3.5 w-3.5" />
+                    <Eye v-else class="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Mode: Cookie -->
+            <div v-else-if="authMode === 'cookie'" class="pt-1">
+              <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                {{ t("explore.auth.cookieLabel") }}
+              </label>
+              <div class="relative">
+                <input
+                  v-model="cookieValue"
+                  data-testid="explore-auth-cookie-input"
+                  :type="showCookie ? 'text' : 'password'"
+                  :placeholder="t('explore.auth.cookiePlaceholder')"
+                  class="input-field !py-1.5 pr-8 font-mono text-xs"
+                />
+                <button
+                  type="button"
+                  class="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                  :title="showCookie ? t('explore.auth.hideSecret') : t('explore.auth.showSecret')"
+                  @click="showCookie = !showCookie"
+                >
+                  <EyeOff v-if="showCookie" class="h-3.5 w-3.5" />
+                  <Eye v-else class="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+
+            <!-- Mode: Basic Auth -->
+            <div v-else-if="authMode === 'basic'" class="grid grid-cols-1 gap-3 pt-1 sm:grid-cols-2">
+              <div>
+                <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                  {{ t("explore.auth.usernameLabel") }}
+                </label>
+                <input
+                  v-model="basicUsername"
+                  type="text"
+                  :placeholder="t('explore.auth.usernamePlaceholder')"
+                  class="input-field !py-1.5 font-mono text-xs"
+                />
+              </div>
+              <div>
+                <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                  {{ t("explore.auth.passwordLabel") }}
+                </label>
+                <div class="relative">
+                  <input
+                    v-model="basicPassword"
+                    :type="showBasicPassword ? 'text' : 'password'"
+                    :placeholder="t('explore.auth.passwordPlaceholder')"
+                    class="input-field !py-1.5 pr-8 font-mono text-xs"
+                  />
+                  <button
+                    type="button"
+                    class="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                    :title="showBasicPassword ? t('explore.auth.hideSecret') : t('explore.auth.showSecret')"
+                    @click="showBasicPassword = !showBasicPassword"
+                  >
+                    <EyeOff v-if="showBasicPassword" class="h-3.5 w-3.5" />
+                    <Eye v-else class="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Mode: Login API -->
+            <div v-else-if="authMode === 'login_api'" class="space-y-3 pt-1">
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-12">
+                <div class="sm:col-span-6">
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.loginUrlLabel") }}
+                  </label>
+                  <input
+                    v-model="loginApiUrl"
+                    data-testid="explore-auth-login-url-input"
+                    type="url"
+                    :placeholder="t('explore.auth.loginUrlPlaceholder')"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div class="sm:col-span-2">
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.loginMethodLabel") }}
+                  </label>
+                  <select
+                    v-model="loginApiMethod"
+                    data-testid="explore-auth-login-method-select"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  >
+                    <option value="POST">POST</option>
+                    <option value="PUT">PUT</option>
+                    <option value="PATCH">PATCH</option>
+                  </select>
+                </div>
+                <div class="sm:col-span-4">
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.contentTypeLabel") }}
+                  </label>
+                  <div class="flex rounded-lg border border-slate-200 bg-slate-50 p-0.5 text-xs">
+                    <button
+                      type="button"
+                      class="flex-1 rounded-md px-2 py-1 font-medium transition"
+                      :class="
+                        loginApiContentType === 'json'
+                          ? 'bg-white text-indigo-700 shadow-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      "
+                      @click="loginApiContentType = 'json'"
+                    >
+                      JSON
+                    </button>
+                    <button
+                      type="button"
+                      class="flex-1 rounded-md px-2 py-1 font-medium transition"
+                      :class="
+                        loginApiContentType === 'form'
+                          ? 'bg-white text-indigo-700 shadow-sm'
+                          : 'text-slate-600 hover:text-slate-900'
+                      "
+                      @click="loginApiContentType = 'form'"
+                    >
+                      Form
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-4">
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.usernameFieldLabel") }}
+                  </label>
+                  <input
+                    v-model="loginApiUsernameField"
+                    type="text"
+                    placeholder="username"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.usernameLabel") }}
+                  </label>
+                  <input
+                    v-model="loginApiUsername"
+                    type="text"
+                    :placeholder="t('explore.auth.usernamePlaceholder')"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.passwordFieldLabel") }}
+                  </label>
+                  <input
+                    v-model="loginApiPasswordField"
+                    type="text"
+                    placeholder="password"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.passwordLabel") }}
+                  </label>
+                  <div class="relative">
+                    <input
+                      v-model="loginApiPassword"
+                      :type="showLoginApiPassword ? 'text' : 'password'"
+                      :placeholder="t('explore.auth.passwordPlaceholder')"
+                      class="input-field !py-1.5 pr-8 font-mono text-xs"
+                    />
+                    <button
+                      type="button"
+                      class="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                      :title="showLoginApiPassword ? t('explore.auth.hideSecret') : t('explore.auth.showSecret')"
+                      @click="showLoginApiPassword = !showLoginApiPassword"
+                    >
+                      <EyeOff v-if="showLoginApiPassword" class="h-3.5 w-3.5" />
+                      <Eye v-else class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.tokenJsonpathLabel") }}
+                  </label>
+                  <input
+                    v-model="loginApiTokenJsonpath"
+                    type="text"
+                    :placeholder="t('explore.auth.tokenJsonpathPlaceholder')"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.targetHeaderLabel") }}
+                  </label>
+                  <input
+                    v-model="loginApiTokenHeader"
+                    type="text"
+                    placeholder="Authorization"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.tokenPrefixLabel") }}
+                  </label>
+                  <input
+                    v-model="loginApiTokenPrefix"
+                    type="text"
+                    placeholder="Bearer "
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <!-- Mode: Browser Form Login -->
+            <div v-else-if="authMode === 'form_login'" class="space-y-3 pt-1">
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.formLoginUrlLabel") }}
+                  </label>
+                  <input
+                    v-model="formLoginUrl"
+                    type="url"
+                    :placeholder="t('explore.auth.formLoginUrlPlaceholder')"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.usernameLabel") }}
+                  </label>
+                  <input
+                    v-model="formLoginUsername"
+                    type="text"
+                    :placeholder="t('explore.auth.usernamePlaceholder')"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <div>
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.passwordLabel") }}
+                  </label>
+                  <div class="relative">
+                    <input
+                      v-model="formLoginPassword"
+                      :type="showFormLoginPassword ? 'text' : 'password'"
+                      :placeholder="t('explore.auth.passwordPlaceholder')"
+                      class="input-field !py-1.5 pr-8 font-mono text-xs"
+                    />
+                    <button
+                      type="button"
+                      class="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                      :title="showFormLoginPassword ? t('explore.auth.hideSecret') : t('explore.auth.showSecret')"
+                      @click="showFormLoginPassword = !showFormLoginPassword"
+                    >
+                      <EyeOff v-if="showFormLoginPassword" class="h-3.5 w-3.5" />
+                      <Eye v-else class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 hover:text-indigo-700"
+                  @click="showFormSelectors = !showFormSelectors"
+                >
+                  <ChevronDown v-if="showFormSelectors" class="h-3 w-3" />
+                  <ChevronRight v-else class="h-3 w-3" />
+                  <span>{{ t("explore.auth.advancedSelectors") }}</span>
+                </button>
+                <div v-if="showFormSelectors" class="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  <div>
+                    <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                      {{ t("explore.auth.usernameSelectorLabel") }}
+                    </label>
+                    <input
+                      v-model="formUsernameSelector"
+                      type="text"
+                      placeholder="input[name=username]"
+                      class="input-field !py-1.5 font-mono text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                      {{ t("explore.auth.passwordSelectorLabel") }}
+                    </label>
+                    <input
+                      v-model="formPasswordSelector"
+                      type="text"
+                      placeholder="input[type=password]"
+                      class="input-field !py-1.5 font-mono text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                      {{ t("explore.auth.submitSelectorLabel") }}
+                    </label>
+                    <input
+                      v-model="formSubmitSelector"
+                      type="text"
+                      placeholder="button[type=submit]"
+                      class="input-field !py-1.5 font-mono text-xs"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Mode: Custom Headers -->
+            <div v-else-if="authMode === 'headers'" class="space-y-2 pt-1">
+              <div class="flex items-center justify-between">
+                <span class="text-[11px] font-medium text-slate-700">
+                  {{ t("explore.auth.customHeadersLabel") }}
+                </span>
+                <div class="flex items-center gap-3">
+                  <button
+                    type="button"
+                    class="inline-flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-700"
+                    @click="showCustomHeaderValues = !showCustomHeaderValues"
+                  >
+                    <EyeOff v-if="showCustomHeaderValues" class="h-3 w-3" />
+                    <Eye v-else class="h-3 w-3" />
+                    <span>
+                      {{ showCustomHeaderValues ? t("explore.auth.hideSecret") : t("explore.auth.showSecret") }}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    class="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                    @click="customHeaderRows.push({ key: '', value: '' })"
+                  >
+                    {{ t("explore.auth.addHeaderRow") }}
+                  </button>
+                </div>
+              </div>
+              <div
+                v-for="(row, idx) in customHeaderRows"
+                :key="idx"
+                class="flex items-center gap-2"
+              >
+                <input
+                  v-model="row.key"
+                  type="text"
+                  :placeholder="t('explore.auth.headerNamePlaceholder')"
+                  class="input-field !py-1.5 font-mono text-xs"
+                />
+                <span class="text-xs text-slate-400">:</span>
+                <input
+                  v-model="row.value"
+                  :type="showCustomHeaderValues ? 'text' : 'password'"
+                  :placeholder="t('explore.auth.headerValuePlaceholder')"
+                  class="input-field !py-1.5 font-mono text-xs"
+                />
+                <button
+                  type="button"
+                  class="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-rose-600"
+                  :disabled="customHeaderRows.length === 1"
+                  @click="customHeaderRows.splice(idx, 1)"
+                >
+                  <X class="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+
+            <!-- Burp-Style Session Validity Check (Verify Auth) + Save as Project Profile -->
+            <div
+              v-if="authMode !== 'none'"
+              class="space-y-3 border-t border-slate-100 pt-3"
+            >
+              <!-- Pre-flight Verify URL Bar -->
+              <div class="flex flex-wrap items-end gap-2">
+                <div class="min-w-[240px] flex-1">
+                  <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                    {{ t("explore.auth.verifyUrlLabel") }}
+                  </label>
+                  <input
+                    v-model="verifyUrl"
+                    data-testid="explore-verify-url-input"
+                    type="url"
+                    :placeholder="t('explore.auth.verifyUrlPlaceholder')"
+                    class="input-field !py-1.5 font-mono text-xs"
+                  />
+                </div>
+                <button
+                  type="button"
+                  data-testid="explore-verify-auth-btn"
+                  class="btn-secondary !px-3 !py-1.5 !text-xs"
+                  :disabled="verifyingAuth"
+                  @click="handleVerifyAuth"
+                >
+                  <Loader2 v-if="verifyingAuth" class="h-3.5 w-3.5 animate-spin text-indigo-600" />
+                  <ShieldCheck v-else class="h-3.5 w-3.5 text-indigo-600" />
+                  <span>
+                    {{ verifyingAuth ? t("explore.auth.verifyingBtn") : t("explore.auth.verifyBtn") }}
+                  </span>
+                </button>
+              </div>
+
+              <!-- Verify Auth Inline Result Badge -->
+              <div
+                v-if="verifyResult"
+                data-testid="explore-verify-auth-result"
+                class="flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-xs"
+                :class="
+                  verifyResult.verdict === 'valid'
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                    : verifyResult.verdict === 'denied'
+                      ? 'border-amber-200 bg-amber-50 text-amber-900'
+                      : 'border-rose-200 bg-rose-50 text-rose-800'
+                "
+              >
+                <CheckCircle2
+                  v-if="verifyResult.verdict === 'valid'"
+                  class="h-4 w-4 shrink-0 text-emerald-600"
+                />
+                <AlertTriangle
+                  v-else
+                  class="h-4 w-4 shrink-0"
+                  :class="verifyResult.verdict === 'denied' ? 'text-amber-600' : 'text-rose-600'"
+                />
+                <span class="font-semibold">
+                  {{
+                    verifyResult.verdict === "valid"
+                      ? t("explore.auth.verifyValid")
+                      : verifyResult.verdict === "denied"
+                        ? t("explore.auth.verifyDenied")
+                        : t("explore.auth.verifyError")
+                  }}
+                </span>
+                <span
+                  v-if="verifyResult.status_code"
+                  class="rounded bg-white/80 px-1.5 py-0.5 font-mono text-[11px] font-semibold ring-1 ring-inset ring-black/10"
+                >
+                  HTTP {{ verifyResult.status_code }}
+                </span>
+                <span
+                  v-if="verifyResult.biz_code !== null && verifyResult.biz_code !== undefined"
+                  class="rounded bg-white/80 px-1.5 py-0.5 font-mono text-[11px] ring-1 ring-inset ring-black/10"
+                >
+                  biz={{ verifyResult.biz_code }}
+                </span>
+                <span class="font-mono text-[11px] opacity-80">
+                  {{ verifyResult.duration_ms }}ms
+                </span>
+                <span v-if="verifyResult.message" class="text-[11px]">
+                  · {{ verifyResult.message }}
+                </span>
+                <span
+                  v-if="verifyResult.redirected_to"
+                  class="font-mono text-[11px] underline decoration-dotted"
+                >
+                  ({{ t("explore.auth.verifyRedirect", { url: verifyResult.redirected_to }) }})
+                </span>
+              </div>
+
+              <div
+                v-if="verifyError"
+                class="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"
+              >
+                {{ verifyError }}
+              </div>
+
+              <!-- Optional Save as Project AuthProfile Toggle -->
+              <div
+                v-if="projectId && authMode !== 'profile'"
+                class="flex flex-wrap items-center gap-3 rounded-lg bg-slate-50 px-3 py-2 text-xs"
+              >
+                <label class="inline-flex cursor-pointer items-center gap-2 font-medium text-slate-700">
+                  <input
+                    v-model="saveAsProfile"
+                    data-testid="explore-auth-save-toggle"
+                    type="checkbox"
+                    class="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <span>{{ t("explore.auth.saveAsProfileToggle") }}</span>
+                </label>
+
+                <template v-if="saveAsProfile">
+                  <input
+                    v-model="saveProfileName"
+                    data-testid="explore-auth-profile-name-input"
+                    type="text"
+                    :placeholder="t('explore.auth.profileNamePlaceholder')"
+                    class="input-field w-48 !py-1 text-xs"
+                  />
+                  <input
+                    v-model="saveProfileRoleTag"
+                    data-testid="explore-auth-role-tag-input"
+                    list="explore-role-tag-list"
+                    type="text"
+                    :placeholder="t('explore.auth.roleTagPlaceholder')"
+                    class="input-field w-36 !py-1 font-mono text-xs"
+                  />
+                  <datalist id="explore-role-tag-list">
+                    <option v-for="rTag in ROLE_TAG_SUGGESTIONS" :key="rTag" :value="rTag" />
+                  </datalist>
+                </template>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Auth Profile Saved Notice Toast -->
+        <div
+          v-if="authSuccessNotice"
+          data-testid="explore-auth-saved-toast"
+          class="flex items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs font-medium text-emerald-800"
+        >
+          <span class="flex items-center gap-2">
+            <CheckCircle2 class="h-4 w-4 shrink-0 text-emerald-600" />
+            <span>{{ authSuccessNotice }}</span>
+          </span>
+          <button
+            type="button"
+            class="text-emerald-600 hover:text-emerald-800"
+            @click="authSuccessNotice = null"
+          >
+            <X class="h-3.5 w-3.5" />
+          </button>
+        </div>
+
         <!-- Strategy Checkboxes + Launch Button -->
         <div class="flex flex-wrap items-center justify-between gap-4 border-t border-slate-100 pt-4">
           <div class="flex flex-wrap items-center gap-4 text-xs">
@@ -1493,11 +2766,12 @@ onBeforeUnmount(() => {
               </code>
             </span>
             <span
-              v-for="hdr in result.seed.auth_headers_detected || []"
-              :key="hdr"
-              class="rounded-full bg-emerald-50 px-2 py-0.5 font-mono text-[11px] font-medium text-emerald-700 ring-1 ring-emerald-600/20"
+              v-if="resultAuthBadgeText"
+              data-testid="explore-result-auth-badge"
+              class="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-0.5 font-mono text-[11px] font-medium text-emerald-700 ring-1 ring-emerald-600/20"
             >
-              {{ hdr }}
+              <KeyRound class="h-3 w-3 shrink-0" />
+              <span>{{ t("explore.auth.resultBadge", { detail: resultAuthBadgeText }) }}</span>
             </span>
           </div>
 

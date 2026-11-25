@@ -1,7 +1,65 @@
 import { apiFetch } from "./client";
-import type { DiscoveredPortal, Run } from "./types";
+import type { AuthProfile, DiscoveredPortal, Run } from "./types";
 
 export type ExploreMode = "passive" | "active";
+
+export type ExploreAuthType =
+  | "none"
+  | "profile"
+  | "headers"
+  | "bearer"
+  | "cookie"
+  | "basic"
+  | "login_api"
+  | "form_login";
+
+export interface ExploreAuthConfig {
+  auth_type: ExploreAuthType;
+  credential_id?: string | null;
+  token?: string | null;
+  token_header?: string;
+  token_prefix?: string;
+  cookie?: string | null;
+  headers?: Record<string, string>;
+  username?: string | null;
+  password?: string | null;
+  login_url?: string | null;
+  login_method?: string;
+  login_content_type?: "json" | "form";
+  username_field?: string;
+  password_field?: string;
+  extra_fields?: Record<string, unknown>;
+  token_jsonpath?: string | null;
+  username_selector?: string | null;
+  password_selector?: string | null;
+  submit_selector?: string | null;
+  save_as_profile?: boolean;
+  profile_name?: string | null;
+  role_tag?: string;
+  verify_url?: string | null;
+  scope_domains?: string[];
+}
+
+export interface ExploreVerifyAuthRequest {
+  verify_url?: string | null;
+  target_url?: string | null;
+  project_id?: string | null;
+  credential_id?: string | null;
+  auth?: ExploreAuthConfig | null;
+}
+
+export interface ExploreVerifyAuthResponse {
+  valid: boolean;
+  verdict: "valid" | "denied" | "error";
+  auth_mode: string;
+  header_names: string[];
+  status_code: number;
+  biz_code?: number | string | null;
+  redirected_to?: string | null;
+  duration_ms: number;
+  message: string;
+  warnings: string[];
+}
 
 export interface ExploreRequest {
   seed_curl?: string | null;
@@ -13,6 +71,8 @@ export interface ExploreRequest {
   depth?: number;
   merge?: boolean;
   project_id?: string | null;
+  credential_id?: string | null;
+  auth?: ExploreAuthConfig | null;
 }
 
 export interface ExploreAllTargetsRequest {
@@ -21,6 +81,8 @@ export interface ExploreAllTargetsRequest {
   probe_openapi_docs?: boolean;
   crawl_js?: boolean;
   depth?: number;
+  credential_id?: string | null;
+  auth?: ExploreAuthConfig | null;
 }
 
 export interface ExploredTargetResult {
@@ -38,6 +100,9 @@ export interface ExploreSeedInfo {
   api_prefix: string;
   auth_headers_detected: string[];
   sibling_api_hosts?: string[];
+  auth_mode?: string;
+  auth_profile_id?: string | null;
+  auth_profile_name?: string | null;
 }
 
 export interface ExploreSummary {
@@ -97,6 +162,7 @@ export interface ExploreResult {
   subdomains: string[];
   live_hosts: Array<Record<string, unknown> | string>;
   warnings: string[];
+  saved_auth_profile?: AuthProfile | null;
 }
 
 export interface ExploreListItem {
@@ -234,4 +300,13 @@ export async function listExploreJobs(
 
 export function getExploreJob(jobId: string): Promise<ExploreJob> {
   return apiFetch<ExploreJob>(`/explore/jobs/${encodeURIComponent(jobId)}`);
+}
+
+export function verifyExploreAuth(
+  payload: ExploreVerifyAuthRequest
+): Promise<ExploreVerifyAuthResponse> {
+  return apiFetch<ExploreVerifyAuthResponse>("/explore/verify-auth", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }

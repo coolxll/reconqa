@@ -6,12 +6,14 @@ import asyncio
 import json
 import re
 import shutil
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode, urlparse
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -20,11 +22,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from reconqa.config import settings
 from reconqa.models.db import get_db
 from reconqa.models.schemas import (
+    AuthProfileOut,
     DiscoverPortalsRequest,
     DiscoverPortalsResponse,
+    ExploreAuthConfig,
+    ExploreVerifyAuthRequest,
+    ExploreVerifyAuthResponse,
     RunOut,
 )
-from reconqa.models.tables import Job, Project, Run, Target
+from reconqa.models.tables import AuthProfile, Job, Project, Run, Target
+from reconqa.modules.discovery.auth_resolver import (
+    ResolvedAuth,
+    headers_for_url,
+    is_unsafe_auth_url,
+    load_storage_state_cookies_for_host,
+    make_async_scope_request_hook,
+    redact_secrets,
+    resolve_explore_auth,
+    sanitize_url_for_storage,
+)
 from reconqa.modules.discovery.seed_explorer import (
     _collect_merged_hosts,
     _registrable_root_domain,
@@ -57,6 +73,8 @@ class ExploreRequest(BaseModel):
     depth: int = 2
     merge: bool = True
     project_id: str | None = None
+    credential_id: str | None = None
+    auth: ExploreAuthConfig | None = None
 
 
 class ExploreJobRequest(ExploreRequest):
@@ -122,6 +140,8 @@ class ExploreAllTargetsRequest(BaseModel):
     discover_portals: bool = True
     depth: int = 2
     merge: bool = True
+    credential_id: str | None = None
+    auth: ExploreAuthConfig | None = None
 
 
 class PromoteToRunRequest(BaseModel):
@@ -432,6 +452,227 @@ def _parse_batch_target_urls(
     return cleaned
 
 
+def _build_auth_meta(resolved: ResolvedAuth | None) -> dict[str, Any] | None:
+    if resolved is None:
+        return None
+    return {
+        "auth_mode": resolved.auth_mode,
+        "profile_id": resolved.profile_id,
+        "profile_name": resolved.profile_name,
+        "scope_domains": list(resolved.scope_domains or []),
+    }
+
+
+def _is_env_ref_str(raw: str | None) -> bool:
+    val = str(raw or "").strip()
+    return val.startswith(("ENV:", "env:")) or (val.startswith("${") and val.endswith("}"))
+
+
+def _build_profile_headers_for_save(
+    auth_cfg: ExploreAuthConfig,
+    resolved: ResolvedAuth,
+) -> dict[str, str]:
+    """Build extra_headers_ref to persist on AuthProfile while preserving ENV:RECONQA_* refs."""
+    mode = auth_cfg.auth_type
+    if mode == "basic":
+        # username & password (including ENV refs) are stored in login_config;
+        # avoid persisting resolved plaintext Basic header into extra_headers_ref.
+        return {}
+    if mode == "bearer":
+        raw_tok = str(auth_cfg.token or "").strip()
+        if _is_env_ref_str(raw_tok):
+            if not (auth_cfg.token_prefix or ""):
+                return {auth_cfg.token_header or "Authorization": raw_tok}
+            # Prefix + ENV ref stored cleanly in login_config so it resolves dynamically.
+            return {}
+        return dict(resolved.headers)
+    if mode == "cookie":
+        raw_ck = str(auth_cfg.cookie or "").strip()
+        if _is_env_ref_str(raw_ck):
+            return {"Cookie": raw_ck}
+        return dict(resolved.headers)
+    if mode == "headers":
+        out: dict[str, str] = {}
+        for k, v in (auth_cfg.headers or {}).items():
+            h_name = str(k or "").strip()
+            raw_v = str(v or "").strip()
+            if not h_name or h_name.startswith(":"):
+                continue
+            if _is_env_ref_str(raw_v):
+                out[h_name] = raw_v
+            elif h_name in resolved.headers:
+                out[h_name] = resolved.headers[h_name]
+        return out
+    # login_api / form_login cache exchanged session headers; when form_login saves
+    # storage_state.json, keep cookies exclusively in storage_state for per-host scoping.
+    if mode == "form_login" and resolved.storage_state_data:
+        return {k: v for k, v in resolved.headers.items() if k.lower() != "cookie"}
+    return dict(resolved.headers)
+
+
+def _build_profile_login_config_from_auth(auth_cfg: ExploreAuthConfig) -> dict[str, Any]:
+    mode = auth_cfg.auth_type
+    cfg: dict[str, Any] = {}
+    if auth_cfg.verify_url:
+        cfg["verify_url"] = auth_cfg.verify_url
+    if auth_cfg.scope_domains:
+        cfg["scope_domains"] = list(auth_cfg.scope_domains)
+    if mode == "bearer" and _is_env_ref_str(auth_cfg.token):
+        cfg.update(
+            {
+                "token": str(auth_cfg.token or "").strip(),
+                "token_header": auth_cfg.token_header,
+                "token_prefix": auth_cfg.token_prefix,
+            }
+        )
+    elif mode == "basic":
+        cfg.update(
+            {
+                "username": auth_cfg.username or "",
+                "password": auth_cfg.password or "",
+            }
+        )
+    elif mode == "login_api":
+        cfg.update(
+            {
+                "login_url": auth_cfg.login_url or "",
+                "login_method": auth_cfg.login_method,
+                "login_content_type": auth_cfg.login_content_type,
+                "username_field": auth_cfg.username_field,
+                "password_field": auth_cfg.password_field,
+                "username": auth_cfg.username or "",
+                "password": auth_cfg.password or "",
+                "extra_fields": dict(auth_cfg.extra_fields or {}),
+                "token_jsonpath": auth_cfg.token_jsonpath or "",
+                "token_header": auth_cfg.token_header,
+                "token_prefix": auth_cfg.token_prefix,
+            }
+        )
+    elif mode == "form_login":
+        cfg.update(
+            {
+                "login_url": auth_cfg.login_url or "",
+                "username": auth_cfg.username or "",
+                "password": auth_cfg.password or "",
+                "username_selector": auth_cfg.username_selector or "",
+                "password_selector": auth_cfg.password_selector or "",
+                "submit_selector": auth_cfg.submit_selector or "",
+                "token_header": auth_cfg.token_header,
+                "token_prefix": auth_cfg.token_prefix,
+            }
+        )
+    return cfg
+
+
+async def _resolve_request_auth(
+    db: AsyncSession,
+    *,
+    project_id: str | None,
+    credential_id: str | None,
+    auth_cfg: ExploreAuthConfig | None,
+    target_hint: str = "",
+    allow_save: bool = True,
+) -> tuple[ResolvedAuth, dict[str, Any] | None]:
+    """Resolve runtime auth headers ONCE per Explore request and optionally save as AuthProfile."""
+    eff_cred_id = (credential_id or "").strip() or (
+        (auth_cfg.credential_id or "").strip() if auth_cfg else ""
+    )
+    profile: AuthProfile | None = None
+    if eff_cred_id:
+        profile = await db.get(AuthProfile, eff_cred_id)
+        if profile is None or (project_id and profile.project_id != project_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Auth profile '{eff_cred_id}' not found",
+            )
+
+    target_host = ""
+    if target_hint:
+        hint_raw = target_hint.strip()
+        if "://" in hint_raw:
+            target_host = (urlparse(hint_raw).hostname or "").lower()
+        else:
+            target_host = (urlparse(f"https://{hint_raw}").hostname or "").lower()
+
+    auth_dict = auth_cfg.model_dump() if auth_cfg is not None else None
+    resolved = await asyncio.to_thread(
+        resolve_explore_auth,
+        auth_dict,
+        profile=profile,
+        target_host=target_host,
+    )
+
+    saved_profile_out: dict[str, Any] | None = None
+    if (
+        allow_save
+        and auth_cfg is not None
+        and auth_cfg.save_as_profile
+        and project_id
+        and auth_cfg.auth_type not in {"none", "profile"}
+        and resolved.login_succeeded is not False
+        and bool(resolved.headers)
+    ):
+        login_cfg = _build_profile_login_config_from_auth(auth_cfg)
+        headers_to_save = _build_profile_headers_for_save(auth_cfg, resolved)
+        if headers_to_save or login_cfg:
+            proj = await db.get(Project, project_id)
+            if proj is not None:
+                profile_name = (
+                    (auth_cfg.profile_name or "").strip()
+                    or f"Explore Auth ({resolved.auth_mode})"
+                )
+                role_tag = (auth_cfg.role_tag or "account_a").strip() or "account_a"
+                existing_res = await db.execute(
+                    select(AuthProfile).where(
+                        AuthProfile.project_id == project_id,
+                        AuthProfile.name == profile_name,
+                    )
+                )
+                saved_prof = existing_res.scalars().first()
+                if saved_prof is not None:
+                    saved_prof.role_tag = role_tag
+                    saved_prof.auth_type = auth_cfg.auth_type
+                    saved_prof.extra_headers_ref = headers_to_save
+                    saved_prof.login_config = login_cfg
+                else:
+                    saved_prof = AuthProfile(
+                        project_id=project_id,
+                        name=profile_name,
+                        role_tag=role_tag,
+                        auth_type=auth_cfg.auth_type,
+                        storage_state_path=None,
+                        extra_headers_ref=headers_to_save,
+                        login_config=login_cfg,
+                    )
+                    db.add(saved_prof)
+                    await db.flush()
+
+                if resolved.storage_state_data:
+                    auth_dir = ensure_dir(
+                        settings.data_dir.resolve() / "projects" / project_id / "auth"
+                    )
+                    safe_name = (
+                        f"{slugify(saved_prof.id)}_{slugify(saved_prof.role_tag)}_storage_state.json"
+                    )
+                    dest_path = (auth_dir / safe_name).resolve()
+                    if auth_dir.resolve() in dest_path.parents:
+                        dest_path.write_text(
+                            json.dumps(resolved.storage_state_data, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        saved_prof.storage_state_path = str(dest_path)
+
+                await db.commit()
+                await db.refresh(saved_prof)
+                resolved.profile_id = saved_prof.id
+                resolved.profile_name = saved_prof.name
+                saved_profile_out = AuthProfileOut.model_validate(saved_prof).model_dump(
+                    mode="json"
+                )
+
+    return resolved, saved_profile_out
+
+
 async def _run_batch_explore_urls(
     urls: list[str],
     *,
@@ -443,11 +684,51 @@ async def _run_batch_explore_urls(
     merge: bool,
     project_id: str | None,
     job_state: dict[str, Any] | None = None,
+    resolved_auth: ResolvedAuth | None = None,
 ) -> tuple[dict[str, Any], list[tuple[str, int]]]:
     """Explore multiple portal URLs with bounded concurrency (2) and merge into root-domain inventory."""
     sem = asyncio.Semaphore(2)
     per_url_out: list[tuple[str, Path | None, dict[str, Any] | None, str | None]] = []
     per_target_pct = [0] * len(urls)
+    auth_meta = _build_auth_meta(resolved_auth)
+    auth_secrets = list(resolved_auth.secret_values) if resolved_auth else []
+    auth_scope = list(resolved_auth.scope_domains) if resolved_auth else []
+
+    # Bind batch auth scope to explicit scope_domains, login_url root domain, or first target root domain
+    # so unrelated root domains in a multi-target batch never auto-authorize themselves.
+    batch_allowed_root = ""
+    if not auth_scope:
+        scope_seed_url = (
+            (resolved_auth.login_url or "").strip()
+            if (resolved_auth and resolved_auth.login_url)
+            else (urls[0] if urls else "")
+        )
+        if scope_seed_url:
+            raw_s = scope_seed_url if "://" in scope_seed_url else f"https://{scope_seed_url}"
+            s_host = (urlparse(raw_s).hostname or "").lower()
+            batch_allowed_root = _registrable_root_domain(s_host) or s_host
+
+    def _headers_for_batch_target(u: str) -> tuple[dict[str, str] | None, list[str]]:
+        if resolved_auth is None:
+            return None, list(auth_secrets)
+        u_raw = u if "://" in u else f"https://{u}"
+        u_host = (urlparse(u_raw).hostname or "").lower()
+        per_secrets = list(auth_secrets)
+        if resolved_auth.storage_state_path:
+            # Re-filter storage_state cookies per portal host to avoid leaking Portal A cookies to Portal B
+            per_hdrs = {
+                k: v
+                for k, v in (resolved_auth.non_storage_headers or {}).items()
+                if k.lower() != "cookie"
+            }
+            ck_hdr, ck_secs = load_storage_state_cookies_for_host(
+                resolved_auth.storage_state_path, u_host
+            )
+            if ck_hdr:
+                per_hdrs["Cookie"] = ck_hdr
+                per_secrets.extend(ck_secs)
+            return (per_hdrs or None), per_secrets
+        return (dict(resolved_auth.headers) if resolved_auth.headers else None), per_secrets
 
     def _update_batch_progress(idx: int, stage: str, pct: int, detail: str) -> None:
         if job_state is None:
@@ -457,18 +738,20 @@ async def _run_batch_explore_urls(
         job_state["progress_pct"] = max(int(job_state.get("progress_pct", 0)), min(92, overall))
         job_state["stage"] = stage
         if detail:
-            job_state["current_target"] = detail
+            job_state["current_target"] = sanitize_url_for_storage(detail)
 
     async def _explore_one(idx: int, u: str) -> tuple[str, Path | None, dict[str, Any] | None, str | None]:
         async with sem:
             sid = uuid.uuid4().hex[:12]
             tdir = ensure_dir(_explores_root() / f"_tmp_{sid}")
+            safe_u = sanitize_url_for_storage(u)
             if job_state is not None:
-                job_state["current_target"] = u
+                job_state["current_target"] = safe_u
 
             def _cb(stage: str, pct: int, detail: str) -> None:
-                _update_batch_progress(idx, stage, pct, detail or u)
+                _update_batch_progress(idx, stage, pct, detail or safe_u)
 
+            per_headers, per_secrets = _headers_for_batch_target(u)
             try:
                 res = await asyncio.to_thread(
                     explore_from_seed,
@@ -481,6 +764,11 @@ async def _run_batch_explore_urls(
                     depth=depth,
                     explore_id=sid,
                     on_progress=_cb if job_state is not None else None,
+                    extra_headers=per_headers,
+                    auth_meta=auth_meta,
+                    secret_values=per_secrets,
+                    scope_domains=auth_scope,
+                    allowed_root_domain=batch_allowed_root or None,
                 )
                 if project_id:
                     res["project_id"] = project_id
@@ -489,14 +777,14 @@ async def _run_batch_explore_urls(
                     job_state["endpoints_found"] = int(job_state.get("endpoints_found", 0)) + len(
                         res.get("discovered_endpoints") or []
                     )
-                    _update_batch_progress(idx, "finalize", 100, u)
+                    _update_batch_progress(idx, "finalize", 100, safe_u)
                 return u, tdir, res, None
             except Exception as exc:
                 shutil.rmtree(tdir, ignore_errors=True)
                 if job_state is not None:
                     job_state["targets_done"] = int(job_state.get("targets_done", 0)) + 1
-                    _update_batch_progress(idx, "finalize", 100, u)
-                return u, None, None, str(exc)
+                    _update_batch_progress(idx, "finalize", 100, safe_u)
+                return u, None, None, redact_secrets(str(exc), per_secrets)
 
     results = await asyncio.gather(*(_explore_one(i, u) for i, u in enumerate(urls)))
     per_url_out.extend(results)
@@ -554,10 +842,15 @@ async def _run_batch_explore_urls(
     assert merged_result is not None
     if project_id:
         merged_result["project_id"] = project_id
-    if failed_warnings:
-        merged_result["warnings"] = list(
-            dict.fromkeys([*(merged_result.get("warnings") or []), *failed_warnings])
-        )[-30:]
+    auth_warnings = list(resolved_auth.warnings) if resolved_auth else []
+    extra_warnings = [*auth_warnings, *failed_warnings]
+    if extra_warnings:
+        merged_result["warnings"] = [
+            redact_secrets(w, auth_secrets)
+            for w in list(
+                dict.fromkeys([*(merged_result.get("warnings") or []), *extra_warnings])
+            )[-30:]
+        ]
     merged_hosts = _collect_merged_hosts(merged_result)
     merged_result["merged_hosts"] = merged_hosts
     merged_result["seed_hosts"] = list(merged_hosts)
@@ -577,9 +870,14 @@ async def _run_single_explore_seed(
     merge: bool,
     project_id: str | None,
     job_state: dict[str, Any] | None = None,
+    resolved_auth: ResolvedAuth | None = None,
 ) -> dict[str, Any]:
     scan_id = uuid.uuid4().hex[:12]
     tmp_dir = ensure_dir(_explores_root() / f"_tmp_{scan_id}")
+    auth_headers = dict(resolved_auth.headers) if resolved_auth and resolved_auth.headers else None
+    auth_meta = _build_auth_meta(resolved_auth)
+    auth_secrets = list(resolved_auth.secret_values) if resolved_auth else []
+    auth_scope = list(resolved_auth.scope_domains) if resolved_auth else []
 
     def _cb(stage: str, pct: int, detail: str) -> None:
         if job_state is None:
@@ -587,7 +885,7 @@ async def _run_single_explore_seed(
         job_state["stage"] = stage
         job_state["progress_pct"] = max(int(job_state.get("progress_pct", 0)), min(92, int(pct)))
         if detail:
-            job_state["current_target"] = detail
+            job_state["current_target"] = sanitize_url_for_storage(detail)
 
     try:
         incoming = await asyncio.to_thread(
@@ -602,10 +900,14 @@ async def _run_single_explore_seed(
             depth=depth,
             explore_id=scan_id,
             on_progress=_cb if job_state is not None else None,
+            extra_headers=auth_headers,
+            auth_meta=auth_meta,
+            secret_values=auth_secrets,
+            scope_domains=auth_scope,
         )
     except ValueError as exc:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=redact_secrets(str(exc), auth_secrets)) from exc
 
     if job_state is not None:
         job_state["stage"] = "merge"
@@ -615,6 +917,13 @@ async def _run_single_explore_seed(
 
     if project_id:
         incoming["project_id"] = project_id
+    if resolved_auth and resolved_auth.warnings:
+        incoming["warnings"] = [
+            redact_secrets(w, auth_secrets)
+            for w in list(
+                dict.fromkeys([*(incoming.get("warnings") or []), *resolved_auth.warnings])
+            )[-30:]
+        ]
 
     resolved_domain = (
         str((incoming.get("seed") or {}).get("root_domain") or "").strip().lower()
@@ -642,9 +951,178 @@ async def _run_single_explore_seed(
     return final_result
 
 
+@router.post("/explore/verify-auth", response_model=ExploreVerifyAuthResponse)
+async def verify_explore_auth(
+    body: ExploreVerifyAuthRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ExploreVerifyAuthResponse:
+    """Burp-style read-only pre-flight session validity check (GET with follow_redirects=False, zero raw secrets)."""
+    from reconqa.server.routers.projects import _classify_matrix_verdict, _should_bypass_env_proxy
+
+    explicit_verify = (
+        (body.verify_url or "").strip()
+        or ((body.auth.verify_url or "").strip() if body.auth else "")
+    )
+    target_hint = explicit_verify or (body.target_url or "").strip()
+    resolved, _ = await _resolve_request_auth(
+        db,
+        project_id=body.project_id,
+        credential_id=body.credential_id,
+        auth_cfg=body.auth,
+        target_hint=target_hint,
+        allow_save=False,
+    )
+    # Precedence: 1. body.verify_url -> 2. body.auth.verify_url -> 3. profile.login_config.verify_url -> 4. body.target_url
+    raw_verify = (
+        explicit_verify
+        or (resolved.verify_url or "").strip()
+        or (body.target_url or "").strip()
+    )
+
+    if not raw_verify:
+        raise HTTPException(
+            status_code=400,
+            detail="Either verify_url or target_url must be provided.",
+        )
+    if "://" not in raw_verify:
+        raw_verify = f"https://{raw_verify}"
+    if is_unsafe_auth_url(raw_verify):
+        raise HTTPException(
+            status_code=400,
+            detail="Verification URL must use http(s):// and must not target cloud metadata or link-local hosts.",
+        )
+
+    if resolved.login_succeeded is False:
+        msg = redact_secrets(
+            " ".join(resolved.warnings) or "Authentication login exchange failed.",
+            resolved.secret_values,
+        )
+        return ExploreVerifyAuthResponse(
+            valid=False,
+            verdict="denied",
+            auth_mode=resolved.auth_mode,
+            header_names=resolved.auth_header_names,
+            status_code=int(resolved.login_status_code or 0),
+            message=msg,
+            warnings=list(resolved.warnings),
+        )
+
+    if resolved.auth_mode != "none" and not resolved.headers:
+        msg = redact_secrets(
+            " ".join(resolved.warnings)
+            or "No usable authentication headers were resolved (check token/cookie/ENV:RECONQA_* reference).",
+            resolved.secret_values,
+        )
+        return ExploreVerifyAuthResponse(
+            valid=False,
+            verdict="denied",
+            auth_mode=resolved.auth_mode,
+            header_names=[],
+            status_code=int(resolved.login_status_code or 0),
+            message=msg,
+            warnings=list(resolved.warnings),
+        )
+
+    v_host = (urlparse(raw_verify).hostname or "").lower()
+    scope_doms = list(resolved.scope_domains or [])
+    req_headers = (
+        headers_for_url(raw_verify, resolved.headers, "", scope_domains=scope_doms)
+        if scope_doms
+        else dict(resolved.headers)
+    )
+    if scope_doms and resolved.headers and not req_headers:
+        warn_msg = "Verification URL host is outside configured scope_domains; credentials were not sent."
+        return ExploreVerifyAuthResponse(
+            valid=False,
+            verdict="denied",
+            auth_mode=resolved.auth_mode,
+            header_names=[],
+            status_code=0,
+            message=warn_msg,
+            warnings=[*resolved.warnings, warn_msg],
+        )
+
+    scope_hook = make_async_scope_request_hook(
+        v_host, scope_doms or None, list(req_headers.keys())
+    )
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(
+            verify=False,
+            follow_redirects=False,
+            timeout=12.0,
+            trust_env=not _should_bypass_env_proxy(v_host),
+            event_hooks={"request": [scope_hook]},
+        ) as client:
+            resp = await client.get(raw_verify, headers=req_headers)
+    except httpx.HTTPError as exc:
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        err_msg = redact_secrets(f"Verification request failed: {exc}", resolved.secret_values)
+        return ExploreVerifyAuthResponse(
+            valid=False,
+            verdict="error",
+            auth_mode=resolved.auth_mode,
+            header_names=resolved.auth_header_names,
+            status_code=0,
+            duration_ms=elapsed_ms,
+            message=err_msg,
+            warnings=list(resolved.warnings),
+        )
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    redirected_to: str | None = None
+    if 300 <= resp.status_code < 400:
+        loc = (resp.headers.get("location") or "").strip()
+        if loc:
+            redirected_to = redact_secrets(loc, resolved.secret_values)
+
+    body_json: Any = None
+    try:
+        raw_text = (resp.text or "").strip()
+        if raw_text and ("json" in (resp.headers.get("content-type") or "").lower() or raw_text.startswith(("{", "["))):
+            body_json = json.loads(raw_text)
+    except Exception:
+        body_json = None
+
+    biz_code, matrix_verdict = _classify_matrix_verdict(resp.status_code, body_json)
+    if matrix_verdict == "allowed":
+        verdict: Literal["valid", "denied", "error"] = "valid"
+        valid = True
+        message = f"Session verified (HTTP {resp.status_code})."
+    elif matrix_verdict == "error":
+        verdict = "error"
+        valid = False
+        message = f"Verification endpoint returned server error (HTTP {resp.status_code})."
+    else:
+        verdict = "denied"
+        valid = False
+        if redirected_to:
+            message = f"Session denied: HTTP {resp.status_code} redirected to {redirected_to}."
+        elif biz_code is not None:
+            message = f"Session denied (HTTP {resp.status_code}, code={biz_code})."
+        else:
+            message = f"Session denied (HTTP {resp.status_code})."
+
+    return ExploreVerifyAuthResponse(
+        valid=valid,
+        verdict=verdict,
+        auth_mode=resolved.auth_mode,
+        header_names=resolved.auth_header_names,
+        status_code=resp.status_code,
+        biz_code=biz_code,
+        redirected_to=redirected_to,
+        duration_ms=elapsed_ms,
+        message=redact_secrets(message, resolved.secret_values),
+        warnings=list(resolved.warnings),
+    )
+
+
 @router.post("/explore", status_code=status.HTTP_201_CREATED)
 @router.post("/explore/seed", status_code=status.HTTP_201_CREATED)
-async def run_explore(body: ExploreRequest) -> dict[str, Any]:
+async def run_explore(
+    body: ExploreRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
     """Run an Explore & Discovery scan (single or multi-URL batch), merging by root domain."""
     has_curl = bool(body.seed_curl and body.seed_curl.strip())
     parsed_urls = _parse_batch_target_urls(body.target_url, body.target_urls)
@@ -653,6 +1131,15 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
             status_code=400,
             detail="Either seed_curl, target_url, or target_urls must be provided.",
         )
+
+    target_hint = parsed_urls[0] if parsed_urls else (extract_seed_root_domain(body.seed_curl, None) or "")
+    resolved_auth, saved_profile_out = await _resolve_request_auth(
+        db,
+        project_id=body.project_id,
+        credential_id=body.credential_id,
+        auth_cfg=body.auth,
+        target_hint=target_hint,
+    )
 
     if body.merge:
         _consolidate_legacy_explores()
@@ -668,11 +1155,14 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
             depth=body.depth,
             merge=body.merge,
             project_id=body.project_id,
+            resolved_auth=resolved_auth,
         )
+        if saved_profile_out is not None:
+            return {**merged_result, "saved_auth_profile": saved_profile_out}
         return merged_result
 
     single_url = parsed_urls[0] if parsed_urls else body.target_url
-    return await _run_single_explore_seed(
+    final_result = await _run_single_explore_seed(
         seed_curl=body.seed_curl,
         target_url=single_url,
         mode=body.mode,
@@ -682,7 +1172,11 @@ async def run_explore(body: ExploreRequest) -> dict[str, Any]:
         depth=body.depth,
         merge=body.merge,
         project_id=body.project_id,
+        resolved_auth=resolved_auth,
     )
+    if saved_profile_out is not None:
+        return {**final_result, "saved_auth_profile": saved_profile_out}
+    return final_result
 
 
 @router.post("/explore/jobs", status_code=status.HTTP_202_ACCEPTED)
@@ -746,6 +1240,15 @@ async def start_explore_job(
             else (extract_seed_root_domain(body.seed_curl, None) or "seed_curl")
         )
 
+    # Resolve auth ONCE here (never persist raw auth/headers/secrets inside _EXPLORE_JOBS!)
+    resolved_auth, _ = await _resolve_request_auth(
+        db,
+        project_id=body.project_id,
+        credential_id=body.credential_id,
+        auth_cfg=body.auth,
+        target_hint=initial_target,
+    )
+
     job_id = f"exp_{uuid.uuid4().hex[:10]}"
     now_iso = datetime.now(UTC).isoformat()
     job_state: dict[str, Any] = {
@@ -756,7 +1259,7 @@ async def start_explore_job(
         "stage": "init",
         "targets_total": targets_total,
         "targets_done": 0,
-        "current_target": initial_target,
+        "current_target": sanitize_url_for_storage(initial_target),
         "endpoints_found": 0,
         "explore_id": None,
         "started_at": now_iso,
@@ -784,13 +1287,14 @@ async def start_explore_job(
                     merge=body.merge,
                     project_id=body.project_id,
                     job_state=job_state,
+                    resolved_auth=resolved_auth,
                 )
                 count_map = dict(counts_by_url)
                 merged_result["explored_targets"] = [
                     {
                         "id": tid,
                         "portal_label": label,
-                        "base_url": u,
+                        "base_url": sanitize_url_for_storage(u),
                         "endpoints_found": int(count_map.get(u, 0)),
                     }
                     for tid, label, u in target_meta_rows
@@ -810,6 +1314,7 @@ async def start_explore_job(
                     merge=body.merge,
                     project_id=body.project_id,
                     job_state=job_state,
+                    resolved_auth=resolved_auth,
                 )
             else:
                 single_url = parsed_urls[0] if parsed_urls else body.target_url
@@ -824,6 +1329,7 @@ async def start_explore_job(
                     merge=body.merge,
                     project_id=body.project_id,
                     job_state=job_state,
+                    resolved_auth=resolved_auth,
                 )
 
             job_state["status"] = "completed"
@@ -837,12 +1343,12 @@ async def start_explore_job(
         except HTTPException as exc:
             job_state["status"] = "failed"
             job_state["stage"] = "failed"
-            job_state["error"] = str(exc.detail)
+            job_state["error"] = redact_secrets(str(exc.detail), resolved_auth.secret_values)
             job_state["finished_at"] = datetime.now(UTC).isoformat()
         except Exception as exc:
             job_state["status"] = "failed"
             job_state["stage"] = "failed"
-            job_state["error"] = str(exc)
+            job_state["error"] = redact_secrets(str(exc), resolved_auth.secret_values)
             job_state["finished_at"] = datetime.now(UTC).isoformat()
 
     task = asyncio.create_task(_runner())
@@ -922,6 +1428,14 @@ async def explore_all_project_targets(
     if not urls:
         raise HTTPException(status_code=400, detail="Selected targets have no valid URLs.")
 
+    resolved_auth, saved_profile_out = await _resolve_request_auth(
+        db,
+        project_id=project_id,
+        credential_id=body.credential_id,
+        auth_cfg=body.auth,
+        target_hint=urls[0],
+    )
+
     merged_result, counts_by_url = await _run_batch_explore_urls(
         urls,
         mode=body.mode,
@@ -931,13 +1445,14 @@ async def explore_all_project_targets(
         depth=body.depth,
         merge=body.merge,
         project_id=project_id,
+        resolved_auth=resolved_auth,
     )
     count_map = dict(counts_by_url)
     explored_targets = [
         {
             "id": tgt.id,
             "portal_label": str((tgt.scope_rules or {}).get("portal_label") or ""),
-            "base_url": u,
+            "base_url": sanitize_url_for_storage(u),
             "endpoints_found": int(count_map.get(u, 0)),
         }
         for tgt, u in target_url_pairs
@@ -946,6 +1461,8 @@ async def explore_all_project_targets(
     dest_path = _explores_root() / str(merged_result["explore_id"]) / "explore_result.json"
     if dest_path.parent.is_dir():
         write_json(dest_path, merged_result)
+    if saved_profile_out is not None:
+        return {**merged_result, "saved_auth_profile": saved_profile_out}
     return merged_result
 
 

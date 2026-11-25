@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -48,10 +50,27 @@ def get_session_factory(database_url: str | None = None) -> async_sessionmaker[A
     return _session_factory
 
 
+def _migrate_schema(sync_conn: Any) -> None:
+    inspector = inspect(sync_conn)
+    if "auth_profiles" in inspector.get_table_names():
+        existing_cols = {col["name"] for col in inspector.get_columns("auth_profiles")}
+        if "auth_type" not in existing_cols:
+            sync_conn.execute(
+                text(
+                    "ALTER TABLE auth_profiles ADD COLUMN auth_type VARCHAR(32) DEFAULT 'headers'"
+                )
+            )
+        if "login_config" not in existing_cols:
+            sync_conn.execute(
+                text("ALTER TABLE auth_profiles ADD COLUMN login_config JSON DEFAULT '{}'")
+            )
+
+
 async def init_db(database_url: str | None = None) -> None:
     engine = get_engine(database_url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_schema)
 
 
 async def get_db() -> AsyncIterator[AsyncSession]:

@@ -5,6 +5,7 @@ import type {
   AcceptancePromptResponse,
   AuthProfile,
   AuthProfileCreate,
+  AuthProfileTestLoginResponse,
   BatchTargetItem,
   BatchTargetsResponse,
   DiscoverPortalsResponse,
@@ -156,6 +157,16 @@ export function uploadStorageState(
   return apiUpload<AuthProfile>(
     `/projects/${encodeURIComponent(projectId)}/auth-profiles/${encodeURIComponent(profileId)}/storage-state`,
     formData
+  );
+}
+
+export function testAuthProfileLogin(
+  projectId: string,
+  profileId: string
+): Promise<AuthProfileTestLoginResponse> {
+  return apiFetch<AuthProfileTestLoginResponse>(
+    `/projects/${encodeURIComponent(projectId)}/auth-profiles/${encodeURIComponent(profileId)}/test-login`,
+    { method: "POST" }
   );
 }
 

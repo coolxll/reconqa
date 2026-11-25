@@ -550,27 +550,67 @@ def create_mcp_server(
         }
 
     @mcp.tool()
+    async def reconqa_list_auth_profiles(project_id: str) -> dict[str, Any]:
+        """List saved project auth profiles with masked metadata only (zero raw secrets)."""
+        profiles = await client.request_json("GET", f"/projects/{project_id}/auth-profiles")
+        items = []
+        for p in profiles or []:
+            if not isinstance(p, dict):
+                continue
+            login_cfg = p.get("login_config") if isinstance(p.get("login_config"), dict) else {}
+            extra_refs = (
+                p.get("extra_headers_ref") if isinstance(p.get("extra_headers_ref"), dict) else {}
+            )
+            items.append(
+                {
+                    "id": p.get("id"),
+                    "name": p.get("name"),
+                    "role_tag": p.get("role_tag"),
+                    "auth_type": p.get("auth_type") or "headers",
+                    "has_storage_state": bool(p.get("storage_state_path")),
+                    "header_names": sorted(str(k) for k in extra_refs.keys()),
+                    "login_url": login_cfg.get("login_url") or None,
+                    "username": login_cfg.get("username") or None,
+                }
+            )
+        return {
+            "project_id": project_id,
+            "count": len(items),
+            "auth_profiles": items,
+        }
+
+    @mcp.tool()
     async def reconqa_explore_from_seed(
         seed_curl: str | None = None,
         target_url: str | None = None,
         mode: str = "passive",
         probe_openapi_docs: bool = True,
         crawl_js: bool = True,
+        project_id: str | None = None,
+        credential_id: str | None = None,
+        auth: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Discover API endpoints, Swagger/OpenAPI docs, SPA routes, and sibling API hosts from a seed cURL or URL."""
         if not (seed_curl and seed_curl.strip()) and not (target_url and target_url.strip()):
             raise ValueError("Provide either seed_curl or target_url.")
         eff_mode = "active" if mode.strip().lower() == "active" else "passive"
+        req_body: dict[str, Any] = {
+            "seed_curl": seed_curl,
+            "target_url": target_url,
+            "mode": eff_mode,
+            "probe_openapi_docs": probe_openapi_docs,
+            "crawl_js": crawl_js,
+        }
+        if project_id:
+            req_body["project_id"] = project_id
+        if credential_id:
+            req_body["credential_id"] = credential_id
+        if auth:
+            req_body["auth"] = auth
         data = await client.request_json(
             "POST",
             "/explore",
-            json_body={
-                "seed_curl": seed_curl,
-                "target_url": target_url,
-                "mode": eff_mode,
-                "probe_openapi_docs": probe_openapi_docs,
-                "crawl_js": crawl_js,
-            },
+            json_body=req_body,
             timeout=90.0,
         )
         seed = data.get("seed") or {}
@@ -600,6 +640,9 @@ def create_mcp_server(
                 "base_url": seed.get("base_url"),
                 "root_domain": seed.get("root_domain"),
                 "api_prefix": seed.get("api_prefix"),
+                "auth_mode": seed.get("auth_mode") or "none",
+                "auth_profile_id": seed.get("auth_profile_id"),
+                "auth_profile_name": seed.get("auth_profile_name"),
                 "auth_headers_detected": seed.get("auth_headers_detected") or [],
                 "sibling_api_hosts": seed.get("sibling_api_hosts") or [],
             },

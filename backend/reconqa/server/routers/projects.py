@@ -25,6 +25,7 @@ from reconqa.models.db import get_db
 from reconqa.models.schemas import (
     AuthProfileCreate,
     AuthProfileOut,
+    AuthProfileTestLoginResponse,
     BatchTargetsCreateRequest,
     BatchTargetsCreateResponse,
     KnowledgeDocCreate,
@@ -44,6 +45,13 @@ from reconqa.models.schemas import (
     TargetUpdate,
 )
 from reconqa.models.tables import AuthProfile, KnowledgeDoc, Project, Run, Target
+from reconqa.modules.discovery.auth_resolver import (
+    headers_for_url,
+    is_unsafe_auth_url,
+    make_async_scope_request_hook,
+    redact_secrets,
+    resolve_auth_from_profile,
+)
 from reconqa.modules.hub.inventory import build_project_inventory
 from reconqa.server.routers.explore import find_project_explores
 from reconqa.utils.io import ensure_dir, slugify
@@ -306,13 +314,164 @@ async def create_auth_profile(
         project_id=project_id,
         name=body.name,
         role_tag=body.role_tag,
+        auth_type=body.auth_type,
         storage_state_path=None,
         extra_headers_ref=body.extra_headers_ref,
+        login_config=body.login_config,
     )
     db.add(profile)
     await db.commit()
     await db.refresh(profile)
     return profile
+
+
+@router.post(
+    "/projects/{project_id}/auth-profiles/{profile_id}/test-login",
+    response_model=AuthProfileTestLoginResponse,
+)
+async def test_auth_profile_login(
+    project_id: str,
+    profile_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> AuthProfileTestLoginResponse:
+    """Test and optionally refresh an AuthProfile's login session (and verify_url if configured)."""
+    await _get_project_or_404(db, project_id)
+    profile = await db.get(AuthProfile, profile_id)
+    if profile is None or profile.project_id != project_id:
+        raise HTTPException(status_code=404, detail=f"Auth profile '{profile_id}' not found")
+
+    auth_type = str(profile.auth_type or "headers").strip().lower()
+    login_cfg = dict(profile.login_config or {})
+
+    if auth_type in {"login_api", "form_login"}:
+        resolved = await asyncio.to_thread(
+            resolve_auth_from_profile, profile, force_refresh=True
+        )
+    else:
+        resolved = await asyncio.to_thread(resolve_auth_from_profile, profile)
+
+    ok = (
+        bool(resolved.login_succeeded and resolved.headers)
+        if auth_type in {"login_api", "form_login"}
+        else bool(resolved.headers)
+    )
+    status_code = resolved.login_status_code
+    messages: list[str] = []
+    if resolved.warnings:
+        messages.extend(resolved.warnings)
+
+    verify_url = str(login_cfg.get("verify_url") or "").strip()
+    if ok and verify_url:
+        if "://" not in verify_url:
+            verify_url = f"https://{verify_url}"
+        if is_unsafe_auth_url(verify_url):
+            ok = False
+            messages.append("Configured verify_url is blocked by security policy.")
+        else:
+            v_host = (urlparse(verify_url).hostname or "").lower()
+            scope_doms = list(resolved.scope_domains or [])
+            req_headers = (
+                headers_for_url(verify_url, resolved.headers, "", scope_domains=scope_doms)
+                if scope_doms
+                else dict(resolved.headers)
+            )
+            if scope_doms and not req_headers and resolved.headers:
+                ok = False
+                messages.append(
+                    "Configured verify_url host is outside scope_domains; credentials were not sent."
+                )
+            else:
+                scope_hook = make_async_scope_request_hook(
+                    v_host, scope_doms or None, list(req_headers.keys())
+                )
+                try:
+                    async with httpx.AsyncClient(
+                        verify=False,
+                        follow_redirects=False,
+                        timeout=12.0,
+                        trust_env=not _should_bypass_env_proxy(v_host),
+                        event_hooks={"request": [scope_hook]},
+                    ) as client:
+                        v_resp = await client.get(verify_url, headers=req_headers)
+                    status_code = v_resp.status_code
+                    v_json: Any = None
+                    try:
+                        if v_resp.text.strip():
+                            v_json = v_resp.json()
+                    except Exception:
+                        v_json = None
+                    biz_code, verdict = _classify_matrix_verdict(v_resp.status_code, v_json)
+                    if verdict != "allowed":
+                        ok = False
+                        loc = v_resp.headers.get("location")
+                        if loc:
+                            messages.append(
+                                f"Verify URL returned HTTP {v_resp.status_code} redirecting to {loc}."
+                            )
+                        elif biz_code is not None:
+                            messages.append(
+                                f"Verify URL denied session (HTTP {v_resp.status_code}, code={biz_code})."
+                            )
+                        else:
+                            messages.append(
+                                f"Verify URL denied session (HTTP {v_resp.status_code})."
+                            )
+                    else:
+                        messages.append(
+                            f"Verify URL confirmed valid session (HTTP {v_resp.status_code})."
+                        )
+                except httpx.HTTPError as exc:
+                    ok = False
+                    messages.append(
+                        redact_secrets(
+                            f"Verify URL request failed: {exc}", resolved.secret_values
+                        )
+                    )
+
+    # ONLY persist updated session headers for login_api / form_login after login (+ verify) succeeds;
+    # NEVER overwrite extra_headers_ref on basic / headers / bearer / cookie profiles (preserves ENV refs).
+    if ok and auth_type in {"login_api", "form_login"} and resolved.headers:
+        merged_refs = dict(profile.extra_headers_ref or {})
+        lower_to_key = {k.lower(): k for k in merged_refs}
+        for hk, hv in resolved.headers.items():
+            prev_k = lower_to_key.get(hk.lower())
+            if prev_k and prev_k != hk:
+                merged_refs.pop(prev_k, None)
+            merged_refs[hk] = hv
+            lower_to_key[hk.lower()] = hk
+        profile.extra_headers_ref = merged_refs
+
+        if resolved.storage_state_data:
+            auth_dir = ensure_dir(settings.data_dir.resolve() / "projects" / project_id / "auth")
+            safe_name = f"{slugify(profile_id)}_{slugify(profile.role_tag)}_storage_state.json"
+            dest_path = (auth_dir / safe_name).resolve()
+            if auth_dir.resolve() in dest_path.parents:
+                dest_path.write_text(
+                    json.dumps(resolved.storage_state_data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                profile.storage_state_path = str(dest_path)
+
+        await db.commit()
+        await db.refresh(profile)
+
+    if not messages:
+        if ok:
+            messages.append(
+                f"Authentication succeeded ({len(resolved.headers)} header(s) resolved)."
+            )
+        else:
+            messages.append("Authentication did not produce usable credentials.")
+
+    final_msg = redact_secrets(" ".join(messages), resolved.secret_values)
+    return AuthProfileTestLoginResponse(
+        ok=ok,
+        auth_type=auth_type,
+        header_names=sorted(resolved.headers.keys()),
+        status_code=status_code,
+        message=final_msg,
+        profile=AuthProfileOut.model_validate(profile),
+    )
 
 
 @router.get("/projects/{project_id}/auth-profiles", response_model=list[AuthProfileOut])
@@ -748,7 +907,38 @@ def _load_credential_headers(profile: AuthProfile, target_host: str) -> dict[str
     for k, v in (profile.extra_headers_ref or {}).items():
         h_name = str(k).strip()
         if h_name:
-            headers[h_name] = _resolve_header_value(str(v))
+            resolved_v = _resolve_header_value(str(v))
+            if resolved_v:
+                headers[h_name] = resolved_v
+
+    auth_type = str(getattr(profile, "auth_type", None) or "headers").strip().lower()
+    login_cfg = getattr(profile, "login_config", None)
+    cfg = dict(login_cfg) if isinstance(login_cfg, dict) else {}
+    has_authz = any(k.lower() == "authorization" and v for k, v in headers.items())
+
+    if auth_type == "basic" and not has_authz:
+        import base64
+
+        uname = _resolve_header_value(str(cfg.get("username") or ""))
+        pwd = _resolve_header_value(str(cfg.get("password") or ""))
+        if uname or pwd:
+            b64 = base64.b64encode(f"{uname}:{pwd}".encode()).decode("ascii")
+            headers["Authorization"] = f"Basic {b64}"
+    elif auth_type == "bearer" and not headers:
+        tok = _resolve_header_value(str(cfg.get("token") or ""))
+        if tok:
+            tok_hdr = str(cfg.get("token_header") or "Authorization").strip() or "Authorization"
+            tok_pfx = "Bearer " if cfg.get("token_prefix") is None else str(cfg.get("token_prefix"))
+            if tok_pfx and not tok.lower().startswith(tok_pfx.lower()):
+                headers[tok_hdr] = f"{tok_pfx}{tok}"
+            else:
+                headers[tok_hdr] = tok
+    elif auth_type == "cookie" and "Cookie" not in headers:
+        ck_raw = _resolve_header_value(str(cfg.get("cookie") or ""))
+        if ck_raw.lower().startswith("cookie:"):
+            ck_raw = ck_raw[7:].strip()
+        if ck_raw:
+            headers["Cookie"] = ck_raw
 
     return headers
 

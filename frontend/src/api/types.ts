@@ -67,20 +67,41 @@ export interface BatchTargetsResponse {
   skipped: number;
 }
 
+export type AuthType =
+  | "headers"
+  | "bearer"
+  | "cookie"
+  | "basic"
+  | "login_api"
+  | "form_login";
+
 export interface AuthProfile {
   id: string;
   project_id: string;
   name: string;
   role_tag: RoleTag | string;
+  auth_type?: AuthType | string;
   storage_state_path: string | null;
   extra_headers_ref: Record<string, string>;
+  login_config?: Record<string, unknown>;
 }
 
 export interface AuthProfileCreate {
   name: string;
   role_tag: RoleTag;
+  auth_type?: AuthType;
   storage_state_path?: string | null;
   extra_headers_ref?: Record<string, string>;
+  login_config?: Record<string, unknown>;
+}
+
+export interface AuthProfileTestLoginResponse {
+  ok: boolean;
+  auth_type: string;
+  header_names: string[];
+  status_code?: number | null;
+  message: string;
+  profile: AuthProfile;
 }
 
 export type KnowledgeDocType =

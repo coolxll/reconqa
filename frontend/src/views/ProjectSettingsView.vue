@@ -4,6 +4,9 @@ import { useRoute, useRouter } from "vue-router";
 import {
   AlertTriangle,
   CheckCircle2,
+  ClipboardPaste,
+  Eye,
+  EyeOff,
   Globe,
   KeyRound,
   Loader2,
@@ -17,6 +20,7 @@ import {
   Trash2,
   Upload,
   X,
+  Zap,
 } from "lucide-vue-next";
 import {
   createAuthProfile,
@@ -27,15 +31,18 @@ import {
   extractCredentialFromHar,
   listAuthProfiles,
   listTargets,
+  testAuthProfileLogin,
   updateTarget,
   uploadStorageState,
 } from "@/api/projects";
-import type { AuthProfile, DiscoveredPortal, RoleTag, Target } from "@/api/types";
+import type { AuthProfile, AuthType, DiscoveredPortal, RoleTag, Target } from "@/api/types";
+import { parseAuthPaste } from "@/utils/authPasteParser";
 import StatusBadge from "@/components/layout/StatusBadge.vue";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import DiscoveredPortalsPanel from "@/components/workspace/DiscoveredPortalsPanel.vue";
 import { useWorkspace } from "@/stores/workspace";
 import { useI18n } from "@/i18n";
+import "@/i18n/locales/explore";
 
 interface HeaderRefRow {
   header: string;
@@ -92,13 +99,48 @@ const discoveredRootDomain = ref("");
 
 // Credentials form
 const ROLE_PRESETS = ["admin", "pharmacy", "doctor", "assistant", "account_a", "account_b", "guest"] as const;
+const PROFILE_AUTH_TYPES: ReadonlyArray<AuthType> = ["headers", "basic", "login_api", "form_login"];
 const addingProfile = ref(false);
 const profileName = ref("");
 const profileRole = ref<RoleTag>("account_a");
+const profileAuthType = ref<AuthType>("headers");
 const headerRefRows = ref<HeaderRefRow[]>([
   { header: "Authorization", envRef: "ENV:RECONQA_ACCOUNT_A_TOKEN" },
 ]);
+// Extended login_config fields
+const basicUsername = ref("");
+const basicPassword = ref("");
+const basicVerifyUrl = ref("");
+const showBasicPassword = ref(false);
+const loginApiUrl = ref("");
+const loginApiMethod = ref<"POST" | "PUT" | "PATCH">("POST");
+const loginApiContentType = ref<"json" | "form">("json");
+const loginApiUsernameField = ref("username");
+const loginApiPasswordField = ref("password");
+const loginApiUsername = ref("");
+const loginApiPassword = ref("");
+const showLoginApiPassword = ref(false);
+const loginApiTokenJsonpath = ref("");
+const loginApiTokenHeader = ref("Authorization");
+const loginApiTokenPrefix = ref("Bearer ");
+const loginApiVerifyUrl = ref("");
+const loginApiExtraFields = ref<Record<string, unknown> | undefined>(undefined);
+const formLoginUrl = ref("");
+const formLoginUsername = ref("");
+const formLoginPassword = ref("");
+const showFormLoginPassword = ref(false);
+const formLoginVerifyUrl = ref("");
+const formUsernameSelector = ref("");
+const formPasswordSelector = ref("");
+const formSubmitSelector = ref("");
+// Burp-style Smart Paste in Settings
+const settingsSmartPasteOpen = ref(false);
+const settingsSmartPasteText = ref("");
+const settingsSmartPasteNotice = ref<string | null>(null);
+const settingsSmartPasteError = ref<string | null>(null);
+
 const uploadingProfileId = ref<string | null>(null);
+const testingProfileId = ref<string | null>(null);
 const extractingFromHar = ref(false);
 
 // General metadata edit form
@@ -213,6 +255,39 @@ async function loadDetails(): Promise<void> {
 watch(projectId, () => {
   confirmingDeleteProject.value = false;
   discoveredPortals.value = null;
+  profileName.value = "";
+  profileRole.value = "account_a";
+  profileAuthType.value = "headers";
+  headerRefRows.value = [{ header: "Authorization", envRef: "ENV:RECONQA_ACCOUNT_A_TOKEN" }];
+  basicUsername.value = "";
+  basicPassword.value = "";
+  basicVerifyUrl.value = "";
+  showBasicPassword.value = false;
+  loginApiUrl.value = "";
+  loginApiMethod.value = "POST";
+  loginApiContentType.value = "json";
+  loginApiUsernameField.value = "username";
+  loginApiPasswordField.value = "password";
+  loginApiUsername.value = "";
+  loginApiPassword.value = "";
+  showLoginApiPassword.value = false;
+  loginApiTokenJsonpath.value = "";
+  loginApiTokenHeader.value = "Authorization";
+  loginApiTokenPrefix.value = "Bearer ";
+  loginApiVerifyUrl.value = "";
+  loginApiExtraFields.value = undefined;
+  formLoginUrl.value = "";
+  formLoginUsername.value = "";
+  formLoginPassword.value = "";
+  showFormLoginPassword.value = false;
+  formLoginVerifyUrl.value = "";
+  formUsernameSelector.value = "";
+  formPasswordSelector.value = "";
+  formSubmitSelector.value = "";
+  settingsSmartPasteOpen.value = false;
+  settingsSmartPasteText.value = "";
+  settingsSmartPasteNotice.value = null;
+  settingsSmartPasteError.value = null;
   void loadDetails();
 });
 
@@ -327,23 +402,209 @@ function onSettingsPortalsAdded(added: Target[], skipped: number): void {
   notifySuccess(t("settings.target.batchAddedToast", { added: added.length, skipped }));
 }
 
+function applyHeaderPreset(preset: "bearer" | "cookie"): void {
+  if (preset === "bearer") {
+    const idx = headerRefRows.value.findIndex(
+      (r) => r.header.trim().toLowerCase() === "authorization"
+    );
+    const envName =
+      profileRole.value === "account_b"
+        ? "ENV:RECONQA_ACCOUNT_B_TOKEN"
+        : "ENV:RECONQA_ACCOUNT_A_TOKEN";
+    if (idx >= 0) {
+      headerRefRows.value[idx] = { header: "Authorization", envRef: envName };
+    } else {
+      headerRefRows.value.push({ header: "Authorization", envRef: envName });
+    }
+  } else {
+    const idx = headerRefRows.value.findIndex(
+      (r) => r.header.trim().toLowerCase() === "cookie"
+    );
+    if (idx >= 0) {
+      headerRefRows.value[idx] = { header: "Cookie", envRef: "sid=...; token=..." };
+    } else {
+      headerRefRows.value.push({ header: "Cookie", envRef: "sid=...; token=..." });
+    }
+  }
+}
+
+function normalizeLoginMethod(method: string | undefined): "POST" | "PUT" | "PATCH" {
+  const upper = (method || "POST").toUpperCase();
+  if (upper === "PUT" || upper === "PATCH") return upper;
+  return "POST";
+}
+
+function handleSettingsSmartPaste(): void {
+  settingsSmartPasteError.value = null;
+  settingsSmartPasteNotice.value = null;
+  const parsed = parseAuthPaste(settingsSmartPasteText.value);
+  if (!parsed.ok) {
+    settingsSmartPasteError.value =
+      parsed.errorKey === "empty"
+        ? t("explore.auth.smartPasteErrEmpty")
+        : t("explore.auth.smartPasteErrNone");
+    return;
+  }
+
+  if (parsed.mode === "login_api") {
+    profileAuthType.value = "login_api";
+    loginApiUrl.value = parsed.loginUrl ?? "";
+    loginApiMethod.value = normalizeLoginMethod(parsed.loginMethod);
+    loginApiContentType.value = parsed.loginContentType ?? "json";
+    loginApiUsernameField.value = parsed.usernameField ?? "username";
+    loginApiPasswordField.value = parsed.passwordField ?? "password";
+    loginApiUsername.value = parsed.username ?? "";
+    loginApiPassword.value = parsed.password ?? "";
+    loginApiExtraFields.value = parsed.extraFields;
+    settingsSmartPasteNotice.value = t("explore.auth.smartPasteExtractedLogin", {
+      method: loginApiMethod.value,
+      url: parsed.loginUrl || "",
+    });
+  } else {
+    loginApiExtraFields.value = undefined;
+    loginApiMethod.value = "POST";
+    if (parsed.mode === "basic") {
+      profileAuthType.value = "basic";
+      basicUsername.value = parsed.username ?? "";
+      basicPassword.value = parsed.password ?? "";
+      if (parsed.detectedUrl && !basicVerifyUrl.value.trim()) {
+        basicVerifyUrl.value = parsed.detectedUrl;
+      }
+      settingsSmartPasteNotice.value = t("explore.auth.smartPasteExtractedBasic", {
+        user: parsed.username ?? "",
+      });
+    } else if (parsed.mode === "bearer") {
+      profileAuthType.value = "headers";
+      const hdrName = parsed.tokenHeader || "Authorization";
+      const fullVal = `${parsed.tokenPrefix ?? "Bearer "}${parsed.token ?? ""}`;
+      headerRefRows.value = [{ header: hdrName, envRef: fullVal }];
+      settingsSmartPasteNotice.value = t("explore.auth.smartPasteExtractedBearer", {
+        header: hdrName,
+      });
+    } else if (parsed.mode === "cookie") {
+      profileAuthType.value = "headers";
+      headerRefRows.value = [{ header: "Cookie", envRef: parsed.cookie ?? "" }];
+      settingsSmartPasteNotice.value = t("explore.auth.smartPasteExtractedCookie");
+    } else if (parsed.mode === "headers" && parsed.headers) {
+      profileAuthType.value = "headers";
+      headerRefRows.value = Object.entries(parsed.headers).map(([header, envRef]) => ({
+        header,
+        envRef,
+      }));
+      settingsSmartPasteNotice.value = t("explore.auth.smartPasteExtractedHeaders", {
+        count: parsed.headerNames.length,
+        headers: parsed.headerNames.join(", "),
+      });
+    }
+  }
+
+  settingsSmartPasteText.value = "";
+  settingsSmartPasteOpen.value = false;
+}
+
+function profileAuthTypeLabel(profile: AuthProfile): string {
+  return (profile.auth_type || "headers").toLowerCase();
+}
+
+function profileAuthTypeBadgeClass(authType: string): string {
+  switch (authType) {
+    case "login_api":
+      return "bg-violet-50 text-violet-700 ring-violet-600/20";
+    case "form_login":
+      return "bg-sky-50 text-sky-700 ring-sky-600/20";
+    case "basic":
+      return "bg-amber-50 text-amber-800 ring-amber-600/20";
+    default:
+      return "bg-slate-100 text-slate-700 ring-slate-500/20";
+  }
+}
+
+function canTestProfileLogin(profile: AuthProfile): boolean {
+  const kind = profileAuthTypeLabel(profile);
+  return kind === "login_api" || kind === "form_login" || kind === "basic";
+}
+
+function formatRedactedPassword(raw: unknown): string {
+  if (typeof raw !== "string" || !raw.trim()) return "";
+  const trimmed = raw.trim();
+  if (/^env:/i.test(trimmed) || /^\$\{.+\}$/.test(trimmed)) return trimmed;
+  return "••••";
+}
+
 async function handleAddAuthProfile(): Promise<void> {
   if (!projectId.value || !profileName.value.trim()) return;
   addingProfile.value = true;
   try {
+    const authType = profileAuthType.value;
     const extraHeadersRef: Record<string, string> = {};
-    for (const row of headerRefRows.value) {
-      const k = row.header.trim();
-      const v = row.envRef.trim();
-      if (k && v) extraHeadersRef[k] = v;
+    let loginConfig: Record<string, unknown> | undefined;
+
+    if (authType === "headers") {
+      for (const row of headerRefRows.value) {
+        const k = row.header.trim();
+        const v = row.envRef.trim();
+        if (k && v) extraHeadersRef[k] = v;
+      }
+    } else if (authType === "basic") {
+      loginConfig = {
+        username: basicUsername.value.trim(),
+        password: basicPassword.value,
+        ...(basicVerifyUrl.value.trim() ? { verify_url: basicVerifyUrl.value.trim() } : {}),
+      };
+    } else if (authType === "login_api") {
+      loginConfig = {
+        login_url: loginApiUrl.value.trim(),
+        login_method: loginApiMethod.value,
+        login_content_type: loginApiContentType.value,
+        username_field: loginApiUsernameField.value.trim() || "username",
+        password_field: loginApiPasswordField.value.trim() || "password",
+        username: loginApiUsername.value.trim(),
+        password: loginApiPassword.value,
+        token_header: loginApiTokenHeader.value.trim() || "Authorization",
+        token_prefix: loginApiTokenPrefix.value,
+        ...(loginApiTokenJsonpath.value.trim()
+          ? { token_jsonpath: loginApiTokenJsonpath.value.trim() }
+          : {}),
+        ...(loginApiVerifyUrl.value.trim() ? { verify_url: loginApiVerifyUrl.value.trim() } : {}),
+        ...(loginApiExtraFields.value && Object.keys(loginApiExtraFields.value).length > 0
+          ? { extra_fields: loginApiExtraFields.value }
+          : {}),
+      };
+    } else if (authType === "form_login") {
+      loginConfig = {
+        login_url: formLoginUrl.value.trim(),
+        username: formLoginUsername.value.trim(),
+        password: formLoginPassword.value,
+        ...(formLoginVerifyUrl.value.trim() ? { verify_url: formLoginVerifyUrl.value.trim() } : {}),
+        ...(formUsernameSelector.value.trim()
+          ? { username_selector: formUsernameSelector.value.trim() }
+          : {}),
+        ...(formPasswordSelector.value.trim()
+          ? { password_selector: formPasswordSelector.value.trim() }
+          : {}),
+        ...(formSubmitSelector.value.trim()
+          ? { submit_selector: formSubmitSelector.value.trim() }
+          : {}),
+      };
     }
+
     const created = await createAuthProfile(projectId.value, {
       name: profileName.value.trim(),
       role_tag: profileRole.value,
+      auth_type: authType,
       extra_headers_ref: extraHeadersRef,
+      login_config: loginConfig,
     });
     authProfiles.value = [...authProfiles.value, created];
     profileName.value = "";
+    basicPassword.value = "";
+    loginApiPassword.value = "";
+    formLoginPassword.value = "";
+    loginApiMethod.value = "POST";
+    loginApiExtraFields.value = undefined;
+    settingsSmartPasteText.value = "";
+    settingsSmartPasteNotice.value = null;
+    settingsSmartPasteError.value = null;
     notifySuccess(
       t("projects.toast.profileCreated", { name: created.name, role: created.role_tag })
     );
@@ -351,6 +612,36 @@ async function handleAddAuthProfile(): Promise<void> {
     notifyError(err, t("projects.err.createProfile"));
   } finally {
     addingProfile.value = false;
+  }
+}
+
+async function handleTestProfileLogin(profile: AuthProfile): Promise<void> {
+  if (!projectId.value || testingProfileId.value) return;
+  testingProfileId.value = profile.id;
+  try {
+    const res = await testAuthProfileLogin(projectId.value, profile.id);
+    if (res.profile) {
+      authProfiles.value = authProfiles.value.map((p) =>
+        p.id === res.profile.id ? res.profile : p
+      );
+    }
+    if (res.ok) {
+      const headersText = (res.header_names || []).join(", ");
+      notifySuccess(
+        headersText
+          ? t("settings.auth.testLoginOk", { message: res.message, headers: headersText })
+          : t("settings.auth.testLoginOkNoHeaders", { message: res.message })
+      );
+    } else {
+      notifyError(
+        new Error(t("settings.auth.testLoginFail", { message: res.message })),
+        t("settings.auth.testLoginErr")
+      );
+    }
+  } catch (err) {
+    notifyError(err, t("settings.auth.testLoginErr"));
+  } finally {
+    testingProfileId.value = null;
   }
 }
 
@@ -767,8 +1058,69 @@ onMounted(() => {
       </div>
 
       <form class="card p-5" @submit.prevent="handleAddAuthProfile">
-        <h3 class="text-sm font-semibold text-slate-900">{{ t("projects.auth.formTitle") }}</h3>
-        <p class="mt-0.5 text-xs text-slate-500">{{ t("projects.auth.formDesc") }}</p>
+        <div class="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <h3 class="text-sm font-semibold text-slate-900">{{ t("projects.auth.formTitle") }}</h3>
+            <p class="mt-0.5 text-xs text-slate-500">{{ t("projects.auth.formDesc") }}</p>
+          </div>
+          <button
+            type="button"
+            data-testid="settings-smart-paste-toggle"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50/70 px-3 py-1.5 text-xs font-medium text-indigo-700 transition hover:bg-indigo-100"
+            @click="settingsSmartPasteOpen = !settingsSmartPasteOpen"
+          >
+            <ClipboardPaste class="h-3.5 w-3.5" />
+            <span>{{ t("settings.auth.smartPasteBtn") }}</span>
+          </button>
+        </div>
+
+        <!-- Burp-Style Smart Paste Inline Box -->
+        <div
+          v-if="settingsSmartPasteOpen"
+          class="mt-3 space-y-2 rounded-xl border border-indigo-200 bg-indigo-50/40 p-3.5"
+        >
+          <p class="text-[11px] text-indigo-900">{{ t("settings.auth.smartPasteHint") }}</p>
+          <textarea
+            v-model="settingsSmartPasteText"
+            data-testid="settings-smart-paste-input"
+            rows="3"
+            class="input-field bg-white font-mono text-[11px] leading-relaxed"
+            :placeholder="t('explore.auth.smartPastePlaceholder')"
+          />
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <p v-if="settingsSmartPasteError" class="text-[11px] font-medium text-rose-600">
+              {{ settingsSmartPasteError }}
+            </p>
+            <span v-else />
+            <button
+              type="button"
+              data-testid="settings-smart-paste-apply"
+              class="btn-primary !px-3 !py-1 !text-xs"
+              @click="handleSettingsSmartPaste"
+            >
+              <Sparkles class="h-3 w-3" />
+              <span>{{ t("settings.auth.smartPasteApply") }}</span>
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-if="settingsSmartPasteNotice"
+          class="mt-3 flex items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs text-emerald-800"
+        >
+          <span class="flex items-center gap-1.5">
+            <CheckCircle2 class="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+            <span>{{ settingsSmartPasteNotice }}</span>
+          </span>
+          <button
+            type="button"
+            class="text-emerald-600 hover:text-emerald-800"
+            @click="settingsSmartPasteNotice = null"
+          >
+            <X class="h-3.5 w-3.5" />
+          </button>
+        </div>
+
         <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
             <label class="mb-1 block text-xs font-medium text-slate-700">
@@ -814,18 +1166,59 @@ onMounted(() => {
           </div>
         </div>
 
-        <div class="mt-4">
-          <div class="flex items-center justify-between">
+        <!-- Auth Type Selector -->
+        <div class="mt-4" data-testid="auth-type-selector">
+          <label class="mb-1.5 block text-xs font-medium text-slate-700">
+            {{ t("settings.auth.typeLabel") }}
+          </label>
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              v-for="aType in PROFILE_AUTH_TYPES"
+              :key="aType"
+              type="button"
+              :data-testid="`auth-type-opt-${aType}`"
+              class="rounded-lg px-3 py-1.5 text-xs font-medium transition"
+              :class="
+                profileAuthType === aType
+                  ? 'bg-indigo-600 text-white shadow-sm'
+                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+              "
+              @click="profileAuthType = aType"
+            >
+              {{ t(`settings.auth.type.${aType}`) }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Auth Type: headers -->
+        <div v-if="profileAuthType === 'headers'" class="mt-4">
+          <div class="flex flex-wrap items-center justify-between gap-2">
             <label class="text-xs font-medium text-slate-700">
               {{ t("projects.auth.headersLabel") }}
             </label>
-            <button
-              type="button"
-              class="text-xs font-medium text-indigo-600 hover:text-indigo-800"
-              @click="headerRefRows.push({ header: '', envRef: '' })"
-            >
-              {{ t("projects.auth.addHeaderBtn") }}
-            </button>
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                class="rounded bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-indigo-50 hover:text-indigo-700"
+                @click="applyHeaderPreset('bearer')"
+              >
+                {{ t("settings.auth.presetBearer") }}
+              </button>
+              <button
+                type="button"
+                class="rounded bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:bg-indigo-50 hover:text-indigo-700"
+                @click="applyHeaderPreset('cookie')"
+              >
+                {{ t("settings.auth.presetCookie") }}
+              </button>
+              <button
+                type="button"
+                class="text-xs font-medium text-indigo-600 hover:text-indigo-800"
+                @click="headerRefRows.push({ header: '', envRef: '' })"
+              >
+                {{ t("projects.auth.addHeaderBtn") }}
+              </button>
+            </div>
           </div>
 
           <div class="mt-2 space-y-2">
@@ -856,6 +1249,320 @@ onMounted(() => {
           <p class="mt-2 text-[11px] leading-relaxed text-slate-500">
             {{ t("settings.auth.valueSupportHint") }}
           </p>
+        </div>
+
+        <!-- Auth Type: basic -->
+        <div v-else-if="profileAuthType === 'basic'" class="mt-4 space-y-3">
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.usernameLabel") }}
+              </label>
+              <input
+                v-model="basicUsername"
+                type="text"
+                required
+                :placeholder="t('settings.auth.usernamePlaceholder')"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.passwordLabel") }}
+              </label>
+              <div class="relative">
+                <input
+                  v-model="basicPassword"
+                  :type="showBasicPassword ? 'text' : 'password'"
+                  required
+                  :placeholder="t('settings.auth.passwordPlaceholder')"
+                  class="input-field !py-1.5 pr-8 font-mono text-xs"
+                />
+                <button
+                  type="button"
+                  class="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                  @click="showBasicPassword = !showBasicPassword"
+                >
+                  <EyeOff v-if="showBasicPassword" class="h-3.5 w-3.5" />
+                  <Eye v-else class="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-700">
+              {{ t("settings.auth.verifyUrlLabel") }}
+            </label>
+            <input
+              v-model="basicVerifyUrl"
+              type="url"
+              :placeholder="t('settings.auth.verifyUrlPlaceholder')"
+              class="input-field !py-1.5 font-mono text-xs"
+            />
+          </div>
+          <p class="text-[11px] text-slate-500">{{ t("settings.auth.envSupportHint") }}</p>
+        </div>
+
+        <!-- Auth Type: login_api -->
+        <div v-else-if="profileAuthType === 'login_api'" class="mt-4 space-y-3">
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-12">
+            <div class="sm:col-span-6">
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.loginUrlLabel") }}
+              </label>
+              <input
+                v-model="loginApiUrl"
+                type="url"
+                required
+                :placeholder="t('settings.auth.loginUrlPlaceholder')"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div class="sm:col-span-2">
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("explore.auth.loginMethodLabel") }}
+              </label>
+              <select
+                v-model="loginApiMethod"
+                data-testid="settings-auth-login-method-select"
+                class="input-field !py-1.5 font-mono text-xs"
+              >
+                <option value="POST">POST</option>
+                <option value="PUT">PUT</option>
+                <option value="PATCH">PATCH</option>
+              </select>
+            </div>
+            <div class="sm:col-span-4">
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.contentTypeLabel") }}
+              </label>
+              <div class="flex rounded-lg border border-slate-200 bg-slate-50 p-0.5 text-xs">
+                <button
+                  type="button"
+                  class="flex-1 rounded-md px-2 py-1 font-medium transition"
+                  :class="
+                    loginApiContentType === 'json'
+                      ? 'bg-white text-indigo-700 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  "
+                  @click="loginApiContentType = 'json'"
+                >
+                  JSON
+                </button>
+                <button
+                  type="button"
+                  class="flex-1 rounded-md px-2 py-1 font-medium transition"
+                  :class="
+                    loginApiContentType === 'form'
+                      ? 'bg-white text-indigo-700 shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  "
+                  @click="loginApiContentType = 'form'"
+                >
+                  Form
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-4">
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.usernameFieldLabel") }}
+              </label>
+              <input
+                v-model="loginApiUsernameField"
+                type="text"
+                placeholder="username"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.usernameLabel") }}
+              </label>
+              <input
+                v-model="loginApiUsername"
+                type="text"
+                required
+                :placeholder="t('settings.auth.usernamePlaceholder')"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.passwordFieldLabel") }}
+              </label>
+              <input
+                v-model="loginApiPasswordField"
+                type="text"
+                placeholder="password"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.passwordLabel") }}
+              </label>
+              <div class="relative">
+                <input
+                  v-model="loginApiPassword"
+                  :type="showLoginApiPassword ? 'text' : 'password'"
+                  required
+                  :placeholder="t('settings.auth.passwordPlaceholder')"
+                  class="input-field !py-1.5 pr-8 font-mono text-xs"
+                />
+                <button
+                  type="button"
+                  class="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                  @click="showLoginApiPassword = !showLoginApiPassword"
+                >
+                  <EyeOff v-if="showLoginApiPassword" class="h-3.5 w-3.5" />
+                  <Eye v-else class="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.tokenJsonpathLabel") }}
+              </label>
+              <input
+                v-model="loginApiTokenJsonpath"
+                type="text"
+                :placeholder="t('settings.auth.tokenJsonpathPlaceholder')"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.tokenHeaderLabel") }}
+              </label>
+              <input
+                v-model="loginApiTokenHeader"
+                type="text"
+                placeholder="Authorization"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.tokenPrefixLabel") }}
+              </label>
+              <input
+                v-model="loginApiTokenPrefix"
+                type="text"
+                placeholder="Bearer "
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-700">
+              {{ t("settings.auth.verifyUrlLabel") }}
+            </label>
+            <input
+              v-model="loginApiVerifyUrl"
+              type="url"
+              :placeholder="t('settings.auth.verifyUrlPlaceholder')"
+              class="input-field !py-1.5 font-mono text-xs"
+            />
+          </div>
+          <p class="text-[11px] text-slate-500">{{ t("settings.auth.envSupportHint") }}</p>
+        </div>
+
+        <!-- Auth Type: form_login -->
+        <div v-else-if="profileAuthType === 'form_login'" class="mt-4 space-y-3">
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.loginUrlLabel") }}
+              </label>
+              <input
+                v-model="formLoginUrl"
+                type="url"
+                required
+                :placeholder="t('settings.auth.formLoginUrlPlaceholder')"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.usernameLabel") }}
+              </label>
+              <input
+                v-model="formLoginUsername"
+                type="text"
+                required
+                :placeholder="t('settings.auth.usernamePlaceholder')"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+            <div>
+              <label class="mb-1 block text-xs font-medium text-slate-700">
+                {{ t("settings.auth.passwordLabel") }}
+              </label>
+              <div class="relative">
+                <input
+                  v-model="formLoginPassword"
+                  :type="showFormLoginPassword ? 'text' : 'password'"
+                  required
+                  :placeholder="t('settings.auth.passwordPlaceholder')"
+                  class="input-field !py-1.5 pr-8 font-mono text-xs"
+                />
+                <button
+                  type="button"
+                  class="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600"
+                  @click="showFormLoginPassword = !showFormLoginPassword"
+                >
+                  <EyeOff v-if="showFormLoginPassword" class="h-3.5 w-3.5" />
+                  <Eye v-else class="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <label class="mb-1 block text-xs font-medium text-slate-700">
+              {{ t("settings.auth.verifyUrlLabel") }}
+            </label>
+            <input
+              v-model="formLoginVerifyUrl"
+              type="url"
+              :placeholder="t('settings.auth.verifyUrlPlaceholder')"
+              class="input-field !py-1.5 font-mono text-xs"
+            />
+          </div>
+
+          <div>
+            <p class="mb-1.5 text-[11px] font-medium text-slate-600">
+              {{ t("settings.auth.selectorsOptional") }}
+            </p>
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <input
+                v-model="formUsernameSelector"
+                type="text"
+                :placeholder="`${t('settings.auth.usernameSelectorLabel')} (input[name=username])`"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+              <input
+                v-model="formPasswordSelector"
+                type="text"
+                :placeholder="`${t('settings.auth.passwordSelectorLabel')} (input[type=password])`"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+              <input
+                v-model="formSubmitSelector"
+                type="text"
+                :placeholder="`${t('settings.auth.submitSelectorLabel')} (button[type=submit])`"
+                class="input-field !py-1.5 font-mono text-xs"
+              />
+            </div>
+          </div>
+          <p class="text-[11px] text-slate-500">{{ t("settings.auth.envSupportHint") }}</p>
         </div>
 
         <div class="mt-4 flex justify-end">
@@ -897,10 +1604,38 @@ onMounted(() => {
                 <div class="flex flex-wrap items-center gap-2">
                   <span class="text-sm font-semibold text-slate-900">{{ profile.name }}</span>
                   <StatusBadge :status="profile.role_tag" />
+                  <span
+                    data-testid="profile-auth-type-badge"
+                    class="rounded-full px-2 py-0.5 font-mono text-[10px] font-semibold ring-1 ring-inset"
+                    :class="profileAuthTypeBadgeClass(profileAuthTypeLabel(profile))"
+                  >
+                    {{ profileAuthTypeLabel(profile) }}
+                  </span>
                 </div>
                 <p class="mt-0.5 font-mono text-[11px] text-slate-400">ID: {{ profile.id }}</p>
               </div>
-              <div class="flex shrink-0 items-center gap-2">
+              <div class="flex shrink-0 flex-wrap items-center gap-2">
+                <button
+                  v-if="canTestProfileLogin(profile)"
+                  type="button"
+                  data-testid="test-login-profile-btn"
+                  class="btn-secondary !px-2.5 !py-1.5 !text-xs"
+                  :disabled="testingProfileId === profile.id"
+                  @click="handleTestProfileLogin(profile)"
+                >
+                  <Loader2
+                    v-if="testingProfileId === profile.id"
+                    class="h-3.5 w-3.5 animate-spin text-emerald-600"
+                  />
+                  <Zap v-else class="h-3.5 w-3.5 text-emerald-600" />
+                  <span>
+                    {{
+                      testingProfileId === profile.id
+                        ? t("settings.auth.testingLoginBtn")
+                        : t("settings.auth.testLoginBtn")
+                    }}
+                  </span>
+                </button>
                 <label
                   class="btn-secondary cursor-pointer !px-2.5 !py-1.5 !text-xs"
                   :class="uploadingProfileId === profile.id ? 'opacity-60' : ''"
@@ -935,6 +1670,34 @@ onMounted(() => {
             </div>
 
             <div class="flex flex-wrap items-center gap-2 text-xs">
+              <span
+                v-if="profile.login_config && profile.login_config.login_url"
+                class="inline-flex items-center gap-1 rounded-md bg-violet-50 px-2 py-1 font-mono text-[11px] text-violet-800 ring-1 ring-inset ring-violet-600/20"
+              >
+                <span class="font-semibold">login_url:</span>
+                <span>{{ String(profile.login_config.login_url) }}</span>
+              </span>
+              <span
+                v-if="profile.login_config && profile.login_config.username"
+                class="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2 py-1 font-mono text-[11px] text-slate-700"
+              >
+                <span class="font-semibold">username:</span>
+                <span>{{ String(profile.login_config.username) }}</span>
+              </span>
+              <span
+                v-if="profile.login_config && profile.login_config.password"
+                class="inline-flex items-center gap-1 rounded-md bg-slate-100 px-2 py-1 font-mono text-[11px] text-slate-700"
+              >
+                <span class="font-semibold">password:</span>
+                <span>{{ formatRedactedPassword(profile.login_config.password) }}</span>
+              </span>
+              <span
+                v-if="profile.login_config && profile.login_config.verify_url"
+                class="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-1 font-mono text-[11px] text-emerald-800 ring-1 ring-inset ring-emerald-600/20"
+              >
+                <span class="font-semibold">verify_url:</span>
+                <span>{{ String(profile.login_config.verify_url) }}</span>
+              </span>
               <span
                 class="inline-flex items-center gap-1.5 rounded-md px-2 py-1 font-mono text-[11px]"
                 :class="

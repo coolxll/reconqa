@@ -63,8 +63,10 @@ class AuthProfile(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(128))
     role_tag: Mapped[str] = mapped_column(String(64), default="account_a")
+    auth_type: Mapped[str] = mapped_column(String(32), default="headers")
     storage_state_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     extra_headers_ref: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    login_config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
     project: Mapped[Project] = relationship(back_populates="auth_profiles")
 

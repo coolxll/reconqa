@@ -19,6 +19,13 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from reconqa.config import settings
+from reconqa.modules.discovery.auth_resolver import (
+    _host_in_scope,
+    headers_for_url,
+    make_scope_request_hook,
+    redact_secrets,
+    sanitize_url_for_storage,
+)
 from reconqa.modules.discovery.runner import run_discovery
 from reconqa.modules.discovery.spa_parser import extract_spa_routes
 from reconqa.modules.hub.har_parser import is_telemetry_endpoint
@@ -582,6 +589,13 @@ def merge_explore_results(
             if str(h).strip()
         }
     )
+    in_auth_mode = str(in_seed.get("auth_mode") or "").strip()
+    ex_auth_mode = str(ex_seed.get("auth_mode") or "").strip()
+    merged_auth_mode = (
+        in_auth_mode
+        if (in_auth_mode and in_auth_mode != "none")
+        else (ex_auth_mode or in_auth_mode or "none")
+    )
     merged_seed = {
         "type": in_seed.get("type") or ex_seed.get("type") or "url",
         "base_url": in_seed.get("base_url") or ex_seed.get("base_url") or "",
@@ -589,6 +603,9 @@ def merge_explore_results(
         "seed_url": in_seed.get("seed_url") or ex_seed.get("seed_url") or "",
         "api_prefix": in_seed.get("api_prefix") or ex_seed.get("api_prefix") or "",
         "auth_headers_detected": merged_auth_hdrs,
+        "auth_mode": merged_auth_mode,
+        "auth_profile_id": in_seed.get("auth_profile_id") or ex_seed.get("auth_profile_id"),
+        "auth_profile_name": in_seed.get("auth_profile_name") or ex_seed.get("auth_profile_name"),
         "sibling_api_hosts": merged_siblings,
     }
 
@@ -832,6 +849,7 @@ def _probe_portals_with_cli(
     candidate_urls: list[str],
     *,
     timeout_sec: int,
+    extra_headers: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     cmd = [
         httpx_bin,
@@ -844,6 +862,12 @@ def _probe_portals_with_cli(
         "-threads",
         "20",
     ]
+    for hk, hv in (extra_headers or {}).items():
+        h_name = str(hk or "").strip()
+        h_val = str(hv or "").strip()
+        if not h_name or not h_val or h_name.startswith(":") or h_name.lower() in _SKIP_PROBE_HEADERS:
+            continue
+        cmd.extend(["-H", f"{h_name}: {h_val}"])
     proxy_val = (
         os.environ.get("HTTPS_PROXY")
         or os.environ.get("https_proxy")
@@ -907,6 +931,11 @@ def _is_unsafe_redirect_url(location_url: str, base_url: str) -> bool:
         ip = ipaddress.ip_address(host)
         if isinstance(ip, ipaddress.IPv4Address) and ip in _LINK_LOCAL_V4:
             return True
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            if ip.ipv4_mapped in _LINK_LOCAL_V4 or str(ip.ipv4_mapped) in _BLOCKED_REDIRECT_HOSTS:
+                return True
+        if ip.is_link_local:
+            return True
     except ValueError:
         pass
     return False
@@ -927,18 +956,37 @@ def _probe_portals_with_python(
     candidate_urls: list[str],
     *,
     timeout_sec: int,
+    extra_headers: dict[str, str] | None = None,
+    allowed_root_domain: str = "",
+    scope_domains: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     per_req_timeout = httpx.Timeout(min(4.0, float(timeout_sec)), connect=3.0)
+    clean_headers = {
+        str(k).strip(): str(v).strip()
+        for k, v in (extra_headers or {}).items()
+        if str(k).strip()
+        and str(v).strip()
+        and not str(k).strip().startswith(":")
+        and str(k).strip().lower() not in _SKIP_PROBE_HEADERS
+    }
 
     def _check_one(u: str) -> dict[str, Any] | None:
         try:
+            req_headers = (
+                headers_for_url(u, clean_headers, allowed_root_domain, scope_domains=scope_domains)
+                if (allowed_root_domain or scope_domains)
+                else clean_headers
+            )
+            scope_hook = make_scope_request_hook(
+                allowed_root_domain, scope_domains, list(clean_headers.keys())
+            )
             with httpx.Client(
                 timeout=per_req_timeout,
                 follow_redirects=True,
                 verify=False,
-                event_hooks={"response": [_safe_redirect_hook]},
+                event_hooks={"request": [scope_hook], "response": [_safe_redirect_hook]},
             ) as client:
-                resp = client.get(u)
+                resp = client.get(u, headers=req_headers or None)
                 title = ""
                 ctype = (resp.headers.get("content-type") or "").lower()
                 if "html" in ctype or "<title" in resp.text[:4096].lower():
@@ -962,7 +1010,13 @@ def _probe_portals_with_python(
     return rows
 
 
-def discover_sibling_portals(seed_url: str, timeout_sec: int = 12) -> dict[str, Any]:
+def discover_sibling_portals(
+    seed_url: str,
+    timeout_sec: int = 12,
+    *,
+    extra_headers: dict[str, str] | None = None,
+    scope_domains: list[str] | None = None,
+) -> dict[str, Any]:
     """Probe ~28 high-signal sibling portal subdomains matching the seed host's environment suffix."""
     raw = (seed_url or "").strip()
     if raw and "://" not in raw:
@@ -995,9 +1049,51 @@ def discover_sibling_portals(seed_url: str, timeout_sec: int = 12) -> dict[str, 
     candidate_urls = [f"https://{h}" for h in candidate_hosts]
     httpx_bin = _resolve_httpx_cli()
     if httpx_bin:
-        raw_rows = _probe_portals_with_cli(httpx_bin, candidate_urls, timeout_sec=timeout_sec)
+        if extra_headers:
+            in_scope_urls = [
+                u for u in candidate_urls if headers_for_url(u, extra_headers, root_domain, scope_domains)
+            ]
+            out_scope_urls = [
+                u for u in candidate_urls if not headers_for_url(u, extra_headers, root_domain, scope_domains)
+            ]
+            raw_rows = []
+            if in_scope_urls:
+                raw_rows.extend(
+                    _probe_portals_with_cli(
+                        httpx_bin,
+                        in_scope_urls,
+                        timeout_sec=timeout_sec,
+                        extra_headers=extra_headers,
+                    )
+                )
+            if out_scope_urls:
+                raw_rows.extend(
+                    _probe_portals_with_cli(
+                        httpx_bin,
+                        out_scope_urls,
+                        timeout_sec=timeout_sec,
+                    )
+                )
+        else:
+            raw_rows = _probe_portals_with_cli(
+                httpx_bin,
+                candidate_urls,
+                timeout_sec=timeout_sec,
+            )
     else:
-        raw_rows = _probe_portals_with_python(candidate_urls, timeout_sec=timeout_sec)
+        if extra_headers or scope_domains:
+            raw_rows = _probe_portals_with_python(
+                candidate_urls,
+                timeout_sec=timeout_sec,
+                extra_headers=extra_headers,
+                allowed_root_domain=root_domain,
+                scope_domains=scope_domains,
+            )
+        else:
+            raw_rows = _probe_portals_with_python(
+                candidate_urls,
+                timeout_sec=timeout_sec,
+            )
 
     portals_by_host: dict[str, dict[str, Any]] = {}
     for rec in raw_rows:
@@ -1056,6 +1152,8 @@ def _probe_openapi_on_origin(
     http_timeout: httpx.Timeout,
     endpoints_bucket: dict[tuple[str, str], dict[str, Any]],
     openapi_docs_found: list[dict[str, Any]],
+    allowed_root_domain: str = "",
+    scope_domains: list[str] | None = None,
 ) -> None:
     host = (urlparse(origin).hostname or "").lower()
     probe_queue = list(_OPENAPI_CANDIDATE_PATHS)
@@ -1067,12 +1165,15 @@ def _probe_openapi_on_origin(
 
     seen_doc_urls: set[str] = set()
     q_idx = 0
+    scope_hook = make_scope_request_hook(
+        allowed_root_domain, scope_domains, list(probe_headers.keys())
+    )
     with httpx.Client(
         timeout=http_timeout,
         follow_redirects=True,
         trust_env=not _is_loopback(host),
         verify=False,
-        event_hooks={"response": [_safe_redirect_hook]},
+        event_hooks={"request": [scope_hook], "response": [_safe_redirect_hook]},
     ) as client:
         while q_idx < len(probe_queue) and len(seen_doc_urls) < 25:
             cand_path = probe_queue[q_idx]
@@ -1085,8 +1186,18 @@ def _probe_openapi_on_origin(
             if probe_url in seen_doc_urls:
                 continue
             seen_doc_urls.add(probe_url)
+            req_headers = (
+                headers_for_url(
+                    probe_url,
+                    probe_headers,
+                    allowed_root_domain,
+                    scope_domains=scope_domains,
+                )
+                if (allowed_root_domain or scope_domains)
+                else probe_headers
+            )
             try:
-                resp = client.get(probe_url, headers=probe_headers)
+                resp = client.get(probe_url, headers=req_headers)
             except httpx.HTTPError:
                 continue
             if resp.status_code != 200:
@@ -1169,6 +1280,11 @@ def explore_from_seed(
     timeout: int = 30,
     explore_id: str | None = None,
     on_progress: Callable[[str, int, str], None] | None = None,
+    extra_headers: dict[str, str] | None = None,
+    auth_meta: dict[str, Any] | None = None,
+    secret_values: list[str] | None = None,
+    scope_domains: list[str] | None = None,
+    allowed_root_domain: str | None = None,
 ) -> dict[str, Any]:
     """Explore APIs, OpenAPI docs, JS/SPA routes, sibling API hosts, and assets from a seed cURL or URL."""
     out_dir = ensure_dir(Path(out_dir).resolve())
@@ -1252,12 +1368,16 @@ def explore_from_seed(
                 except json.JSONDecodeError:
                     pass
 
+            safe_req_url = sanitize_url_for_storage(req_url)
+            safe_ep_base = (
+                f"{p_url.scheme}://{p_url.netloc.rsplit('@', 1)[-1]}" if p_url.netloc else base_url
+            )
             _add_endpoint(
                 endpoints_bucket,
                 method=req_method,
                 path=p_url.path or "/",
-                base_url=f"{p_url.scheme}://{p_url.netloc}" if p_url.netloc else base_url,
-                url=req_url,
+                base_url=safe_ep_base,
+                url=safe_req_url,
                 source="seed_curl",
                 inferred_params=q_params,
                 snippet="Imported from seed cURL/traffic",
@@ -1294,6 +1414,36 @@ def explore_from_seed(
     else:
         raise ValueError("Either seed_curl or target_url is required")
 
+    # Merge explicit auth extra_headers into probe_headers (overlays/augments seed_curl headers)
+    detected_auth_merged: set[str] = set(auth_headers_detected)
+    if extra_headers:
+        lower_to_key = {k.lower(): k for k in probe_headers}
+        for hk, hv in extra_headers.items():
+            h_name = str(hk or "").strip()
+            h_val = str(hv or "").strip()
+            low = h_name.lower()
+            if not h_name or not h_val or low.startswith(":") or low in _SKIP_PROBE_HEADERS:
+                continue
+            prev_k = lower_to_key.get(low)
+            if prev_k and prev_k != h_name:
+                probe_headers.pop(prev_k, None)
+            probe_headers[h_name] = h_val
+            lower_to_key[low] = h_name
+            detected_auth_merged.add(h_name)
+    auth_headers_detected = sorted(detected_auth_merged)
+
+    eff_scope_domains = list(scope_domains or [])
+    if not eff_scope_domains and isinstance(auth_meta, dict) and isinstance(auth_meta.get("scope_domains"), list):
+        eff_scope_domains = [str(d).strip() for d in auth_meta["scope_domains"] if str(d).strip()]
+    allowed_root = (
+        allowed_root_domain.strip().lower()
+        if isinstance(allowed_root_domain, str) and allowed_root_domain.strip()
+        else (root_domain or seed_host)
+    )
+    scope_hook = make_scope_request_hook(
+        allowed_root, eff_scope_domains or None, list(probe_headers.keys())
+    )
+
     loopback = _is_loopback(seed_host)
     http_timeout = httpx.Timeout(min(float(timeout), 10.0), connect=5.0)
     collected_urls: list[str] = [base_url]
@@ -1312,6 +1462,8 @@ def explore_from_seed(
             http_timeout=http_timeout,
             endpoints_bucket=endpoints_bucket,
             openapi_docs_found=openapi_docs_found,
+            allowed_root_domain=allowed_root,
+            scope_domains=eff_scope_domains,
         )
 
     # --- Step C: HTML + Same-Origin JS Bundle + Webpack/Vite Chunk Extraction ---
@@ -1345,11 +1497,17 @@ def explore_from_seed(
             follow_redirects=True,
             trust_env=not loopback,
             verify=False,
-            event_hooks={"response": [_safe_redirect_hook]},
+            event_hooks={"request": [scope_hook], "response": [_safe_redirect_hook]},
         ) as client:
             for page_idx, page_url in enumerate(pages_to_fetch):
                 try:
-                    resp = client.get(page_url, headers=probe_headers)
+                    page_hdrs = headers_for_url(
+                        page_url,
+                        probe_headers,
+                        allowed_root,
+                        scope_domains=eff_scope_domains,
+                    )
+                    resp = client.get(page_url, headers=page_hdrs)
                 except httpx.HTTPError as exc:
                     warnings.append(f"Failed to fetch page {page_url}: {exc}")
                     continue
@@ -1381,14 +1539,20 @@ def explore_from_seed(
         def _fetch_js_one(js_url: str) -> tuple[str, str | None]:
             h = (urlparse(js_url).hostname or "").lower()
             try:
+                js_hdrs = headers_for_url(
+                    js_url,
+                    probe_headers,
+                    allowed_root,
+                    scope_domains=eff_scope_domains,
+                )
                 with httpx.Client(
                     timeout=http_timeout,
                     follow_redirects=True,
                     trust_env=not _is_loopback(h),
                     verify=False,
-                    event_hooks={"response": [_safe_redirect_hook]},
+                    event_hooks={"request": [scope_hook], "response": [_safe_redirect_hook]},
                 ) as c:
-                    r = c.get(js_url, headers=probe_headers)
+                    r = c.get(js_url, headers=js_hdrs)
                     if r.status_code == 200 and r.text.strip():
                         return js_url, r.text
             except httpx.HTTPError:
@@ -1460,6 +1624,8 @@ def explore_from_seed(
                     http_timeout=http_timeout,
                     endpoints_bucket=endpoints_bucket,
                     openapi_docs_found=openapi_docs_found,
+                    allowed_root_domain=allowed_root,
+                    scope_domains=eff_scope_domains,
                 )
 
         if any(js_dir.glob("*.js")):
@@ -1522,6 +1688,9 @@ def explore_from_seed(
                 depth=depth,
                 crawl_time="2m",
                 timeout=pd_timeout,
+                extra_headers=probe_headers or None,
+                allowed_root_domain=allowed_root,
+                scope_domains=eff_scope_domains or None,
             )
             for w in disc_res.get("warnings") or []:
                 warnings.append(str(w))
@@ -1590,7 +1759,22 @@ def explore_from_seed(
     discovered_portals: list[dict[str, Any]] = []
     if discover_portals and not loopback and base_url:
         try:
-            portal_res = discover_sibling_portals(base_url, timeout_sec=min(timeout, 12))
+            portals_hdrs = (
+                probe_headers
+                if (
+                    probe_headers
+                    and _host_in_scope(
+                        seed_host, allowed_root, scope_domains=eff_scope_domains or None
+                    )
+                )
+                else None
+            )
+            portal_res = discover_sibling_portals(
+                base_url,
+                timeout_sec=min(timeout, 12),
+                extra_headers=portals_hdrs,
+                scope_domains=eff_scope_domains or None,
+            )
             discovered_portals = list(portal_res.get("portals") or [])
         except Exception as exc:
             warnings.append(f"Sibling portal discovery skipped: {exc}")
@@ -1602,7 +1786,18 @@ def explore_from_seed(
         key=lambda ep: (-_SOURCE_PRIORITY.get(ep["source"], 0), ep["path"], ep["method"]),
     )
 
-    initial_hosts = _extract_host_for_result(base_url, seed_url)
+    all_secrets = [*(secret_values or []), *probe_headers.values()]
+    redacted_warnings = [redact_secrets(w, all_secrets) for w in warnings]
+
+    meta_mode = str((auth_meta or {}).get("auth_mode") or "").strip().lower()
+    if not meta_mode or meta_mode == "none":
+        eff_auth_mode = "curl" if (seed_type == "curl" and auth_headers_detected) else "none"
+    else:
+        eff_auth_mode = meta_mode
+
+    safe_base_url = sanitize_url_for_storage(base_url)
+    safe_seed_url = sanitize_url_for_storage(seed_url)
+    initial_hosts = _extract_host_for_result(safe_base_url, safe_seed_url)
     result: dict[str, Any] = {
         "explore_id": exp_id,
         "created_at": created_at,
@@ -1610,11 +1805,14 @@ def explore_from_seed(
         "mode": mode,
         "seed": {
             "type": seed_type,
-            "base_url": base_url,
+            "base_url": safe_base_url,
             "root_domain": root_domain,
-            "seed_url": seed_url,
+            "seed_url": safe_seed_url,
             "api_prefix": api_prefix,
             "auth_headers_detected": auth_headers_detected,
+            "auth_mode": eff_auth_mode,
+            "auth_profile_id": (auth_meta or {}).get("profile_id"),
+            "auth_profile_name": (auth_meta or {}).get("profile_name"),
             "sibling_api_hosts": sibling_api_hosts,
         },
         "merged_hosts": initial_hosts,
@@ -1634,7 +1832,7 @@ def explore_from_seed(
                 "scanned_at": created_at,
                 "mode": mode,
                 "seed_type": seed_type,
-                "seed_url": seed_url,
+                "seed_url": safe_seed_url,
                 "new_endpoints": len(discovered_endpoints),
                 "new_subdomains": len(subdomains),
             }
@@ -1646,7 +1844,7 @@ def explore_from_seed(
         "micro_frontends": micro_frontends,
         "subdomains": subdomains,
         "live_hosts": live_hosts,
-        "warnings": warnings,
+        "warnings": redacted_warnings,
     }
 
     write_json(out_dir / "explore_result.json", result)
