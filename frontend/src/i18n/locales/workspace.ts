@@ -359,6 +359,20 @@ registerMessages({
     "kb.previewRaw": "源码",
     "kb.copyMarkdown": "复制 Markdown",
     "kb.copiedMarkdown": "已复制",
+
+    // R1 TryIt Scenario Sync & R4 Deliverables Export
+    "tryit.syncScenariosToggle": "自动回写断言结果至业务场景 (L3)",
+    "tryit.syncedBadge": "已自动回写 {scenarios} 个业务场景（{assertions} 条断言）",
+    "inv.exportPostman": "导出 Postman v2.1",
+    "inv.exportingPostman": "导出 Postman 中…",
+    "inv.exportError": "导出 Postman 集合失败，请稍后重试",
+    "projOverview.exportsTitle": "验收报告与资产导出",
+    "projOverview.exportsDesc": "一键导出独立 HTML / Markdown 验收报告，或导出 Postman v2.1 集合。",
+    "projOverview.exportHtml": "导出验收报告 (HTML)",
+    "projOverview.exportMd": "导出验收报告 (Markdown)",
+    "projOverview.exportPostman": "导出 Postman v2.1",
+    "projOverview.exporting": "导出中…",
+    "projOverview.exportError": "导出交付物失败",
   },
   en: {
     // Workspace Switcher & Sidebar Navigation
@@ -738,5 +752,19 @@ registerMessages({
     "kb.previewRaw": "Raw",
     "kb.copyMarkdown": "Copy Markdown",
     "kb.copiedMarkdown": "Copied",
+
+    // R1 TryIt Scenario Sync & R4 Deliverables Export
+    "tryit.syncScenariosToggle": "Auto-sync assertion results to Scenarios (L3)",
+    "tryit.syncedBadge": "Auto-synced {scenarios} scenario(s) ({assertions} assertion(s))",
+    "inv.exportPostman": "Export Postman v2.1",
+    "inv.exportingPostman": "Exporting Postman…",
+    "inv.exportError": "Failed to export Postman collection",
+    "projOverview.exportsTitle": "Acceptance Reports & Exports",
+    "projOverview.exportsDesc": "One-click standalone HTML / Markdown acceptance reports or Postman v2.1 collection.",
+    "projOverview.exportHtml": "Export Report (HTML)",
+    "projOverview.exportMd": "Export Report (Markdown)",
+    "projOverview.exportPostman": "Export Postman v2.1",
+    "projOverview.exporting": "Exporting…",
+    "projOverview.exportError": "Failed to export deliverable",
   },
 });

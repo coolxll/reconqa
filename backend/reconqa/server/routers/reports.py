@@ -3,23 +3,45 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from reconqa.config import doctor_check, settings
+from reconqa.config import doctor_check, load_project_config, settings
 from reconqa.models.db import get_db
-from reconqa.models.schemas import FindingOut
-from reconqa.models.tables import Finding, Project, Run
-from reconqa.utils.io import read_json, read_jsonl
+from reconqa.models.schemas import FindingOut, QualityGateRequest, QualityGateResult
+from reconqa.models.tables import Finding, Project, Run, ScenarioModel, Target
+from reconqa.modules.hub.acceptance_report import (
+    build_acceptance_report_data,
+    render_acceptance_report_html,
+    render_acceptance_report_markdown,
+)
+from reconqa.modules.hub.capability_map import build_capability_map
+from reconqa.modules.hub.chain_runner import list_checkpoints
+from reconqa.modules.hub.postman_exporter import export_postman_collection
+from reconqa.modules.hub.quality_gate import (
+    GateLookupError,
+    dispatch_webhooks,
+    evaluate_project_quality_gate_db,
+)
+from reconqa.server.routers.projects import _compute_project_inventory
+from reconqa.server.routers.scenarios import (
+    _build_scenario_list_response,
+    _enrich_scenario,
+    _load_project_inventory_context,
+    collect_project_scenario_assertions,
+    sync_project_scenarios,
+)
+from reconqa.utils.io import read_json, read_jsonl, slugify
 from reconqa.utils.proc import run_cmd_async
 
 router = APIRouter(tags=["reports"])
@@ -515,3 +537,247 @@ async def get_project_trends(
         "total_runs": len(points),
         "trends": points,
     }
+
+
+def _safe_read_json_dict(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = read_json(path)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+async def _resolve_project_run(
+    db: AsyncSession,
+    project_id: str,
+    run_id: str | None,
+) -> Run | None:
+    if run_id is not None:
+        run_obj = await db.get(Run, run_id)
+        if run_obj is None or run_obj.project_id != project_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Run '{run_id}' not found in project '{project_id}'",
+            )
+        return run_obj
+
+    res = await db.execute(
+        select(Run)
+        .where(Run.project_id == project_id)
+        .order_by(Run.finished_at.desc(), Run.started_at.desc())
+    )
+    all_runs = list(res.scalars().all())
+    for r in all_runs:
+        if r.status == "completed":
+            return r
+    return all_runs[0] if all_runs else None
+
+
+@router.get("/projects/{project_id}/acceptance-report")
+async def export_project_acceptance_report(
+    project_id: str,
+    format: str = Query(default="html"),
+    run_id: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Export a standalone Acceptance Report in HTML, Markdown, or JSON format."""
+    norm_fmt = format.strip().lower()
+    if norm_fmt == "md":
+        norm_fmt = "markdown"
+    if norm_fmt not in {"html", "markdown", "json"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported report format '{format}'. Expected one of: html, markdown, json.",
+        )
+
+    project = await db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    selected_run = await _resolve_project_run(db, project_id, run_id)
+
+    completed_runs, inventory = await _load_project_inventory_context(db, project)
+    await sync_project_scenarios(db, project_id, inventory=inventory)
+
+    sc_rows = list(
+        (await db.execute(select(ScenarioModel).where(ScenarioModel.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+    runs_by_id = {r.id: r for r in completed_runs}
+    enriched_scenarios = [
+        _enrich_scenario(row, inventory=inventory, runs_by_id=runs_by_id)[0] for row in sc_rows
+    ]
+    scenario_list = _build_scenario_list_response(project_id, enriched_scenarios)
+    cap_map = build_capability_map(
+        inventory=inventory,
+        scenarios=enriched_scenarios,
+        project_id=project.id,
+        project_name=project.name,
+    )
+
+    chain_runs = list_checkpoints(project_id, run_id=run_id, limit=50)
+
+    findings: list[Finding] = []
+    har_perf_report: dict[str, Any] | None = None
+    k6_analysis: dict[str, Any] | None = None
+    if selected_run is not None:
+        f_res = await db.execute(select(Finding).where(Finding.run_id == selected_run.id))
+        findings = list(f_res.scalars().all())
+        if selected_run.workspace_dir:
+            ws = Path(selected_run.workspace_dir)
+            har_perf_report = _safe_read_json_dict(ws / "performance" / "har_perf_report.json")
+            k6_analysis = _safe_read_json_dict(ws / "performance" / "k6" / "k6_analysis.json")
+
+    report_data = build_acceptance_report_data(
+        project_id=project.id,
+        project_name=project.name,
+        project_slug=project.slug,
+        run_id=selected_run.id if selected_run is not None else None,
+        inventory=inventory,
+        capability_map=cap_map,
+        scenario_list=scenario_list,
+        chain_runs=chain_runs,
+        findings=findings,
+        har_perf_report=har_perf_report,
+        k6_analysis=k6_analysis,
+    )
+
+    fname_base = f"{slugify(project.slug or project.name)}-acceptance-report"
+    if norm_fmt == "html":
+        html_body = render_acceptance_report_html(report_data)
+        return Response(
+            content=html_body.encode("utf-8"),
+            media_type="text/html; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{fname_base}.html"'},
+        )
+    if norm_fmt == "markdown":
+        md_body = render_acceptance_report_markdown(report_data)
+        return Response(
+            content=md_body.encode("utf-8"),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{fname_base}.md"'},
+        )
+    return report_data.model_dump(mode="json")
+
+
+@router.get("/projects/{project_id}/export/postman")
+async def export_project_postman_collection(
+    project_id: str,
+    run_id: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Export project asset library endpoints & correlation chains as a Postman Collection v2.1 JSON."""
+    project, inventory, openapi_doc = await _compute_project_inventory(db, project_id)
+
+    chains: list[dict[str, Any]] = []
+    base_url = ""
+    if run_id is not None:
+        run_obj = await db.get(Run, run_id)
+        if run_obj is None or run_obj.project_id != project_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Run '{run_id}' not found in project '{project_id}'",
+            )
+        if isinstance(run_obj.config_snapshot, dict):
+            base_url = str(run_obj.config_snapshot.get("target_url") or "").strip()
+        if run_obj.workspace_dir:
+            corr_data = _safe_read_json_dict(Path(run_obj.workspace_dir) / "hub" / "correlation.json")
+            if corr_data:
+                chains = [ch for ch in (corr_data.get("chains") or []) if isinstance(ch, dict)]
+    else:
+        runs_res = await db.execute(
+            select(Run)
+            .where(Run.project_id == project_id)
+            .order_by(Run.finished_at.desc(), Run.started_at.desc())
+        )
+        all_runs = list(runs_res.scalars().all())
+        ordered_runs = [r for r in all_runs if r.status == "completed"] + [
+            r for r in all_runs if r.status != "completed"
+        ]
+        seen_sigs: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
+        for r in ordered_runs:
+            if not base_url and isinstance(r.config_snapshot, dict):
+                base_url = str(r.config_snapshot.get("target_url") or "").strip()
+            if not r.workspace_dir:
+                continue
+            corr_data = _safe_read_json_dict(Path(r.workspace_dir) / "hub" / "correlation.json")
+            if not corr_data:
+                continue
+            for ch in corr_data.get("chains") or []:
+                if not isinstance(ch, dict):
+                    continue
+                sig = (
+                    str(ch.get("name") or ""),
+                    tuple(
+                        (
+                            str(st.get("method") or "").upper(),
+                            str(st.get("path") or ""),
+                        )
+                        for st in (ch.get("steps") or [])
+                        if isinstance(st, dict)
+                    ),
+                )
+                if sig not in seen_sigs:
+                    seen_sigs.add(sig)
+                    chains.append(ch)
+
+    if not base_url:
+        t_res = await db.execute(select(Target).where(Target.project_id == project_id).limit(1))
+        first_target = t_res.scalar_one_or_none()
+        if first_target and first_target.base_url:
+            base_url = first_target.base_url.strip()
+
+    scenario_assertions = await collect_project_scenario_assertions(db, project_id)
+    collection = export_postman_collection(
+        project_id=project.id,
+        project_name=project.name,
+        inventory=inventory,
+        openapi_doc=openapi_doc,
+        chains=chains,
+        scenario_assertions=scenario_assertions,
+        base_url=base_url,
+        run_id=run_id,
+    )
+
+    fname = f"{slugify(project.slug or project.name)}-postman-collection.json"
+    return Response(
+        content=json.dumps(collection, ensure_ascii=False, indent=2).encode("utf-8"),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.post("/projects/{project_id}/gate", response_model=QualityGateResult)
+async def evaluate_project_quality_gate(
+    project_id: str,
+    body: QualityGateRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> QualityGateResult:
+    """Evaluate quality gate rules for a project run and optionally dispatch webhooks."""
+    req = body or QualityGateRequest()
+    proj_cfg = load_project_config()
+    try:
+        result, effective_cfg = await evaluate_project_quality_gate_db(
+            db,
+            project_id,
+            req,
+            project_config=proj_cfg,
+        )
+    except GateLookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    webhooks: dict[str, str | None] = {
+        "feishu": effective_cfg.feishu_webhook,
+        "dingtalk": effective_cfg.dingtalk_webhook,
+        "slack": effective_cfg.slack_webhook,
+    }
+    if any(v for v in webhooks.values()) and (not result.passed or req.notify_on_pass):
+        result.webhook_results = await dispatch_webhooks(
+            webhooks,
+            result,
+            timeout_sec=effective_cfg.webhook_timeout_sec,
+        )
+    return result

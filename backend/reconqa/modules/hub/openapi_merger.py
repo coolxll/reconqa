@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from reconqa.config import ProjectConfig
-from reconqa.modules.hub.har_parser import HarEntry, normalize_path, parse_har_dir
+from reconqa.modules.hub.har_parser import (
+    HarEntry,
+    _is_graphql_path_or_mime,
+    normalize_path,
+    parse_har_dir,
+)
 from reconqa.utils.io import ensure_dir, read_json, redact_header_value, write_json, write_yaml
 
 SOURCE_PRIORITY = {
@@ -293,7 +298,8 @@ def _redact_example(value: Any, parent_key: str = "") -> Any:
 
 
 def _derive_tag(normalized_path: str) -> str:
-    segments = [s for s in normalized_path.strip("/").split("/") if s and not s.startswith("{")]
+    clean_path = (normalized_path or "/").split("#", 1)[0]
+    segments = [s for s in clean_path.strip("/").split("/") if s and not s.startswith("{")]
     for seg in segments:
         if seg.lower() in {"api", "rest", "rpc", "gateway", "gw"}:
             continue
@@ -342,6 +348,20 @@ def _extract_custom_headers(entries: list[HarEntry]) -> dict[str, str]:
     return custom
 
 
+def _is_graphql_response_payload(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        return ("data" in payload or "errors" in payload) and not any(
+            k in payload for k in BIZ_CODE_CANDIDATE_KEYS
+        )
+    if isinstance(payload, list) and payload and all(isinstance(item, dict) for item in payload):
+        return all(
+            ("data" in item or "errors" in item)
+            and not any(k in item for k in BIZ_CODE_CANDIDATE_KEYS)
+            for item in payload
+        )
+    return False
+
+
 def _infer_biz_success(
     entries: list[HarEntry],
     path: str,
@@ -360,7 +380,19 @@ def _infer_biz_success(
         and isinstance(e.response_json, dict)
         and not _response_indicates_auth_required(e)
     ]
+    is_graphql_endpoint = "#" in (path or "") or (
+        bool(path)
+        and any(
+            getattr(e, "graphql_operation_name", None)
+            or getattr(e, "graphql_operation_type", None)
+            or _is_graphql_response_payload(e.response_json)
+            or _is_graphql_path_or_mime(path, getattr(e, "request_mime_type", ""))
+            for e in entries
+        )
+    )
     if not dict_responses:
+        if is_graphql_endpoint:
+            return None
         return global_fallback
 
     for key in BIZ_CODE_CANDIDATE_KEYS:
@@ -388,6 +420,13 @@ def _infer_biz_success(
         ):
             continue
         return {"field": key, "value": best_val}
+
+    is_graphql_payloads = bool(dict_responses) and all(
+        _is_graphql_response_payload(p) for p in dict_responses
+    )
+    if is_graphql_payloads or is_graphql_endpoint:
+        if not dict_responses or is_graphql_payloads:
+            return None
 
     return global_fallback
 
@@ -457,8 +496,17 @@ def merge_to_openapi(
         if "://" in raw_path:
             from urllib.parse import urlsplit
 
-            raw_path = urlsplit(raw_path).path or "/"
+            parsed_js = urlsplit(raw_path)
+            raw_frag = (parsed_js.fragment or "").split("?", 1)[0].strip()
+            raw_path = parsed_js.path or "/"
+            if raw_frag and not raw_frag.startswith(("/", "!")):
+                raw_path = f"{raw_path}#{raw_frag}"
         norm_path, _ = normalize_path(raw_path)
+        op_name_hint = str(item.get("operationName") or item.get("operation_name") or "").strip()
+        if op_name_hint and "#" not in norm_path:
+            clean_op = re.sub(r"[^A-Za-z0-9_.-]+", "_", op_name_hint).strip("_").lstrip("/!.")
+            if clean_op:
+                norm_path, _ = normalize_path(f"{norm_path}#{clean_op}")
         method = str(item.get("method") or "GET").upper().strip()
         if method == "OPTIONS":
             continue
@@ -537,7 +585,7 @@ def merge_to_openapi(
 
         # Parameters (path + query)
         parameters: list[dict[str, Any]] = []
-        path_param_names = re.findall(r"\{([^}]+)\}", norm_path)
+        path_param_names = re.findall(r"\{([^}]+)\}", norm_path.split("#", 1)[0])
         for p_name in path_param_names:
             sample_val = next(
                 (e.path_params.get(p_name) for e in har_group if p_name in e.path_params),
@@ -604,6 +652,25 @@ def merge_to_openapi(
                     "required": True,
                     "content": {"application/json": media},
                 }
+            else:
+                raw_gql_example = next(
+                    (
+                        e.request_body_raw
+                        for e in har_group
+                        if e.request_body_raw and "graphql" in (e.request_mime_type or "").lower()
+                    ),
+                    None,
+                )
+                if raw_gql_example is not None:
+                    request_body = {
+                        "required": True,
+                        "content": {
+                            "application/graphql": {
+                                "schema": {"type": "string"},
+                                "example": raw_gql_example,
+                            }
+                        },
+                    }
 
         # Responses
         responses: dict[str, Any] = {}
@@ -691,6 +758,18 @@ def merge_to_openapi(
             operation["x-host"] = endpoint_host
         if endpoint_origin:
             operation["x-origin"] = endpoint_origin
+        gql_op_name = next(
+            (e.graphql_operation_name for e in har_group if e.graphql_operation_name), None
+        )
+        gql_op_type = next(
+            (e.graphql_operation_type for e in har_group if e.graphql_operation_type), None
+        )
+        if not gql_op_name and "#" in norm_path:
+            gql_op_name = norm_path.split("#", 1)[1].strip() or None
+        if gql_op_name:
+            operation["x-graphql-operation"] = gql_op_name
+        if gql_op_type:
+            operation["x-graphql-type"] = gql_op_type
         if request_body is not None:
             operation["requestBody"] = request_body
         if requires_auth:

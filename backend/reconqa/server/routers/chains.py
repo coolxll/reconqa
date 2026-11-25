@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from reconqa.models.db import get_db
 from reconqa.models.schemas import (
+    AssertionEvalResult,
     ChainExecuteRequest,
     ChainResumeRequest,
     ChainRunOut,
@@ -29,15 +30,27 @@ from reconqa.modules.hub.chain_runner import (
     execute_chain,
     list_checkpoints,
     load_checkpoint,
+    save_checkpoint,
 )
-from reconqa.modules.hub.har_parser import normalize_path
-from reconqa.server.routers.scenarios import collect_project_scenario_assertions
+from reconqa.server.routers.scenarios import (
+    _split_path_and_fragment,
+    canonical_path_shape,
+    clean_endpoint_path,
+    collect_project_scenario_assertions,
+    match_endpoint_scenario_assertions,
+    sync_assertion_evals_to_scenarios,
+)
 from reconqa.utils.io import read_json
 
 router = APIRouter(tags=["chains"])
 
 _SINGLE_PATH_PARAM_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
-_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+_PATH_PARAM_SEG_RE = re.compile(
+    r"^(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|:([A-Za-z_][A-Za-z0-9_]*)|\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\})$"
+)
+_ANY_PATH_PARAM_RE = re.compile(
+    r"\{[A-Za-z_][A-Za-z0-9_]*\}|(?<=/)[:][A-Za-z_][A-Za-z0-9_]*|\{\{\s*[A-Za-z_][A-Za-z0-9_.-]*\s*\}\}"
+)
 
 
 async def _get_project_or_404(db: AsyncSession, project_id: str) -> Project:
@@ -114,54 +127,94 @@ def _origin_only(raw_url: str) -> str:
     return ""
 
 
+def _extract_param_name_from_token(token: str) -> str:
+    if token.startswith("{{") and token.endswith("}}"):
+        return token[2:-2].strip()
+    if token.startswith("{") and token.endswith("}"):
+        return token[1:-1].strip()
+    if token.startswith(":"):
+        return token[1:].strip()
+    return token.strip()
+
+
+def _replace_bound_tokens_in_path(path_str: str, bound_tokens: dict[str, str]) -> str:
+    """Replace {param}, :param, or {{param}} placeholders with bound variable templates."""
+    if not bound_tokens:
+        return path_str
+    tpl_param_names = {
+        _extract_param_name_from_token(m.group(0))
+        for m in _ANY_PATH_PARAM_RE.finditer(path_str)
+    }
+    unmatched_bounds = [
+        val for key, val in bound_tokens.items() if key not in tpl_param_names
+    ]
+
+    def _repl(match: re.Match[str]) -> str:
+        p_name = _extract_param_name_from_token(match.group(0))
+        if p_name in bound_tokens:
+            return bound_tokens[p_name]
+        if len(bound_tokens) == 1 and unmatched_bounds:
+            return unmatched_bounds.pop(0)
+        return match.group(0)
+
+    return _ANY_PATH_PARAM_RE.sub(_repl, path_str)
+
+
 def _merge_recorded_and_bound_path(
     template_path: str,
     recorded_path: str,
     bound_tokens: dict[str, str],
 ) -> str:
-    """Preserve concrete recorded segments for unbound path params while binding correlated ones."""
+    """Preserve concrete recorded segments for unbound path params and #opName fragments while binding correlated ones."""
+    tpl_base, tpl_frag = _split_path_and_fragment(template_path)
     if not recorded_path or recorded_path == "/":
-        result = template_path
-        for param, tpl_str in bound_tokens.items():
-            tok = "{" + param + "}"
-            if tok in result:
-                result = result.replace(tok, tpl_str)
-            elif _SINGLE_PATH_PARAM_RE.search(result):
-                result = _SINGLE_PATH_PARAM_RE.sub(tpl_str, result, count=1)
-        return result
+        result = _replace_bound_tokens_in_path(tpl_base, bound_tokens)
+        return f"{result}#{tpl_frag}" if tpl_frag else result
 
-    tpl_segs = template_path.split("/")
-    rec_segs = recorded_path.split("/")
+    rec_base, rec_frag = _split_path_and_fragment(recorded_path)
+    eff_frag = tpl_frag or rec_frag
+    tpl_segs = [s for s in tpl_base.split("/") if s]
+    rec_segs = [s for s in rec_base.split("/") if s]
     if len(tpl_segs) != len(rec_segs):
         if bound_tokens:
-            result = template_path
-            for param, tpl_str in bound_tokens.items():
-                tok = "{" + param + "}"
-                if tok in result:
-                    result = result.replace(tok, tpl_str)
-                elif _SINGLE_PATH_PARAM_RE.search(result):
-                    result = _SINGLE_PATH_PARAM_RE.sub(tpl_str, result, count=1)
-            return result
-        return recorded_path
+            result = _replace_bound_tokens_in_path(tpl_base, bound_tokens)
+            return f"{result}#{eff_frag}" if eff_frag else result
+        return f"{rec_base}#{eff_frag}" if eff_frag else rec_base
+
+    tpl_param_names: set[str] = set()
+    for t_seg in tpl_segs:
+        m = _PATH_PARAM_SEG_RE.fullmatch(t_seg)
+        if m:
+            p_name = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+            if p_name:
+                tpl_param_names.add(p_name)
+
+    unmatched_bounds = [
+        val for key, val in bound_tokens.items() if key not in tpl_param_names
+    ]
 
     merged: list[str] = []
-    remaining_bounds = list(bound_tokens.values())
     for t_seg, r_seg in zip(tpl_segs, rec_segs, strict=True):
-        m = _SINGLE_PATH_PARAM_RE.fullmatch(t_seg)
+        m = _PATH_PARAM_SEG_RE.fullmatch(t_seg)
         if m:
-            p_name = t_seg[1:-1].strip()
+            is_mustache = m.group(3) is not None
+            p_name = (m.group(1) or m.group(2) or m.group(3) or "").strip()
             if p_name in bound_tokens:
                 merged.append(bound_tokens[p_name])
-                if bound_tokens[p_name] in remaining_bounds:
-                    remaining_bounds.remove(bound_tokens[p_name])
-            elif remaining_bounds and len(bound_tokens) == 1:
-                merged.append(remaining_bounds.pop(0))
+            elif len(bound_tokens) == 1 and unmatched_bounds:
+                merged.append(unmatched_bounds.pop(0))
+            elif is_mustache:
+                # Preserve already-bound {{var}} placeholders when not overridden by uses
+                merged.append(t_seg)
             else:
                 # Keep concrete recorded ID for unbound path parameter
                 merged.append(r_seg)
         else:
             merged.append(r_seg or t_seg)
-    return "/".join(merged) or "/"
+    merged_base = "/" + "/".join(merged)
+    if tpl_base.endswith("/") and merged_base != "/":
+        merged_base += "/"
+    return f"{merged_base}#{eff_frag}" if eff_frag else merged_base
 
 
 def _apply_uses_to_step(step_dict: dict[str, Any]) -> ChainStepInput:
@@ -194,11 +247,14 @@ def _apply_uses_to_step(step_dict: dict[str, Any]) -> ChainStepInput:
                 body = _set_nested_body_value(body, param, tpl_str)
 
     recorded_path = urlparse(raw_url).path if raw_url else ""
+    _, raw_frag = _split_path_and_fragment(raw_url) if raw_url else ("", "")
     if bound_path_tokens or (raw_url and recorded_path):
         path = _merge_recorded_and_bound_path(path, recorded_path, bound_path_tokens)
+    if raw_frag and "#" not in path:
+        path = f"{path}#{raw_frag}"
 
     # Strip recorded query string to origin-only so httpx `params=query_params` never duplicates params,
-    # while `path` now preserves concrete recorded IDs for any unbound segments.
+    # while `path` now preserves concrete recorded IDs for any unbound segments and non-SPA #opName fragments.
     if raw_url and (bound_path_tokens or query_params):
         origin = _origin_only(raw_url)
         if origin:
@@ -225,22 +281,12 @@ def _apply_uses_to_step(step_dict: dict[str, Any]) -> ChainStepInput:
 
 
 def _clean_endpoint_path(raw_path: str) -> str:
-    p = (raw_path or "").strip()
-    if p.startswith(("http://", "https://")):
-        p = urlparse(p).path
-    p = p.split("?", 1)[0].strip()
-    # Normalize {{var}} templates to {var} so normalize_path matches scenario targets
-    p = re.sub(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}", r"{\1}", p)
-    if not p.startswith("/"):
-        p = "/" + p
-    return p.rstrip("/") or "/"
+    return clean_endpoint_path(raw_path)
 
 
 def _canonical_path_shape(path: str) -> str:
     """Canonicalize all path parameter placeholders ({id}, {order_id}, {{order_id}}) to {param}."""
-    cleaned = _clean_endpoint_path(path)
-    norm, _ = normalize_path(cleaned)
-    return re.sub(r"\{[^}]+\}", "{param}", _clean_endpoint_path(norm))
+    return canonical_path_shape(path)
 
 
 def _match_step_scenario_assertions(
@@ -250,43 +296,76 @@ def _match_step_scenario_assertions(
     scenario_assertions: list[dict[str, Any]],
 ) -> list[ScenarioAssertion]:
     """Match saved project ScenarioAssertions targeting this step's (method, path)."""
-    if not scenario_assertions:
-        return []
+    primary = step_path or raw_url
+    _, primary_frag = _split_path_and_fragment(primary)
+    _, raw_frag = _split_path_and_fragment(raw_url)
+    extra = ""
+    if step_path and raw_url and raw_url != step_path:
+        if not primary_frag or raw_frag:
+            extra = raw_url
+    return match_endpoint_scenario_assertions(
+        method,
+        primary,
+        scenario_assertions,
+        extra_path=extra,
+    )
 
-    ep_method = (method or "GET").strip().upper()
-    ep_clean = _clean_endpoint_path(step_path or raw_url)
-    ep_shape = _canonical_path_shape(step_path or raw_url)
 
-    matched: list[ScenarioAssertion] = []
-    seen_ids: set[str] = set()
-    for raw in scenario_assertions:
-        if not isinstance(raw, dict):
+async def _sync_chain_out_to_scenarios(
+    db: AsyncSession,
+    project_id: str,
+    steps: list[ChainStepInput],
+    out: ChainRunOut,
+) -> ChainRunOut:
+    """Sync all non-skipped step assertions in ``out.step_results`` back to ScenarioModel.
+
+    On resume, ``out.step_results`` contains the full effective chain run (both prior
+    non-skipped steps and newly resumed steps), keeping writeback idempotent on already-synced
+    prior steps while transitioning resumed steps and supporting ``sync_scenarios=False -> True``.
+    """
+    eval_items: list[tuple[str, str, list[AssertionEvalResult]]] = []
+    for sr in out.step_results:
+        if sr.status == "skipped" or not sr.assertions:
             continue
-        target = str(raw.get("target_endpoint") or "").strip()
-        if not target:
-            continue
-        parts = target.split(None, 1)
-        if len(parts) == 2 and parts[0].upper() in _HTTP_METHODS:
-            t_method: str | None = parts[0].upper()
-            t_path_raw = parts[1].strip()
+        st_path = ""
+        st_raw = ""
+        step_frag = ""
+        if 0 <= sr.step_index < len(steps):
+            st = steps[sr.step_index]
+            st_path = (st.path or "").strip()
+            st_raw = (st.raw_url or "").strip()
+            _, path_frag = _split_path_and_fragment(st_path)
+            _, raw_frag = _split_path_and_fragment(st_raw)
+            step_frag = path_frag or raw_frag
+
+        if step_frag:
+            base_sr = sr.url.split("#", 1)[0]
+            frag_sr = f"{base_sr}#{step_frag}"
+            eval_items.append((sr.method, frag_sr, sr.assertions))
+            if st_path and st_path != "/" and st_path != frag_sr:
+                eval_items.append((sr.method, st_path, sr.assertions))
+            if st_raw and "#" in st_raw and st_raw != st_path and st_raw != frag_sr:
+                eval_items.append((sr.method, st_raw, sr.assertions))
         else:
-            t_method = None
-            t_path_raw = target
+            eval_items.append((sr.method, sr.url, sr.assertions))
+            if st_path and st_path != "/" and st_path != sr.url:
+                eval_items.append((sr.method, st_path, sr.assertions))
+            if st_raw and "#" in st_raw and st_raw != sr.url and st_raw != st_path:
+                eval_items.append((sr.method, st_raw, sr.assertions))
+    if not eval_items:
+        return out
 
-        if t_method is not None and t_method != ep_method:
-            continue
-
-        t_clean = _clean_endpoint_path(t_path_raw)
-        t_shape = _canonical_path_shape(t_path_raw)
-        if t_clean == ep_clean or t_shape == ep_shape:
-            try:
-                parsed = ScenarioAssertion.model_validate(raw)
-            except Exception:
-                continue
-            if parsed.id not in seen_ids:
-                seen_ids.add(parsed.id)
-                matched.append(parsed)
-    return matched
+    synced_scenarios, synced_assertions = await sync_assertion_evals_to_scenarios(
+        db, project_id, eval_items
+    )
+    out.synced_scenarios = synced_scenarios
+    out.synced_assertions = synced_assertions
+    cp = load_checkpoint(out.chain_run_id)
+    if isinstance(cp, dict):
+        cp["synced_scenarios"] = synced_scenarios
+        cp["synced_assertions"] = synced_assertions
+        save_checkpoint(cp)
+    return out
 
 
 @router.get("/projects/{project_id}/chain-runs", response_model=list[ChainRunOut])
@@ -432,7 +511,7 @@ async def execute_project_chain(
             base_url = first_target.base_url.strip()
 
     try:
-        return await execute_chain(
+        out = await execute_chain(
             project_id=project_id,
             chain_name=chain_name,
             steps=steps,
@@ -451,6 +530,10 @@ async def execute_project_chain(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    if body.sync_scenarios:
+        out = await _sync_chain_out_to_scenarios(db, project_id, steps, out)
+    return out
+
 
 @router.post("/projects/{project_id}/chain-runs/{chain_run_id}/resume", response_model=ChainRunOut)
 async def resume_project_chain_run(
@@ -459,7 +542,11 @@ async def resume_project_chain_run(
     body: ChainResumeRequest,
     db: AsyncSession = Depends(get_db),
 ) -> ChainRunOut:
-    """Resume a failed or partial chain run from a checkpoint step without re-executing prior steps."""
+    """Resume a failed or partial chain run from a checkpoint step without re-executing prior steps.
+
+    When ``sync_scenarios=True``, syncs the full effective ``ChainRunOut.step_results`` (both prior
+    non-skipped steps and newly resumed steps) to matching ``ScenarioModel`` assertions.
+    """
     await _get_project_or_404(db, project_id)
     try:
         checkpoint = load_checkpoint(chain_run_id)
@@ -535,7 +622,7 @@ async def resume_project_chain_run(
     ]
 
     try:
-        return await execute_chain(
+        out = await execute_chain(
             project_id=project_id,
             chain_name=str(checkpoint.get("chain_name") or "Resumed Chain"),
             steps=steps,
@@ -558,3 +645,7 @@ async def resume_project_chain_run(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if body.sync_scenarios:
+        out = await _sync_chain_out_to_scenarios(db, project_id, steps, out)
+    return out

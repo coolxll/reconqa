@@ -40,6 +40,7 @@ from reconqa.models.schemas import (
     ReplayMatrixResponse,
     ReplayRequest,
     ReplayResponse,
+    ScenarioAssertion,
     TargetCreate,
     TargetOut,
     TargetUpdate,
@@ -52,9 +53,15 @@ from reconqa.modules.discovery.auth_resolver import (
     redact_secrets,
     resolve_auth_from_profile,
 )
-from reconqa.modules.hub.assertion_engine import evaluate_assertion
+from reconqa.modules.hub.assertion_engine import evaluate_assertion, render_template_str
+from reconqa.modules.hub.chain_runner import _render_body_value, _render_path_str
 from reconqa.modules.hub.inventory import build_project_inventory
 from reconqa.server.routers.explore import find_project_explores
+from reconqa.server.routers.scenarios import (
+    collect_project_scenario_assertions,
+    match_endpoint_scenario_assertions,
+    sync_assertion_evals_to_scenarios,
+)
 from reconqa.utils.io import ensure_dir, slugify
 
 router = APIRouter(tags=["projects"])
@@ -977,7 +984,8 @@ def _validate_replay_target(method_raw: str, url_raw: str) -> tuple[str, str, st
         )
 
     raw_url = (url_raw or "").strip()
-    parsed = urlparse(raw_url)
+    wire_url = raw_url.split("#", 1)[0]
+    parsed = urlparse(wire_url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise HTTPException(
             status_code=400,
@@ -990,7 +998,7 @@ def _validate_replay_target(method_raw: str, url_raw: str) -> tuple[str, str, st
             status_code=400,
             detail="Requests to cloud metadata or link-local addresses are blocked.",
         )
-    return method, raw_url, target_host
+    return method, wire_url, target_host
 
 
 async def _execute_single_replay(
@@ -1031,6 +1039,7 @@ async def _execute_single_replay(
         else:
             req_kwargs["json"] = body
 
+    wire_url = raw_url.split("#", 1)[0]
     trust_env = not _should_bypass_env_proxy(target_host)
     t0 = time.perf_counter()
     try:
@@ -1040,7 +1049,7 @@ async def _execute_single_replay(
             timeout=timeout_sec,
             trust_env=trust_env,
         ) as client:
-            resp = await client.request(method, raw_url, **req_kwargs)
+            resp = await client.request(method, wire_url, **req_kwargs)
     except httpx.HTTPError as exc:
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return (
@@ -1137,8 +1146,19 @@ async def replay_project_endpoint(
 ) -> ReplayResponse:
     """Safely replay a single HTTP request inline with optional server-side credential injection."""
     await _get_project_or_404(db, project_id)
-    method, raw_url, target_host = _validate_replay_target(body.method, body.url)
+    ctx = dict(body.context_vars or {})
+    rendered_url = _render_path_str(body.url, ctx)
+    virtual_url = rendered_url
+    method, wire_url, target_host = _validate_replay_target(body.method, rendered_url)
     clamped_timeout = max(1.0, min(30.0, float(body.timeout_sec or 15.0)))
+
+    rendered_headers = {
+        str(k): render_template_str(str(v), ctx) for k, v in (body.headers or {}).items()
+    }
+    rendered_query = {
+        str(k): render_template_str(str(v), ctx) for k, v in (body.query_params or {}).items()
+    }
+    rendered_body = _render_body_value(body.body, ctx) if body.body is not None else None
 
     profile: AuthProfile | None = None
     if body.credential_id:
@@ -1151,15 +1171,27 @@ async def replay_project_endpoint(
 
     resp, _ = await _execute_single_replay(
         method=method,
-        raw_url=raw_url,
+        raw_url=wire_url,
         target_host=target_host,
-        user_headers=body.headers,
-        query_params=body.query_params,
-        body=body.body,
+        user_headers=rendered_headers,
+        query_params=rendered_query,
+        body=rendered_body,
         profile=profile,
         timeout_sec=clamped_timeout,
     )
-    if body.assertions:
+
+    assertions_to_eval: list[ScenarioAssertion] = []
+    if resp.error is None:
+        if body.assertions is not None:
+            assertions_to_eval = list(body.assertions)
+        elif body.include_scenario_assertions:
+            project_assertions = await collect_project_scenario_assertions(db, project_id)
+            if project_assertions:
+                assertions_to_eval = match_endpoint_scenario_assertions(
+                    method, virtual_url, project_assertions
+                )
+
+    if assertions_to_eval:
         resp.assertion_results = [
             await asyncio.to_thread(
                 evaluate_assertion,
@@ -1169,11 +1201,17 @@ async def replay_project_endpoint(
                 response_headers=resp.response_headers,
                 body_json=resp.body_json,
                 body_text=resp.body_text,
-                context_vars=body.context_vars,
+                context_vars=ctx,
                 db_dsn_ref=body.db_dsn_ref,
             )
-            for assertion in body.assertions
+            for assertion in assertions_to_eval
         ]
+        if body.sync_scenarios and resp.assertion_results:
+            synced_sc, synced_as = await sync_assertion_evals_to_scenarios(
+                db, project_id, [(method, virtual_url, resp.assertion_results)]
+            )
+            resp.synced_scenarios = synced_sc
+            resp.synced_assertions = synced_as
     return resp
 
 
@@ -1185,8 +1223,18 @@ async def replay_project_endpoint_matrix(
 ) -> ReplayMatrixResponse:
     """Concurrently replay an endpoint across Anonymous + multiple project role credentials."""
     await _get_project_or_404(db, project_id)
-    method, raw_url, target_host = _validate_replay_target(body.method, body.url)
+    rendered_url = _render_path_str(body.url, {})
+    virtual_url = rendered_url
+    method, wire_url, target_host = _validate_replay_target(body.method, rendered_url)
     clamped_timeout = max(1.0, min(30.0, float(body.timeout_sec or 15.0)))
+
+    rendered_headers = {
+        str(k): render_template_str(str(v), {}) for k, v in (body.headers or {}).items()
+    }
+    rendered_query = {
+        str(k): render_template_str(str(v), {}) for k, v in (body.query_params or {}).items()
+    }
+    rendered_body = _render_body_value(body.body, {}) if body.body is not None else None
 
     res = await db.execute(select(AuthProfile).where(AuthProfile.project_id == project_id))
     all_profiles = list(res.scalars().all())
@@ -1218,11 +1266,11 @@ async def replay_project_endpoint_matrix(
     ) -> ReplayMatrixEntry:
         resp, raw_size = await _execute_single_replay(
             method=method,
-            raw_url=raw_url,
+            raw_url=wire_url,
             target_host=target_host,
-            user_headers=body.headers,
-            query_params=body.query_params,
-            body=body.body,
+            user_headers=rendered_headers,
+            query_params=rendered_query,
+            body=rendered_body,
             profile=prof,
             timeout_sec=clamped_timeout,
         )
@@ -1252,7 +1300,7 @@ async def replay_project_endpoint_matrix(
 
     return ReplayMatrixResponse(
         method=method,
-        url=raw_url,
+        url=virtual_url,
         results=entries,
         allowed_count=allowed_count,
         denied_count=denied_count,

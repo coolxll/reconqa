@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 
 from reconqa.models.db import get_db
 from reconqa.models.schemas import (
+    AssertionEvalResult,
     InventoryEndpoint,
     ProjectCapabilityMapResponse,
     PromoteCapabilityRequest,
@@ -30,6 +31,7 @@ from reconqa.models.schemas import (
 )
 from reconqa.models.tables import Project, Run, ScenarioModel
 from reconqa.modules.hub.capability_map import build_capability_map, endpoint_capability_key
+from reconqa.modules.hub.har_parser import _VERSION_SEG_RE, normalize_path
 from reconqa.modules.hub.inventory import build_project_inventory
 from reconqa.server.routers.explore import find_project_explores
 from reconqa.utils.io import slugify
@@ -263,10 +265,10 @@ def _enrich_scenario(
             parts = raw_t.split(None, 1)
             if len(parts) == 2:
                 m_str = parts[0].upper().strip()
-                p_str = parts[1].split("?", 1)[0].strip().rstrip("/").lower() or "/"
+                p_str = clean_endpoint_path(parts[1]).lower()
                 assertion_targets_norm.add(f"{m_str} {p_str}")
             else:
-                p_str = raw_t.split("?", 1)[0].strip().rstrip("/").lower() or "/"
+                p_str = clean_endpoint_path(raw_t).lower()
                 assertion_targets_norm.add(p_str)
 
     for raw_ep in inventory.get("endpoints") or []:
@@ -276,7 +278,7 @@ def _enrich_scenario(
             ep_method = str(raw_ep.get("method") or "GET").upper().strip()
             ep_path = str(raw_ep.get("path") or "/")
             ep_host = str(raw_ep.get("host") or "")
-            ep_path_norm = ep_path.split("?", 1)[0].strip().rstrip("/").lower() or "/"
+            ep_path_norm = clean_endpoint_path(ep_path).lower()
             ep_target_norm = f"{ep_method} {ep_path_norm}"
             if raw_ep.get("discovery_source") == "har-live":
                 ep_cap_key = endpoint_capability_key(ep_path, ep_host)
@@ -419,6 +421,376 @@ async def collect_project_scenario_assertions(
             item["scenario_name"] = row.name
             collected.append(item)
     return collected
+
+
+_SYNC_HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+_MUSTACHE_VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}")
+_COLON_PATH_PARAM_RE = re.compile(r"(?<=/)[:]([A-Za-z_][A-Za-z0-9_]*)")
+_BRACE_PARAM_RE = re.compile(r"\{[^}]+\}")
+_STATIC_REST_SEGMENTS = frozenset(
+    {
+        "api",
+        "rest",
+        "rpc",
+        "graphql",
+        "oauth",
+        "oauth2",
+        "openid",
+        "v1",
+        "v2",
+        "v3",
+        "v4",
+        "submit",
+        "create",
+        "list",
+        "search",
+        "query",
+        "find",
+        "filter",
+        "export",
+        "import",
+        "batch",
+        "bulk",
+        "count",
+        "stats",
+        "summary",
+        "overview",
+        "health",
+        "healthz",
+        "ready",
+        "readyz",
+        "live",
+        "livez",
+        "status",
+        "ping",
+        "version",
+        "info",
+        "config",
+        "settings",
+        "metrics",
+        "docs",
+        "openapi",
+        "swagger",
+        "schema",
+        "login",
+        "logout",
+        "signin",
+        "signout",
+        "signup",
+        "register",
+        "auth",
+        "token",
+        "refresh",
+        "revoke",
+        "verify",
+        "confirm",
+        "cancel",
+        "pay",
+        "checkout",
+        "refund",
+        "approve",
+        "reject",
+        "close",
+        "reopen",
+        "archive",
+        "restore",
+        "activate",
+        "deactivate",
+        "enable",
+        "disable",
+        "upload",
+        "download",
+        "preview",
+        "validate",
+        "check",
+        "reset",
+        "sync",
+        "merge",
+        "run",
+        "execute",
+        "resume",
+        "replay",
+        "me",
+        "self",
+        "profile",
+        "account",
+        "dashboard",
+        "hidden",
+        "add",
+        "remove",
+        "update",
+        "delete",
+        "edit",
+        "new",
+        "all",
+        "callback",
+        "webhook",
+        "webhooks",
+        "public",
+        "private",
+        "internal",
+    }
+)
+
+
+def _split_path_and_fragment(raw_path: str) -> tuple[str, str]:
+    p = (raw_path or "").strip()
+    if not p:
+        return "/", ""
+    if p.startswith(("http://", "https://")):
+        parsed = urlparse(p)
+        base_p = parsed.path or "/"
+        frag = (parsed.fragment or "").split("?", 1)[0].strip()
+    elif "#" in p:
+        before_frag, raw_frag = p.split("#", 1)
+        base_p = before_frag.split("?", 1)[0].strip()
+        frag = raw_frag.split("?", 1)[0].strip()
+    else:
+        base_p = p.split("?", 1)[0].strip()
+        frag = ""
+    if frag.startswith(("/", "!")):
+        frag = ""
+    return base_p, frag
+
+
+def clean_endpoint_path(raw_path: str) -> str:
+    """Normalize URL/path into a clean path preserving non-SPA #opName fragments and converting {{var}}/:var."""
+    base_p, frag = _split_path_and_fragment(raw_path)
+    base_p = _MUSTACHE_VAR_RE.sub(r"{\1}", base_p)
+    base_p = _COLON_PATH_PARAM_RE.sub(r"{\1}", base_p)
+    base_p = re.sub(r"/{2,}", "/", base_p)
+    if not base_p.startswith("/"):
+        base_p = "/" + base_p
+    base_p = base_p.rstrip("/") or "/"
+    return f"{base_p}#{frag}" if frag else base_p
+
+
+def canonical_path_shape(path: str) -> str:
+    """Canonicalize all path parameter placeholders ({id}, :id, {{id}}, dynamic segments) to {param}."""
+    cleaned = clean_endpoint_path(path)
+    base_p, frag = _split_path_and_fragment(cleaned)
+    norm, _ = normalize_path(base_p)
+    norm = _COLON_PATH_PARAM_RE.sub("{param}", norm)
+    norm = _BRACE_PARAM_RE.sub("{param}", norm)
+    if not norm.startswith("/"):
+        norm = "/" + norm
+    norm = norm.rstrip("/") or "/"
+    return f"{norm}#{frag}" if frag else norm
+
+
+def _split_method_and_target(raw_target: str) -> tuple[str | None, str]:
+    target = (raw_target or "").strip()
+    parts = target.split(None, 1)
+    if len(parts) == 2 and parts[0].upper() in _SYNC_HTTP_METHODS:
+        return parts[0].upper(), parts[1].strip()
+    return None, target
+
+
+def _match_endpoint_specificity(method: str, url_or_path: str, target_endpoint: str) -> int:
+    """Return match specificity: 3=exact, 2=canonical_shape, 1=directional segment template, 0=none."""
+    raw_target = (target_endpoint or "").strip()
+    if not raw_target:
+        return 0
+    ep_method = (method or "GET").strip().upper()
+    t_method, t_path_raw = _split_method_and_target(raw_target)
+    if t_method is not None and t_method != ep_method:
+        return 0
+    ep_clean = clean_endpoint_path(url_or_path)
+    t_clean = clean_endpoint_path(t_path_raw)
+    if ep_clean == t_clean:
+        return 3
+    ep_shape = canonical_path_shape(url_or_path)
+    t_shape = canonical_path_shape(t_path_raw)
+    if ep_shape == t_shape:
+        return 2
+
+    ep_base, ep_frag = _split_path_and_fragment(ep_shape)
+    t_base, t_frag = _split_path_and_fragment(t_shape)
+    if ep_frag != t_frag:
+        return 0
+
+    ep_cbase, _ = _split_path_and_fragment(ep_clean)
+    t_cbase, _ = _split_path_and_fragment(t_clean)
+    ep_shape_segs = [s for s in ep_base.split("/") if s]
+    t_shape_segs = [s for s in t_base.split("/") if s]
+    ep_clean_segs = [s for s in ep_cbase.split("/") if s]
+    t_clean_segs = [s for s in t_cbase.split("/") if s]
+    if not ep_shape_segs or not (
+        len(ep_shape_segs) == len(t_shape_segs) == len(ep_clean_segs) == len(t_clean_segs)
+    ):
+        return 0
+
+    for ep_s, ep_c, t_s, t_c in zip(
+        ep_shape_segs, ep_clean_segs, t_shape_segs, t_clean_segs, strict=True
+    ):
+        if ep_s == t_s:
+            continue
+        if t_s == "{param}" and _BRACE_PARAM_RE.fullmatch(t_c):
+            if (
+                not ep_c
+                or _BRACE_PARAM_RE.fullmatch(ep_c)
+                or ep_c.lower() in _STATIC_REST_SEGMENTS
+                or _VERSION_SEG_RE.match(ep_c)
+            ):
+                return 0
+            continue
+        return 0
+    return 1
+
+
+def endpoint_matches_target(method: str, url_or_path: str, target_endpoint: str) -> bool:
+    """Return True if (method, url_or_path) matches ScenarioAssertion.target_endpoint."""
+    return _match_endpoint_specificity(method, url_or_path, target_endpoint) > 0
+
+
+def match_endpoint_scenario_assertions(
+    method: str,
+    path_or_url: str,
+    scenario_assertions: list[dict[str, Any]],
+    *,
+    extra_path: str = "",
+) -> list[ScenarioAssertion]:
+    """Match saved project ScenarioAssertions targeting (method, path_or_url) or extra_path."""
+    if not scenario_assertions:
+        return []
+
+    scored: list[tuple[int, ScenarioAssertion]] = []
+    seen_ids: set[str] = set()
+    for raw in scenario_assertions:
+        if not isinstance(raw, dict):
+            continue
+        target = str(raw.get("target_endpoint") or "").strip()
+        if not target:
+            continue
+        score = _match_endpoint_specificity(method, path_or_url, target)
+        if extra_path:
+            score = max(score, _match_endpoint_specificity(method, extra_path, target))
+        if score <= 0:
+            continue
+        try:
+            parsed = ScenarioAssertion.model_validate(raw)
+        except Exception:
+            continue
+        if parsed.id not in seen_ids:
+            seen_ids.add(parsed.id)
+            scored.append((score, parsed))
+
+    if not scored:
+        return []
+    if max(score for score, _ in scored) >= 2:
+        return [item for score, item in scored if score >= 2]
+    return [item for _, item in scored]
+
+
+async def sync_assertion_evals_to_scenarios(
+    db: AsyncSession,
+    project_id: str,
+    eval_items: list[tuple[str, str, list[AssertionEvalResult]]],
+) -> tuple[int, int]:
+    """Sync evaluated AssertionEvalResult statuses back to non-archived ScenarioModel assertions.
+
+    Returns ``(synced_scenarios, synced_assertions)`` counting modified rows/assertions and
+    commits only when at least one ScenarioModel row changed.
+    """
+    non_empty_items = [(m, u, res) for m, u, res in eval_items if res]
+    if not non_empty_items:
+        return 0, 0
+
+    res = await db.execute(
+        select(ScenarioModel).where(
+            ScenarioModel.project_id == project_id,
+            ScenarioModel.status != "archived",
+        )
+    )
+    rows = list(res.scalars().all())
+    if not rows:
+        return 0, 0
+
+    rows_assertions: list[tuple[ScenarioModel, list[ScenarioAssertion]]] = []
+    all_persisted_ids: set[str] = set()
+    for row in rows:
+        parsed_assertions = _parse_assertions(row)
+        if not parsed_assertions:
+            continue
+        rows_assertions.append((row, parsed_assertions))
+        for a in parsed_assertions:
+            if a.id:
+                all_persisted_ids.add(a.id)
+
+    if not rows_assertions:
+        return 0, 0
+
+    by_id: dict[str, list[AssertionEvalResult]] = {}
+    fallback_items: list[tuple[str, str, AssertionEvalResult]] = []
+    for method, url_or_path, results in non_empty_items:
+        for ev in results:
+            if ev.id and ev.id in all_persisted_ids:
+                by_id.setdefault(ev.id, []).append(ev)
+            else:
+                fallback_items.append((method, url_or_path, ev))
+
+    fallback_by_assertion_key: dict[tuple[int, int], list[AssertionEvalResult]] = {}
+    if fallback_items:
+        for method, url_or_path, ev in fallback_items:
+            ev_title = (ev.title or "").strip().lower()
+            ev_op = (ev.operator or "").strip().lower()
+            if not (ev_title and ev_op):
+                continue
+            max_endpoint_score = 0
+            matched_keys: list[tuple[int, int, int]] = []
+            for row_idx, (_row, assertions) in enumerate(rows_assertions):
+                for a_idx, a in enumerate(assertions):
+                    target = a.target_endpoint.strip()
+                    if not target:
+                        continue
+                    score = _match_endpoint_specificity(method, url_or_path, target)
+                    if score <= 0:
+                        continue
+                    if score > max_endpoint_score:
+                        max_endpoint_score = score
+                    if (
+                        (a.title or "").strip().lower() == ev_title
+                        and str(a.operator or "").strip().lower() == ev_op
+                    ):
+                        matched_keys.append((score, row_idx, a_idx))
+            min_score = 2 if max_endpoint_score >= 2 else 1
+            for score, row_idx, a_idx in matched_keys:
+                if score >= min_score:
+                    fallback_by_assertion_key.setdefault((row_idx, a_idx), []).append(ev)
+
+    now = datetime.now(UTC)
+    synced_scenarios = 0
+    synced_assertions = 0
+
+    for row_idx, (row, assertions) in enumerate(rows_assertions):
+        row_changed = False
+        for a_idx, a in enumerate(assertions):
+            matched_evals: list[AssertionEvalResult] = list(by_id.get(a.id, ()))
+            matched_evals.extend(fallback_by_assertion_key.get((row_idx, a_idx), ()))
+
+            if not matched_evals:
+                continue
+
+            new_status: Literal["passed", "failed"] = (
+                "failed" if any(not ev.passed for ev in matched_evals) else "passed"
+            )
+            if a.status != new_status:
+                a.status = new_status
+                row_changed = True
+                synced_assertions += 1
+
+        if row_changed:
+            row.assertions_json = json.dumps(
+                [a.model_dump() for a in assertions],
+                ensure_ascii=False,
+            )
+            row.updated_at = now
+            synced_scenarios += 1
+
+    if synced_scenarios > 0:
+        await db.commit()
+
+    return synced_scenarios, synced_assertions
 
 
 async def _get_scenario_or_404(

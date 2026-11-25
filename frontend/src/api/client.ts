@@ -1,3 +1,5 @@
+import { parseContentDispositionFilename } from "@/utils/gateAndExport";
+
 export const API_BASE = "/api/v1";
 
 export class ApiError extends Error {
@@ -74,6 +76,20 @@ export async function apiText(path: string, init?: RequestInit): Promise<string>
     throw new ApiError(res.status, await parseErrorDetail(res));
   }
   return await res.text();
+}
+
+export async function apiBlob(
+  path: string,
+  init?: RequestInit
+): Promise<{ blob: Blob; filename: string | null; contentType: string }> {
+  const res = await fetch(buildUrl(path), init);
+  if (!res.ok) {
+    throw new ApiError(res.status, await parseErrorDetail(res));
+  }
+  const blob = await res.blob();
+  const filename = parseContentDispositionFilename(res.headers.get("content-disposition"));
+  const contentType = res.headers.get("content-type") || blob.type || "application/octet-stream";
+  return { blob, filename, contentType };
 }
 
 export async function apiUpload<T>(path: string, formData: FormData): Promise<T> {

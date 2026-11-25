@@ -39,6 +39,7 @@ import type {
 } from "@/api/types";
 import { useI18n } from "@/i18n";
 import { copyToClipboard } from "@/utils/clipboard";
+import { hasSyncFeedback } from "@/utils/gateAndExport";
 
 export interface TryItEndpointInput {
   method: string;
@@ -65,6 +66,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: [];
+  synced: [payload: { synced_scenarios: number; synced_assertions: number }];
 }>();
 
 const { t } = useI18n();
@@ -138,6 +140,7 @@ const expandedMatrixRows = ref<Set<number>>(new Set());
 const respTab = ref<"body" | "headers">("body");
 const copiedResp = ref(false);
 const runAssertions = ref(true);
+const syncScenarios = ref(true);
 
 const activeAssertions = computed<ScenarioAssertion[]>(() => props.assertions ?? []);
 const assertionResults = computed<AssertionEvalResult[]>(
@@ -380,6 +383,7 @@ async function hydrateFromEndpoint(): Promise<void> {
   errorMsg.value = null;
   respTab.value = "body";
   runAssertions.value = true;
+  syncScenarios.value = true;
 
   await loadProjectContext(props.projectId);
 
@@ -500,7 +504,8 @@ async function handleSend(): Promise<void> {
   sending.value = true;
   response.value = null;
   try {
-    const shouldAttachAssertions = runAssertions.value && activeAssertions.value.length > 0;
+    const hasPropAssertions = activeAssertions.value.length > 0;
+    const shouldAttachAssertions = runAssertions.value && hasPropAssertions;
     const firstDbDsnRef = shouldAttachAssertions
       ? activeAssertions.value.find((a) => a.db_dsn_ref?.trim())?.db_dsn_ref?.trim() || null
       : null;
@@ -513,10 +518,22 @@ async function handleSend(): Promise<void> {
       body: parsedBody,
       credential_id: credentialId.value || null,
       timeout_sec: timeoutSec.value,
+      include_scenario_assertions: hasPropAssertions ? runAssertions.value : true,
+      sync_scenarios: props.projectId
+        ? hasPropAssertions
+          ? runAssertions.value && syncScenarios.value
+          : syncScenarios.value
+        : false,
       ...(shouldAttachAssertions ? { assertions: activeAssertions.value } : {}),
       ...(firstDbDsnRef ? { db_dsn_ref: firstDbDsnRef } : {}),
     });
     respTab.value = "body";
+    if (hasSyncFeedback(response.value)) {
+      emit("synced", {
+        synced_scenarios: response.value.synced_scenarios ?? 0,
+        synced_assertions: response.value.synced_assertions ?? 0,
+      });
+    }
   } catch (err) {
     errorMsg.value = err instanceof Error ? err.message : t("tryit.errSend");
   } finally {
@@ -1047,6 +1064,36 @@ async function copyResponseBody(): Promise<void> {
                 </span>
               </span>
             </div>
+            <label
+              v-if="projectId"
+              class="mt-2.5 flex cursor-pointer items-center gap-2 border-t border-teal-200/70 pt-2 text-xs font-medium text-teal-900"
+              :class="{ 'cursor-not-allowed opacity-50': !runAssertions }"
+            >
+              <input
+                v-model="syncScenarios"
+                data-testid="try-it-sync-scenarios-toggle"
+                type="checkbox"
+                :disabled="!runAssertions"
+                class="h-3.5 w-3.5 rounded border-teal-300 text-teal-600 focus:ring-teal-500 disabled:cursor-not-allowed"
+              />
+              <span>{{ t("tryit.syncScenariosToggle") }}</span>
+            </label>
+          </div>
+          <div
+            v-else-if="projectId"
+            data-testid="try-it-sync-scenarios-panel"
+            class="rounded-xl border border-teal-200/80 bg-teal-50/40 px-3.5 py-2.5"
+          >
+            <label class="flex cursor-pointer items-center gap-2 text-xs font-medium text-teal-900">
+              <input
+                v-model="syncScenarios"
+                data-testid="try-it-sync-scenarios-toggle"
+                type="checkbox"
+                class="h-3.5 w-3.5 rounded border-teal-300 text-teal-600 focus:ring-teal-500"
+              />
+              <ListChecks class="h-3.5 w-3.5 text-teal-600" />
+              <span>{{ t("tryit.syncScenariosToggle") }}</span>
+            </label>
           </div>
 
           <!-- Error Notice -->
@@ -1254,6 +1301,22 @@ async function copyResponseBody(): Promise<void> {
               >
                 <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
                 <span>{{ t("tryit.htmlResponseHint") }}</span>
+              </div>
+
+              <div
+                v-if="hasSyncFeedback(response)"
+                data-testid="try-it-synced-badge"
+                class="mb-3 flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900"
+              >
+                <CheckCircle2 class="h-4 w-4 shrink-0 text-emerald-600" />
+                <span class="font-medium">
+                  {{
+                    t("tryit.syncedBadge", {
+                      scenarios: response.synced_scenarios ?? 0,
+                      assertions: response.synced_assertions ?? 0,
+                    })
+                  }}
+                </span>
               </div>
 
               <!-- Scenario Assertion Evaluation Results -->

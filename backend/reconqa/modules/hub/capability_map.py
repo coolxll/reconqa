@@ -6,6 +6,7 @@ import json
 import re
 from collections import defaultdict
 from typing import Any
+from urllib.parse import urlparse
 
 from reconqa.utils.io import slugify
 
@@ -212,23 +213,59 @@ def _is_param_segment(seg: str) -> bool:
     return (seg.startswith("{") and seg.endswith("}")) or seg.isdigit()
 
 
+def _split_path_and_op(path: str) -> tuple[str, str]:
+    raw = (path or "/").strip()
+    if raw.startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+        base_p = parsed.path or "/"
+        frag = (parsed.fragment or "").split("?", 1)[0].strip()
+    elif "#" in raw:
+        before, after = raw.split("#", 1)
+        base_p = before.split("?", 1)[0].strip()
+        frag = after.split("?", 1)[0].strip()
+    else:
+        base_p = raw.split("?", 1)[0].strip()
+        frag = ""
+    if frag.startswith(("/", "!")):
+        frag = ""
+    return (base_p or "/"), frag
+
+
 def _normalize_endpoint_parts(path: str, host: str = "") -> tuple[str, str, str]:
     """Return (module, resource, inferred_role) for an API path."""
-    raw_segs = [s.strip() for s in (path or "/").split("/") if s.strip()]
+    base_path, op_frag = _split_path_and_op(path)
+    raw_segs = [s.strip() for s in base_path.split("/") if s.strip()]
     low_segs = [s.lower() for s in raw_segs]
     non_param = [s for s in low_segs if not _is_param_segment(s)]
 
-    if not non_param:
+    if not non_param and not op_frag:
         return "root", "root", "common"
 
-    module = non_param[0]
-    resource = ""
-    for seg in non_param[1:]:
-        if seg not in _INFIX_SEGMENTS:
-            resource = seg
-            break
-    if not resource:
-        resource = module
+    if op_frag:
+        skip_prefixes = _INFIX_SEGMENTS | _NOISE_MODULES | {
+            "rest",
+            "public",
+            "internal",
+            "service",
+            "services",
+        }
+        if any(s in {"graphql", "gql"} for s in non_param):
+            module = "graphql"
+        else:
+            module = next(
+                (s for s in non_param if s not in skip_prefixes),
+                "graphql",
+            )
+        resource = op_frag.lower()
+    else:
+        module = non_param[0]
+        resource = ""
+        for seg in non_param[1:]:
+            if seg not in _INFIX_SEGMENTS:
+                resource = seg
+                break
+        if not resource:
+            resource = module
 
     # Infer role from path infixes (prefer explicit role tokens; allow short tokens like p/m/shop after module)
     inferred_role = "common"
@@ -261,8 +298,25 @@ def _normalize_endpoint_parts(path: str, host: str = "") -> tuple[str, str, str]
 
 def _classify_action(method: str, path: str) -> str:
     m_up = (method or "GET").upper().strip()
-    raw_segs = [s.strip().lower() for s in (path or "/").split("/") if s.strip()]
+    base_path, op_frag = _split_path_and_op(path)
+    raw_segs = [s.strip().lower() for s in base_path.split("/") if s.strip()]
     non_param = [s for s in raw_segs if not _is_param_segment(s)]
+
+    if op_frag:
+        expanded_op = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", op_frag).lower()
+        op_tokens = [t for t in re.split(r"[^a-z0-9]+", expanded_op) if t]
+        for action, keywords in _ACTION_KEYWORDS:
+            non_get_kws = tuple(kw for kw in keywords if kw != "get")
+            if expanded_op in non_get_kws or any(t in non_get_kws for t in op_tokens):
+                return action
+            if any(
+                expanded_op.startswith(kw) or expanded_op.endswith(kw)
+                for kw in non_get_kws
+                if len(kw) >= 4
+            ):
+                return action
+        if "get" in op_tokens or expanded_op.startswith("get"):
+            return "detail"
 
     # Inspect tail segments from most specific (last) backwards
     tail_segs = list(reversed(non_param[-3:])) if non_param else []
@@ -355,7 +409,9 @@ def _extract_target_path(target_endpoint: str) -> str:
         return ""
     parts = raw.split(None, 1)
     p = parts[1] if len(parts) == 2 else raw
-    return p.split("?", 1)[0].strip().rstrip("/").lower()
+    base_p, op_frag = _split_path_and_op(p)
+    base_p = base_p.rstrip("/").lower() or "/"
+    return f"{base_p}#{op_frag.lower()}" if op_frag else base_p
 
 
 def _best_slot_status(statuses: list[str]) -> str:
@@ -443,7 +499,10 @@ def build_capability_map(
 
         bucket["roles"].add(role)
         bucket["actions"].add(action)
-        clean_p = path.strip().rstrip("/").lower()
+        base_p, op_frag = _split_path_and_op(path)
+        clean_p = base_p.rstrip("/").lower() or "/"
+        if op_frag:
+            clean_p = f"{clean_p}#{op_frag.lower()}"
         if clean_p:
             bucket["ep_paths_low"].add(clean_p)
         for s_slug in ep.get("scenarios") or []:

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -494,6 +499,310 @@ def cmd_mcp(
         raise typer.Exit(code=1) from exc
 
     run_mcp_server(api_url=api_url, transport=transport, host=host, port=port)
+
+
+def _run_async(coro: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _print_gate_table(result: Any) -> None:
+    status_style = "green" if result.passed else "red"
+    status_word = "PASSED" if result.passed else "FAILED"
+    table = Table(title=f"ReconQA Quality Gate — {result.target_label} ({status_word})")
+    table.add_column("Rule", style="cyan", no_wrap=True)
+    table.add_column("Status", style="bold")
+    table.add_column("Actual", justify="right")
+    table.add_column("Threshold", justify="right")
+    table.add_column("Message")
+
+    for rule in result.rules:
+        if rule.skipped:
+            badge = "[yellow]SKIP[/yellow]"
+        elif rule.passed:
+            badge = "[green]PASS[/green]"
+        else:
+            badge = "[red]FAIL[/red]"
+        actual_str = "-" if rule.actual is None else str(rule.actual)
+        thresh_str = "-" if rule.threshold is None else str(rule.threshold)
+        table.add_row(rule.label, badge, actual_str, thresh_str, rule.message)
+
+    console.print(table)
+    console.print(f"[{status_style}]{result.summary}[/{status_style}]")
+
+    if result.webhook_results:
+        wh_table = Table(title="Webhook Notifications")
+        wh_table.add_column("Provider", style="cyan")
+        wh_table.add_column("Status", style="bold")
+        wh_table.add_column("Target")
+        wh_table.add_column("Details")
+        for wh in result.webhook_results:
+            wh_badge = "[green]SENT[/green]" if wh.sent else "[red]FAILED[/red]"
+            detail = (
+                f"HTTP {wh.status_code}"
+                if wh.sent and wh.status_code is not None
+                else (wh.error or f"HTTP {wh.status_code}")
+            )
+            wh_table.add_row(wh.provider, wh_badge, wh.url_masked, str(detail))
+        console.print(wh_table)
+
+
+@app.command("gate")
+def cmd_gate(
+    run_dir: Path | None = typer.Option(None, "--run-dir", help="Offline run workspace directory."),
+    baseline_dir: Path | None = typer.Option(
+        None, "--baseline-dir", help="Optional offline baseline workspace directory."
+    ),
+    chain_runs_dir: Path | None = typer.Option(
+        None, "--chain-runs-dir", help="Optional directory containing chain_runs/*.json checkpoints."
+    ),
+    project_id: str | None = typer.Option(
+        None, "--project-id", help="Project ID for backend DB or API evaluation."
+    ),
+    api_url: str | None = typer.Option(
+        None,
+        "--api-url",
+        help="ReconQA API base URL (e.g. http://127.0.0.1:8000). If omitted with --project-id, queries local DB directly.",
+    ),
+    run_id: str | None = typer.Option(
+        None, "--run-id", help="Target run ID (or filter for chain checkpoints)."
+    ),
+    baseline_run_id: str | None = typer.Option(
+        None, "--baseline-run-id", help="Baseline run ID for coverage/security diff."
+    ),
+    config: Path | None = typer.Option(None, "--config", help="Path to reconqa.yaml."),
+    max_p0_chain_failures: int | None = typer.Option(
+        None,
+        "--max-p0-chain-failures",
+        min=0,
+        help="Maximum allowed P0 chain/assertion failures (default: 0).",
+    ),
+    max_new_high_security: int | None = typer.Option(
+        None,
+        "--max-new-high-security",
+        min=0,
+        help="Maximum allowed new High/Critical security findings (default: 0).",
+    ),
+    max_coverage_drop: float | None = typer.Option(
+        None,
+        "--max-coverage-drop",
+        min=0.0,
+        help="Maximum allowed API coverage drop percentage vs baseline (default: 5.0).",
+    ),
+    max_p95_ms: float | None = typer.Option(
+        None,
+        "--max-p95-ms",
+        min=0.0,
+        help="Maximum allowed P95 latency in milliseconds (disabled if unset).",
+    ),
+    fail_on_high_without_baseline: bool | None = typer.Option(
+        None,
+        "--fail-on-high-without-baseline/--no-fail-on-high-without-baseline",
+        help="Treat all High/Critical security findings as new when no baseline exists.",
+    ),
+    feishu_webhook: str | None = typer.Option(
+        None, "--feishu-webhook", help="Feishu bot webhook URL."
+    ),
+    dingtalk_webhook: str | None = typer.Option(
+        None, "--dingtalk-webhook", help="DingTalk bot webhook URL."
+    ),
+    slack_webhook: str | None = typer.Option(
+        None, "--slack-webhook", help="Slack incoming webhook URL."
+    ),
+    webhook_timeout: float | None = typer.Option(
+        None,
+        "--webhook-timeout",
+        min=0.5,
+        help="Webhook HTTP timeout in seconds (default: 10.0).",
+    ),
+    notify_on_pass: bool = typer.Option(
+        True,
+        "--notify-on-pass/--no-notify-on-pass",
+        help="Dispatch configured webhooks even when the quality gate passes.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print pure JSON result to stdout."),
+) -> None:
+    """Evaluate release Quality Gate rules and optionally send Feishu/DingTalk/Slack alerts."""
+    from reconqa.models.schemas import QualityGateRequest, QualityGateResult
+    from reconqa.modules.hub.quality_gate import (
+        GateLookupError,
+        dispatch_webhooks,
+        evaluate_project_quality_gate_db,
+        evaluate_run_dir_gate,
+        merge_gate_config,
+        validate_webhook_url,
+    )
+
+    err_console = Console(stderr=True) if json_output else console
+
+    if (run_dir is None) == (project_id is None):
+        err_console.print(
+            "[red]Specify exactly one of --run-dir (offline) or --project-id (backend).[/red]"
+        )
+        raise typer.Exit(code=2)
+    if api_url is not None and project_id is None:
+        err_console.print("[red]--api-url requires --project-id.[/red]")
+        raise typer.Exit(code=2)
+    if run_dir is not None and not run_dir.is_dir():
+        err_console.print(f"[red]Run directory does not exist:[/red] {run_dir}")
+        raise typer.Exit(code=2)
+    if baseline_dir is not None and not baseline_dir.is_dir():
+        err_console.print(f"[red]Baseline directory does not exist:[/red] {baseline_dir}")
+        raise typer.Exit(code=2)
+    if chain_runs_dir is not None and not chain_runs_dir.is_dir():
+        err_console.print(f"[red]Chain runs directory does not exist:[/red] {chain_runs_dir}")
+        raise typer.Exit(code=2)
+    if config is not None and not config.is_file():
+        err_console.print(f"[red]Config file does not exist:[/red] {config}")
+        raise typer.Exit(code=2)
+
+    proj_cfg = load_project_config(config)
+    req = QualityGateRequest(
+        run_id=run_id,
+        baseline_run_id=baseline_run_id,
+        max_p0_chain_failures=max_p0_chain_failures,
+        max_new_high_security=max_new_high_security,
+        max_coverage_drop_pct=max_coverage_drop,
+        max_p95_ms=max_p95_ms,
+        fail_on_high_without_baseline=fail_on_high_without_baseline,
+        feishu_webhook=feishu_webhook,
+        dingtalk_webhook=dingtalk_webhook,
+        slack_webhook=slack_webhook,
+        webhook_timeout_sec=webhook_timeout,
+        notify_on_pass=notify_on_pass,
+    )
+    effective_cfg = merge_gate_config(proj_cfg.gate, req)
+
+    if run_dir is not None:
+        result = evaluate_run_dir_gate(
+            run_dir,
+            baseline_dir=baseline_dir,
+            chain_runs_dir=chain_runs_dir,
+            run_id=run_id,
+            gate_config=effective_cfg,
+            project_name=proj_cfg.project_name,
+        )
+        webhooks: dict[str, str | None] = {
+            "feishu": effective_cfg.feishu_webhook,
+            "dingtalk": effective_cfg.dingtalk_webhook,
+            "slack": effective_cfg.slack_webhook,
+        }
+        if any(v for v in webhooks.values()) and (not result.passed or notify_on_pass):
+            result.webhook_results = _run_async(
+                dispatch_webhooks(
+                    webhooks,
+                    result,
+                    timeout_sec=effective_cfg.webhook_timeout_sec,
+                )
+            )
+    elif api_url is not None:
+        assert project_id is not None
+        ok_url, url_err = validate_webhook_url(api_url)
+        if not ok_url:
+            err_console.print(f"[red]Invalid --api-url:[/red] {url_err}")
+            raise typer.Exit(code=2)
+        clean_api = api_url.strip().rstrip("/")
+        try:
+            api_parts = urlsplit(clean_api)
+            _ = api_parts.port
+        except ValueError as exc:
+            err_console.print(f"[red]Invalid --api-url:[/red] {exc}")
+            raise typer.Exit(code=2) from exc
+        host = (api_parts.hostname or "").strip().lower().rstrip(".")
+        is_loopback = host in {"127.0.0.1", "localhost", "::1"}
+        http_timeout = max(30.0, effective_cfg.webhook_timeout_sec + 10.0)
+        api_req = (
+            QualityGateRequest(
+                run_id=run_id,
+                baseline_run_id=baseline_run_id,
+                max_p0_chain_failures=effective_cfg.max_p0_chain_failures,
+                max_new_high_security=effective_cfg.max_new_high_security,
+                max_coverage_drop_pct=effective_cfg.max_coverage_drop_pct,
+                max_p95_ms=effective_cfg.max_p95_ms,
+                fail_on_high_without_baseline=effective_cfg.fail_on_high_without_baseline,
+                feishu_webhook=effective_cfg.feishu_webhook,
+                dingtalk_webhook=effective_cfg.dingtalk_webhook,
+                slack_webhook=effective_cfg.slack_webhook,
+                webhook_timeout_sec=effective_cfg.webhook_timeout_sec,
+                notify_on_pass=notify_on_pass,
+            )
+            if config is not None
+            else req
+        )
+        try:
+            with httpx.Client(
+                timeout=httpx.Timeout(http_timeout),
+                follow_redirects=False,
+                trust_env=not is_loopback,
+            ) as client:
+                resp = client.post(
+                    f"{clean_api}/api/v1/projects/{project_id}/gate",
+                    json=api_req.model_dump(mode="json", exclude_none=True),
+                )
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
+            err_console.print(f"[red]Failed to reach ReconQA API:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        if resp.status_code >= 400:
+            err_console.print(
+                f"[red]API returned HTTP {resp.status_code}:[/red] {resp.text[:300]}"
+            )
+            raise typer.Exit(code=1)
+
+        result = QualityGateResult.model_validate(resp.json())
+    else:
+        assert project_id is not None
+
+        async def _eval_local_db() -> QualityGateResult:
+            import reconqa.models.db as db_mod
+
+            try:
+                await db_mod.init_db()
+                factory = db_mod.get_session_factory()
+                async with factory() as db:
+                    gate_res, merged_cfg = await evaluate_project_quality_gate_db(
+                        db,
+                        project_id,
+                        req,
+                        project_config=proj_cfg,
+                    )
+                webhooks_db: dict[str, str | None] = {
+                    "feishu": merged_cfg.feishu_webhook,
+                    "dingtalk": merged_cfg.dingtalk_webhook,
+                    "slack": merged_cfg.slack_webhook,
+                }
+                if any(v for v in webhooks_db.values()) and (
+                    not gate_res.passed or notify_on_pass
+                ):
+                    gate_res.webhook_results = await dispatch_webhooks(
+                        webhooks_db,
+                        gate_res,
+                        timeout_sec=merged_cfg.webhook_timeout_sec,
+                    )
+                return gate_res
+            finally:
+                if db_mod._engine is not None:
+                    await db_mod._engine.dispose()
+                db_mod._engine = None
+                db_mod._session_factory = None
+
+        try:
+            result = _run_async(_eval_local_db())
+        except GateLookupError as exc:
+            err_console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+
+    if json_output:
+        typer.echo(result.model_dump_json(indent=2))
+    else:
+        _print_gate_table(result)
+
+    if not result.passed:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

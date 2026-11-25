@@ -1178,6 +1178,11 @@ def create_mcp_server(
         body: Any = None,
         credential_id: str | None = None,
         timeout_sec: float = 15.0,
+        assertions: list[dict[str, Any]] | None = None,
+        include_scenario_assertions: bool = True,
+        sync_scenarios: bool = True,
+        db_dsn_ref: str | None = None,
+        context_vars: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Safely replay an HTTP endpoint via ReconQA with optional server-side AuthProfile injection (4KB response cap)."""
         eff_timeout = max(1.0, min(float(timeout_sec or 15.0), 30.0))
@@ -1190,6 +1195,16 @@ def create_mcp_server(
             "credential_id": credential_id,
             "timeout_sec": eff_timeout,
         }
+        if assertions is not None:
+            payload["assertions"] = assertions
+        if not include_scenario_assertions:
+            payload["include_scenario_assertions"] = False
+        if not sync_scenarios:
+            payload["sync_scenarios"] = False
+        if db_dsn_ref is not None:
+            payload["db_dsn_ref"] = db_dsn_ref
+        if context_vars is not None:
+            payload["context_vars"] = dict(context_vars)
         data = await client.request_json(
             "POST",
             f"/projects/{project_id}/replay",
@@ -1228,6 +1243,9 @@ def create_mcp_server(
             "body_text": safe_body_text,
             "truncated": truncated,
             "error": data.get("error"),
+            "assertion_results": list(data.get("assertion_results") or []),
+            "synced_scenarios": int(data.get("synced_scenarios", 0) or 0),
+            "synced_assertions": int(data.get("synced_assertions", 0) or 0),
         }
 
     @mcp.tool()
@@ -1392,6 +1410,8 @@ def create_mcp_server(
         credential_id: str | None = None,
         initial_vars: dict[str, Any] | None = None,
         step_assertions: dict[str, list[dict[str, Any]]] | None = None,
+        include_scenario_assertions: bool = True,
+        sync_scenarios: bool = True,
         db_dsn_ref: str | None = None,
         stop_on_failure: bool = True,
     ) -> dict[str, Any]:
@@ -1405,6 +1425,8 @@ def create_mcp_server(
             "credential_id": credential_id,
             "initial_vars": dict(initial_vars or {}),
             "step_assertions": dict(step_assertions or {}),
+            "include_scenario_assertions": include_scenario_assertions,
+            "sync_scenarios": sync_scenarios,
             "db_dsn_ref": db_dsn_ref,
             "stop_on_failure": stop_on_failure,
         }
@@ -1424,6 +1446,8 @@ def create_mcp_server(
             "completed_steps": int(data.get("completed_steps", 0) or 0),
             "failed_step_index": data.get("failed_step_index"),
             "resumed_from_index": data.get("resumed_from_index"),
+            "synced_scenarios": int(data.get("synced_scenarios", 0) or 0),
+            "synced_assertions": int(data.get("synced_assertions", 0) or 0),
             "context_vars": data.get("context_vars") or {},
             "step_results": [
                 {
@@ -1453,6 +1477,7 @@ def create_mcp_server(
         override_step_assertions: list[dict[str, Any]] | None = None,
         credential_id: str | None = None,
         db_dsn_ref: str | None = None,
+        sync_scenarios: bool = True,
     ) -> dict[str, Any]:
         """Resume a failed/partial chain run from its checkpoint step without re-running prior passed steps."""
         payload: dict[str, Any] = {
@@ -1462,6 +1487,7 @@ def create_mcp_server(
             "override_step_assertions": override_step_assertions,
             "credential_id": credential_id,
             "db_dsn_ref": db_dsn_ref,
+            "sync_scenarios": sync_scenarios,
         }
         data = await client.request_json(
             "POST",
@@ -1479,6 +1505,8 @@ def create_mcp_server(
             "completed_steps": int(data.get("completed_steps", 0) or 0),
             "failed_step_index": data.get("failed_step_index"),
             "resumed_from_index": data.get("resumed_from_index"),
+            "synced_scenarios": int(data.get("synced_scenarios", 0) or 0),
+            "synced_assertions": int(data.get("synced_assertions", 0) or 0),
             "context_vars": data.get("context_vars") or {},
             "step_results": [
                 {

@@ -13,11 +13,14 @@ import {
   FileUp,
   Layers,
   List,
+  Loader2,
   Play,
   RefreshCw,
   Search,
+  X,
 } from "lucide-vue-next";
 import { getProjectInventory, getProjectInventoryOpenApiUrl } from "@/api/projects";
+import { downloadPostmanCollection } from "@/api/reports";
 import type {
   InventoryEndpoint,
   InventoryScenarioMeta,
@@ -43,7 +46,22 @@ const projectId = computed(() =>
 
 const loading = ref(true);
 const error = ref<string | null>(null);
+const exportingPostman = ref(false);
+const exportError = ref<string | null>(null);
 const inventory = ref<ProjectInventoryResponse | null>(null);
+
+async function handleExportPostman(): Promise<void> {
+  if (!projectId.value || exportingPostman.value) return;
+  exportingPostman.value = true;
+  exportError.value = null;
+  try {
+    await downloadPostmanCollection(projectId.value);
+  } catch (err) {
+    exportError.value = err instanceof Error ? err.message : t("inv.exportError");
+  } finally {
+    exportingPostman.value = false;
+  }
+}
 
 const searchQuery = ref("");
 const methodFilter = ref("ALL");
@@ -422,6 +440,17 @@ onMounted(() => {
             <RefreshCw class="h-3.5 w-3.5" />
             <span>{{ t("inv.refresh") }}</span>
           </button>
+          <button
+            type="button"
+            data-testid="inventory-export-postman-btn"
+            class="btn-secondary !py-1.5 !text-xs"
+            :disabled="exportingPostman"
+            @click="handleExportPostman"
+          >
+            <Loader2 v-if="exportingPostman" class="h-3.5 w-3.5 animate-spin" />
+            <Download v-else class="h-3.5 w-3.5" />
+            <span>{{ exportingPostman ? t("inv.exportingPostman") : t("inv.exportPostman") }}</span>
+          </button>
           <a
             :href="getProjectInventoryOpenApiUrl(projectId)"
             download
@@ -432,6 +461,24 @@ onMounted(() => {
             <span>{{ t("inv.downloadOpenApi") }}</span>
           </a>
         </div>
+      </div>
+
+      <div
+        v-if="exportError"
+        data-testid="inventory-export-error"
+        class="flex items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-800"
+      >
+        <div class="flex items-center gap-2">
+          <AlertTriangle class="h-4 w-4 shrink-0 text-rose-600" />
+          <span>{{ exportError }}</span>
+        </div>
+        <button
+          type="button"
+          class="rounded p-0.5 text-rose-600 hover:bg-rose-100"
+          @click="exportError = null"
+        >
+          <X class="h-3.5 w-3.5" />
+        </button>
       </div>
 
       <!-- 4 Summary KPIs -->

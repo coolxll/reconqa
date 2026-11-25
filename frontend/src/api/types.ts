@@ -812,6 +812,8 @@ export interface ReplayRequest {
   assertions?: Array<Partial<ScenarioAssertion> & { operator: ScenarioAssertionOperator }> | null;
   db_dsn_ref?: string | null;
   context_vars?: Record<string, unknown>;
+  include_scenario_assertions?: boolean;
+  sync_scenarios?: boolean;
 }
 
 export interface ReplayResponse {
@@ -825,6 +827,8 @@ export interface ReplayResponse {
   truncated: boolean;
   error?: string | null;
   assertion_results?: AssertionEvalResult[];
+  synced_scenarios?: number;
+  synced_assertions?: number;
 }
 
 // --- Lightweight Chain Runner & Checkpoint/Resume ---
@@ -853,6 +857,7 @@ export interface ChainExecuteRequest {
   initial_vars?: Record<string, unknown>;
   step_assertions?: Record<string, Array<Partial<ScenarioAssertion>>>;
   include_scenario_assertions?: boolean;
+  sync_scenarios?: boolean;
   db_dsn_ref?: string | null;
   stop_on_failure?: boolean;
   timeout_sec?: number;
@@ -867,6 +872,7 @@ export interface ChainResumeRequest {
   credential_id?: string | null;
   base_url?: string | null;
   db_dsn_ref?: string | null;
+  sync_scenarios?: boolean;
   stop_on_failure?: boolean;
   timeout_sec?: number;
 }
@@ -902,6 +908,8 @@ export interface ChainRunOut {
   base_url: string;
   context_vars: Record<string, unknown>;
   step_results: ChainStepResult[];
+  synced_scenarios?: number;
+  synced_assertions?: number;
   created_at: string;
   updated_at: string;
 }
@@ -1119,4 +1127,267 @@ export interface SseRunEvent {
   summary_metrics?: RunSummaryMetrics;
   jobs?: Array<{ id: string; module: string; status: string }>;
   [key: string]: unknown;
+}
+
+// --- Standalone Acceptance Report (R4) ---
+
+export type AcceptanceReportFormat = "html" | "markdown" | "json";
+
+export interface AcceptanceApiPrefixItem {
+  prefix: string;
+  total: number;
+  covered: number;
+  coverage_pct: number;
+}
+
+export interface AcceptanceApiCoverage {
+  total_endpoints: number;
+  har_live_count: number;
+  js_static_count: number;
+  coverage_pct: number;
+  runs_merged_count: number;
+  explore_sessions_count: number;
+  by_prefix: AcceptanceApiPrefixItem[];
+}
+
+export interface AcceptanceDefenseSlot {
+  slot: string;
+  status: string;
+  count: number;
+}
+
+export interface AcceptanceCapabilityItem {
+  key: string;
+  module: string;
+  resource: string;
+  display_name: string;
+  title_zh: string;
+  title_en: string;
+  recommended_priority: string;
+  is_core: boolean;
+  total_endpoints: number;
+  live_endpoints: number;
+  live_pct: number;
+  roles: string[];
+  case_coverage_pct: number;
+  case_matrix: AcceptanceDefenseSlot[];
+}
+
+export interface AcceptanceCapabilityMap {
+  metrics: Record<string, unknown>;
+  capabilities: AcceptanceCapabilityItem[];
+}
+
+export interface AcceptanceScenarioAssertionItem {
+  id: string;
+  title: string;
+  target_endpoint: string;
+  operator: string;
+  expected: string;
+  status: string;
+}
+
+export interface AcceptanceScenarioItem {
+  id: string;
+  slug: string;
+  name: string;
+  priority: string;
+  status: string;
+  effectiveness_level: string;
+  endpoint_count: number;
+  run_count: number;
+  assertion_count: number;
+  assertions_passed_count: number;
+  negative_case_count: number;
+  negative_cases_covered_count: number;
+  assertions: AcceptanceScenarioAssertionItem[];
+}
+
+export interface AcceptanceScenarioStats {
+  total: number;
+  by_priority: Record<string, number>;
+  by_effectiveness: Record<string, number>;
+  p0_p1_total: number;
+  p0_p1_effective_count: number;
+  p0_p1_effective_pct: number;
+  total_assertions: number;
+  assertions_passed: number;
+  assertions_failed: number;
+  assertions_pending: number;
+  total_negative_cases: number;
+  negative_cases_covered: number;
+  scenarios: AcceptanceScenarioItem[];
+}
+
+export interface AcceptanceChainAssertionEvidence {
+  id: string;
+  title: string;
+  operator: string;
+  passed: boolean;
+  actual?: unknown;
+  expected: string;
+  message: string;
+}
+
+export interface AcceptanceChainStepEvidence {
+  step_index: number;
+  step: number;
+  name: string;
+  method: string;
+  url: string;
+  status: string;
+  status_code: number;
+  duration_ms: number;
+  error?: string | null;
+  assertions: AcceptanceChainAssertionEvidence[];
+}
+
+export interface AcceptanceChainEvidenceItem {
+  chain_run_id: string;
+  chain_name: string;
+  run_id?: string | null;
+  status: string;
+  total_steps: number;
+  completed_steps: number;
+  created_at: string;
+  updated_at: string;
+  step_results: AcceptanceChainStepEvidence[];
+}
+
+export interface AcceptanceChainEvidenceSummary {
+  total_chain_runs: number;
+  passed_chains: number;
+  failed_chains: number;
+  chain_pass_rate_pct: number;
+  total_assertions_evaluated: number;
+  assertions_passed: number;
+  assertions_failed: number;
+  chains: AcceptanceChainEvidenceItem[];
+}
+
+export interface AcceptanceFindingItem {
+  id: string;
+  category: string;
+  severity: string;
+  endpoint: string;
+  title: string;
+  evidence: Record<string, unknown>;
+}
+
+export interface AcceptanceSecurityFindings {
+  total_count: number;
+  by_severity: Record<string, number>;
+  high_critical_count: number;
+  high_critical_items: AcceptanceFindingItem[];
+}
+
+export interface AcceptancePerformanceSummary {
+  total_count: number;
+  by_severity: Record<string, number>;
+  high_critical_count: number;
+  high_critical_items: AcceptanceFindingItem[];
+  har_perf_summary: Record<string, unknown> | null;
+  slowest_ttfb: Array<Record<string, unknown>>;
+  k6_analysis: Record<string, unknown> | null;
+}
+
+export interface AcceptanceSummaryVerdict {
+  overall_status: "passed" | "attention_needed" | "failed";
+  api_coverage_pct: number;
+  capability_coverage_pct: number;
+  p0_p1_effective_pct: number;
+  chain_pass_rate_pct: number;
+  high_critical_security_count: number;
+  high_critical_perf_count: number;
+}
+
+export interface AcceptanceReportData {
+  project_id: string;
+  project_name: string;
+  project_slug: string;
+  run_id: string | null;
+  generated_at: string;
+  summary: AcceptanceSummaryVerdict;
+  api_coverage: AcceptanceApiCoverage;
+  capability_map: AcceptanceCapabilityMap;
+  scenarios: AcceptanceScenarioStats;
+  chain_evidence: AcceptanceChainEvidenceSummary;
+  security_findings: AcceptanceSecurityFindings;
+  performance: AcceptancePerformanceSummary;
+}
+
+// --- Quality Gate & Webhook DTOs (R5) ---
+
+export type QualityGateRuleKey =
+  | "p0_chain_failures"
+  | "new_high_security"
+  | "coverage_drop_pct"
+  | "p95_latency_ms"
+  | string;
+
+export interface GateRuleResult {
+  rule: QualityGateRuleKey;
+  label: string;
+  passed: boolean;
+  skipped: boolean;
+  actual: number | null;
+  threshold: number | null;
+  message: string;
+  details: Record<string, unknown>;
+}
+
+export interface QualityGateMetrics {
+  p0_chain_failures: number;
+  p0_failed_chains: number;
+  p0_failed_assertions: number;
+  total_chain_runs: number;
+  high_security_count: number;
+  baseline_high_security_count: number | null;
+  new_high_security_count: number;
+  current_coverage_pct: number | null;
+  baseline_coverage_pct: number | null;
+  coverage_drop_pct: number | null;
+  p95_ms: number | null;
+  p95_source: "k6" | "har" | "none";
+  baseline_available: boolean;
+}
+
+export type WebhookProvider = "feishu" | "dingtalk" | "slack";
+
+export interface WebhookDeliveryResult {
+  provider: WebhookProvider;
+  url_masked: string;
+  sent: boolean;
+  status_code: number | null;
+  error: string | null;
+}
+
+export interface QualityGateRequest {
+  run_id?: string | null;
+  baseline_run_id?: string | null;
+  max_p0_chain_failures?: number | null;
+  max_new_high_security?: number | null;
+  max_coverage_drop_pct?: number | null;
+  max_p95_ms?: number | null;
+  fail_on_high_without_baseline?: boolean | null;
+  feishu_webhook?: string | null;
+  dingtalk_webhook?: string | null;
+  slack_webhook?: string | null;
+  webhook_timeout_sec?: number | null;
+  notify_on_pass?: boolean;
+}
+
+export interface QualityGateResult {
+  project_id: string | null;
+  project_name: string;
+  target_label: string;
+  run_id: string | null;
+  baseline_run_id: string | null;
+  passed: boolean;
+  status: "passed" | "failed";
+  evaluated_at: string;
+  rules: GateRuleResult[];
+  metrics: QualityGateMetrics;
+  summary: string;
+  webhook_results: WebhookDeliveryResult[];
 }

@@ -1,11 +1,16 @@
-import { apiFetch } from "./client";
+import { API_BASE, apiBlob, apiFetch } from "./client";
+import { triggerBlobDownload } from "@/utils/gateAndExport";
 import type {
+  AcceptanceReportData,
+  AcceptanceReportFormat,
   DoctorInstallResult,
   DoctorToolStatus,
   Finding,
   JavaAllureReport,
   PerformanceReport,
   ProjectTrendsResponse,
+  QualityGateRequest,
+  QualityGateResult,
   SecurityReport,
 } from "./types";
 
@@ -55,4 +60,111 @@ export function installDoctorTool(tool: string): Promise<DoctorInstallResult> {
     method: "POST",
     body: JSON.stringify({ tool }),
   });
+}
+
+// --- Standalone Acceptance Report & Postman v2.1 Export (R4) ---
+
+export function getAcceptanceReportUrl(
+  projectId: string,
+  options?: { format?: AcceptanceReportFormat; runId?: string | null }
+): string {
+  const params = new URLSearchParams();
+  params.set("format", options?.format ?? "html");
+  if (options?.runId && options.runId.trim()) {
+    params.set("run_id", options.runId.trim());
+  }
+  return `${API_BASE}/projects/${encodeURIComponent(projectId)}/acceptance-report?${params.toString()}`;
+}
+
+export function getPostmanExportUrl(
+  projectId: string,
+  runId?: string | null
+): string {
+  const params = new URLSearchParams();
+  if (runId && runId.trim()) {
+    params.set("run_id", runId.trim());
+  }
+  const qs = params.toString();
+  const base = `${API_BASE}/projects/${encodeURIComponent(projectId)}/export/postman`;
+  return qs ? `${base}?${qs}` : base;
+}
+
+export function getAcceptanceReport(
+  projectId: string,
+  runId?: string | null
+): Promise<AcceptanceReportData> {
+  const params = new URLSearchParams({ format: "json" });
+  if (runId && runId.trim()) {
+    params.set("run_id", runId.trim());
+  }
+  return apiFetch<AcceptanceReportData>(
+    `/projects/${encodeURIComponent(projectId)}/acceptance-report?${params.toString()}`
+  );
+}
+
+export function fetchAcceptanceReportBlob(
+  projectId: string,
+  options?: { format?: Exclude<AcceptanceReportFormat, "json">; runId?: string | null }
+): Promise<{ blob: Blob; filename: string | null; contentType: string }> {
+  const params = new URLSearchParams();
+  params.set("format", options?.format ?? "html");
+  if (options?.runId && options.runId.trim()) {
+    params.set("run_id", options.runId.trim());
+  }
+  return apiBlob(
+    `/projects/${encodeURIComponent(projectId)}/acceptance-report?${params.toString()}`
+  );
+}
+
+export async function downloadAcceptanceReport(
+  projectId: string,
+  options?: { format?: Exclude<AcceptanceReportFormat, "json">; runId?: string | null }
+): Promise<string> {
+  const format = options?.format ?? "html";
+  const { blob, filename } = await fetchAcceptanceReportBlob(projectId, {
+    format,
+    runId: options?.runId,
+  });
+  const ext = format === "markdown" ? "md" : "html";
+  const resolvedName = filename || `${projectId}-acceptance-report.${ext}`;
+  triggerBlobDownload(blob, resolvedName);
+  return resolvedName;
+}
+
+export function fetchPostmanCollectionBlob(
+  projectId: string,
+  runId?: string | null
+): Promise<{ blob: Blob; filename: string | null; contentType: string }> {
+  const params = new URLSearchParams();
+  if (runId && runId.trim()) {
+    params.set("run_id", runId.trim());
+  }
+  const qs = params.toString();
+  const base = `/projects/${encodeURIComponent(projectId)}/export/postman`;
+  return apiBlob(qs ? `${base}?${qs}` : base);
+}
+
+export async function downloadPostmanCollection(
+  projectId: string,
+  runId?: string | null
+): Promise<string> {
+  const { blob, filename } = await fetchPostmanCollectionBlob(projectId, runId);
+  const resolvedName = filename || `${projectId}-postman-collection.json`;
+  triggerBlobDownload(blob, resolvedName);
+  return resolvedName;
+}
+
+// --- Quality Gate API (R5) ---
+
+export function evaluateProjectQualityGate(
+  projectId: string,
+  payload?: QualityGateRequest
+): Promise<QualityGateResult> {
+  return apiFetch<QualityGateResult>(
+    `/projects/${encodeURIComponent(projectId)}/gate`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload ?? {}),
+    }
+  );
 }

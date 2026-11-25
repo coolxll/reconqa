@@ -94,6 +94,13 @@ registerMessages({
     "cap.col.replay": "调试",
     "cap.tryIt": "Try It",
     "cap.noEndpoints": "该能力下暂无接口明细。",
+
+    // R4 Acceptance Report & Postman Exports
+    "cap.exportHtml": "导出报告 (HTML)",
+    "cap.exportMd": "导出报告 (MD)",
+    "cap.exportPostman": "导出 Postman v2.1",
+    "cap.exporting": "导出中…",
+    "cap.errorExport": "导出文件失败。",
   },
   en: {
     "cap.loading": "Synthesizing Business Capability Quality Matrix…",
@@ -189,5 +196,12 @@ registerMessages({
     "cap.col.replay": "Replay",
     "cap.tryIt": "Try It",
     "cap.noEndpoints": "No endpoints recorded for this capability.",
+
+    // R4 Acceptance Report & Postman Exports
+    "cap.exportHtml": "Export Report (HTML)",
+    "cap.exportMd": "Export Report (MD)",
+    "cap.exportPostman": "Export Postman v2.1",
+    "cap.exporting": "Exporting…",
+    "cap.errorExport": "Failed to export file.",
   },
 });

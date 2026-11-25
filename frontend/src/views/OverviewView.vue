@@ -8,22 +8,30 @@ import {
   CheckCircle2,
   Code2,
   Compass,
+  Download,
+  FileText,
   FileUp,
   FolderKanban,
   Gauge,
   GitBranch,
   Globe,
   HelpCircle,
+  Loader2,
   RefreshCw,
   Settings,
   ShieldCheck,
   Wrench,
+  X,
   XCircle,
 } from "lucide-vue-next";
 import { getProjectInventory, listKnowledgeDocs, listTargets } from "@/api/projects";
 import { listProjectScenarios } from "@/api/scenarios";
 import { getRunTitle, listProjectRuns, shortRunId } from "@/api/runs";
-import { getDoctorStatus } from "@/api/reports";
+import {
+  downloadAcceptanceReport,
+  downloadPostmanCollection,
+  getDoctorStatus,
+} from "@/api/reports";
 import type {
   DoctorToolStatus,
   KnowledgeDoc,
@@ -60,8 +68,27 @@ const projectId = computed(
 const loading = ref(true);
 const doctorLoading = ref(true);
 const error = ref<string | null>(null);
+const exportingKind = ref<"html" | "markdown" | "postman" | null>(null);
+const exportError = ref<string | null>(null);
 const acceptancePromptOpen = ref(false);
 const pillarsManualToggle = ref<boolean | null>(null);
+
+async function handleExportDeliverable(kind: "html" | "markdown" | "postman"): Promise<void> {
+  if (!projectId.value || exportingKind.value) return;
+  exportingKind.value = kind;
+  exportError.value = null;
+  try {
+    if (kind === "postman") {
+      await downloadPostmanCollection(projectId.value);
+    } else {
+      await downloadAcceptanceReport(projectId.value, { format: kind });
+    }
+  } catch (err) {
+    exportError.value = err instanceof Error ? err.message : t("projOverview.exportError");
+  } finally {
+    exportingKind.value = null;
+  }
+}
 
 const showPillars = computed(() => {
   if (pillarsManualToggle.value !== null) return pillarsManualToggle.value;
@@ -661,6 +688,89 @@ onMounted(async () => {
               </tr>
             </tbody>
           </table>
+        </div>
+      </section>
+
+      <!-- Compact Deliverable Exports Strip (R4) -->
+      <section class="card px-5 py-4" data-testid="overview-exports-strip">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-center gap-3">
+            <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600">
+              <FileText class="h-4 w-4" />
+            </div>
+            <div>
+              <h3 class="text-sm font-semibold text-slate-900">
+                {{ t("projOverview.exportsTitle") }}
+              </h3>
+              <p class="text-xs text-slate-500">
+                {{ t("projOverview.exportsDesc") }}
+              </p>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              data-testid="overview-export-html-btn"
+              class="btn-secondary !px-3 !py-1.5 !text-xs"
+              :disabled="Boolean(exportingKind)"
+              @click="handleExportDeliverable('html')"
+            >
+              <Loader2 v-if="exportingKind === 'html'" class="h-3.5 w-3.5 animate-spin" />
+              <FileText v-else class="h-3.5 w-3.5" />
+              <span>
+                {{ exportingKind === "html" ? t("projOverview.exporting") : t("projOverview.exportHtml") }}
+              </span>
+            </button>
+            <button
+              type="button"
+              data-testid="overview-export-md-btn"
+              class="btn-secondary !px-3 !py-1.5 !text-xs"
+              :disabled="Boolean(exportingKind)"
+              @click="handleExportDeliverable('markdown')"
+            >
+              <Loader2 v-if="exportingKind === 'markdown'" class="h-3.5 w-3.5 animate-spin" />
+              <FileText v-else class="h-3.5 w-3.5" />
+              <span>
+                {{ exportingKind === "markdown" ? t("projOverview.exporting") : t("projOverview.exportMd") }}
+              </span>
+            </button>
+            <button
+              type="button"
+              data-testid="overview-export-postman-btn"
+              class="btn-secondary !px-3 !py-1.5 !text-xs"
+              :disabled="Boolean(exportingKind)"
+              @click="handleExportDeliverable('postman')"
+            >
+              <Loader2 v-if="exportingKind === 'postman'" class="h-3.5 w-3.5 animate-spin" />
+              <Download v-else class="h-3.5 w-3.5" />
+              <span>
+                {{
+                  exportingKind === "postman"
+                    ? t("projOverview.exporting")
+                    : t("projOverview.exportPostman")
+                }}
+              </span>
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-if="exportError"
+          data-testid="overview-export-error"
+          class="mt-3 flex items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3.5 py-2 text-xs text-rose-800"
+        >
+          <div class="flex items-center gap-2">
+            <AlertTriangle class="h-4 w-4 shrink-0 text-rose-600" />
+            <span>{{ exportError }}</span>
+          </div>
+          <button
+            type="button"
+            class="rounded p-0.5 text-rose-600 hover:bg-rose-100"
+            @click="exportError = null"
+          >
+            <X class="h-3.5 w-3.5" />
+          </button>
         </div>
       </section>
 

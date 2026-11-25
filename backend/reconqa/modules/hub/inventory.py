@@ -505,6 +505,15 @@ def build_project_inventory(
             if not isinstance(ep, dict):
                 continue
             ep_path = str(ep.get("path") or "")
+            ep_op_name = str(ep.get("operation_name") or ep.get("operationName") or "").strip()
+            if ep_op_name:
+                norm_ep_path, _ = normalize_path(ep_path or "/")
+                if "#" not in norm_ep_path:
+                    clean_op = (
+                        re.sub(r"[^A-Za-z0-9_.-]+", "_", ep_op_name).strip("_").lstrip("/!.")
+                    )
+                    if clean_op:
+                        ep_path = f"{norm_ep_path}#{clean_op}"
             ep_url = str(ep.get("url") or "")
             ep_host = (urlparse(ep_url).netloc if ep_url else "") or default_host
             ep_source = str(ep.get("source") or "js-static")

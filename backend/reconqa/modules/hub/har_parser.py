@@ -394,6 +394,8 @@ class HarEntry:
     timings: dict[str, float] = field(default_factory=dict)
     ttfb_ms: float = 0.0
     has_auth: bool = False
+    graphql_operation_name: str | None = None
+    graphql_operation_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -426,6 +428,8 @@ class HarEntry:
             "timings": dict(self.timings),
             "ttfb_ms": self.ttfb_ms,
             "has_auth": self.has_auth,
+            "graphql_operation_name": self.graphql_operation_name,
+            "graphql_operation_type": self.graphql_operation_type,
         }
 
 
@@ -502,13 +506,28 @@ def _derive_param_name(prev_segment: str, used: set[str]) -> str:
 def normalize_path(path: str) -> tuple[str, dict[str, str]]:
     """Normalize dynamic path segments into semantic OpenAPI placeholders.
 
+    Preserves non-SPA ``#OperationName`` fragments (e.g. ``/graphql#GetOrderList``)
+    while stripping query strings and SPA hash routes (``#/dashboard``, ``#!/home``).
+
     Returns ``(normalized_path, raw_params_map)``, e.g.:
     ``normalize_path("/api/v1/items/9823410")`` ->
     ``("/api/v1/items/{itemId}", {"itemId": "9823410"})``.
     """
-    raw = path.split("?", 1)[0].split("#", 1)[0].strip()
+    raw_in = (path or "").strip()
+    if "#" in raw_in:
+        before_frag, after_frag = raw_in.split("#", 1)
+        raw = before_frag.split("?", 1)[0].strip()
+        frag = after_frag.split("?", 1)[0].strip()
+    else:
+        raw = raw_in.split("?", 1)[0].strip()
+        frag = ""
+
+    if not frag or frag.startswith(("/", "!")):
+        frag = ""
+
     if not raw:
-        return "/", {}
+        base_norm = "/"
+        return (f"{base_norm}#{frag}" if frag else base_norm), {}
     if not raw.startswith("/"):
         raw = "/" + raw
     raw = re.sub(r"/{2,}", "/", raw)
@@ -534,7 +553,8 @@ def normalize_path(path: str) -> tuple[str, dict[str, str]]:
         else:
             normalized_segments.append(seg)
 
-    return "/" + "/".join(normalized_segments), raw_params
+    base_norm = "/" + "/".join(normalized_segments)
+    return (f"{base_norm}#{frag}" if frag else base_norm), raw_params
 
 
 def _normalize_target_domain(target_domain: str | None) -> str | None:
@@ -685,6 +705,185 @@ def _is_static_asset(
     return False
 
 
+_GQL_COMMENT_RE = re.compile(r"#[^\r\n]*")
+_GQL_NAMED_OP_RE = re.compile(
+    r"(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"(?:\([^)]*\))?(?:\s*@[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*\))?)*\s*\{"
+)
+_GQL_ANON_TYPE_RE = re.compile(
+    r"(query|mutation|subscription)\s*"
+    r"(?:\([^)]*\))?(?:\s*@[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*\))?)*\s*\{"
+)
+_GQL_FRAGMENT_HEAD_RE = re.compile(r"fragment\b")
+
+
+def _sanitize_graphql_op_name(name: str | None) -> str | None:
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("_").lstrip("/!.")
+    return cleaned or None
+
+
+def _is_graphql_path_or_mime(raw_path: str, req_mime: str) -> bool:
+    if "graphql" in (req_mime or "").lower():
+        return True
+    clean_path = (raw_path or "").split("#", 1)[0].split("?", 1)[0]
+    segments = [s.strip().lower() for s in clean_path.split("/") if s.strip()]
+    return any(s in {"graphql", "gql"} or s.endswith("graphql") for s in segments)
+
+
+def _skip_gql_leading_fragments(cleaned: str) -> int:
+    """Advance past any leading top-level `fragment ... { ... }` definitions."""
+    n = len(cleaned)
+    pos = 0
+    while pos < n:
+        while pos < n and cleaned[pos].isspace():
+            pos += 1
+        if not _GQL_FRAGMENT_HEAD_RE.match(cleaned, pos):
+            break
+        depth = 0
+        saw_brace = False
+        i = pos
+        while i < n:
+            if cleaned.startswith('"""', i):
+                end_block = cleaned.find('"""', i + 3)
+                i = n if end_block == -1 else end_block + 3
+                continue
+            ch = cleaned[i]
+            if ch == '"':
+                i += 1
+                while i < n:
+                    if cleaned[i] == "\\":
+                        i += 2
+                        continue
+                    if cleaned[i] == '"':
+                        i += 1
+                        break
+                    i += 1
+                continue
+            if ch == "{":
+                depth += 1
+                saw_brace = True
+            elif ch == "}" and saw_brace:
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        if not saw_brace or depth != 0:
+            break
+        pos = i
+    while pos < n and cleaned[pos].isspace():
+        pos += 1
+    return pos
+
+
+def _extract_op_from_graphql_query(query_text: str) -> tuple[str | None, str | None]:
+    cleaned = _GQL_COMMENT_RE.sub("", str(query_text or "")).strip()
+    if not cleaned:
+        return None, None
+    pos = _skip_gql_leading_fragments(cleaned)
+    if pos >= len(cleaned):
+        return None, None
+    named = _GQL_NAMED_OP_RE.match(cleaned, pos)
+    if named:
+        return _sanitize_graphql_op_name(named.group(2)), named.group(1).lower()
+    anon_type = _GQL_ANON_TYPE_RE.match(cleaned, pos)
+    if anon_type:
+        return None, anon_type.group(1).lower()
+    if cleaned.startswith("{", pos):
+        return None, "query"
+    return None, None
+
+
+def _extract_graphql_ops_for_request(
+    method: str,
+    raw_path: str,
+    req_mime: str,
+    req_body_raw: str | None,
+    req_json: Any,
+    query_params: dict[str, str],
+    resp_json: Any,
+) -> list[tuple[str | None, str | None, Any, Any]]:
+    on_gql_endpoint = _is_graphql_path_or_mime(raw_path, req_mime)
+
+    # Case A: Batched GraphQL JSON array
+    if isinstance(req_json, list) and req_json and all(isinstance(x, dict) for x in req_json):
+        has_gql_keys = any(
+            "query" in x
+            or "operationName" in x
+            or (isinstance(x.get("extensions"), dict) and "persistedQuery" in x["extensions"])
+            for x in req_json
+        )
+        has_named_query = any(
+            isinstance(x.get("query"), str) and _extract_op_from_graphql_query(x["query"])[0] is not None
+            for x in req_json
+        )
+        if (on_gql_endpoint and has_gql_keys) or has_named_query:
+            item_ops: list[tuple[str | None, str | None]] = []
+            for item in req_json:
+                raw_op = item.get("operationName")
+                q_str = item.get("query") if isinstance(item.get("query"), str) else ""
+                q_name, q_type = _extract_op_from_graphql_query(q_str) if q_str else (None, None)
+                op_name = (
+                    _sanitize_graphql_op_name(raw_op)
+                    if isinstance(raw_op, str) and raw_op.strip()
+                    else q_name
+                )
+                item_ops.append((op_name, q_type))
+
+            if len(req_json) == 1:
+                return [(item_ops[0][0], item_ops[0][1], req_json, resp_json)]
+
+            if any(op_n is not None for op_n, _ in item_ops):
+                resp_is_paired_list = isinstance(resp_json, list) and len(resp_json) == len(req_json)
+                return [
+                    (
+                        item_ops[idx][0],
+                        item_ops[idx][1],
+                        item,
+                        resp_json[idx] if resp_is_paired_list else resp_json,
+                    )
+                    for idx, item in enumerate(req_json)
+                ]
+            return [(None, item_ops[0][1], req_json, resp_json)]
+
+    # Case B: Single GraphQL JSON object
+    if isinstance(req_json, dict):
+        q_str = req_json.get("query") if isinstance(req_json.get("query"), str) else ""
+        q_name, q_type = _extract_op_from_graphql_query(q_str) if q_str else (None, None)
+        has_persisted = isinstance(req_json.get("extensions"), dict) and "persistedQuery" in req_json["extensions"]
+        has_gql_keys = "query" in req_json or "operationName" in req_json or has_persisted
+        if (on_gql_endpoint and has_gql_keys) or q_name is not None or has_persisted:
+            raw_op = req_json.get("operationName")
+            op_name = (
+                _sanitize_graphql_op_name(raw_op)
+                if isinstance(raw_op, str) and raw_op.strip()
+                else q_name
+            )
+            return [(op_name, q_type, req_json, resp_json)]
+
+    # Case C: Raw application/graphql body
+    if "graphql" in (req_mime or "").lower() and req_json is None and req_body_raw:
+        op_name, op_type = _extract_op_from_graphql_query(req_body_raw)
+        return [(op_name, op_type, req_json, resp_json)]
+
+    # Case D: GET GraphQL query params
+    if method == "GET" and on_gql_endpoint:
+        raw_op = query_params.get("operationName")
+        q_str = str(query_params.get("query") or "")
+        q_name, q_type = _extract_op_from_graphql_query(q_str) if q_str else (None, None)
+        op_name = (
+            _sanitize_graphql_op_name(raw_op)
+            if isinstance(raw_op, str) and raw_op.strip()
+            else q_name
+        )
+        return [(op_name, q_type, req_json, resp_json)]
+
+    return [(None, None, req_json, resp_json)]
+
+
 def parse_har_file(
     path: Path,
     scenario: str | None = None,
@@ -797,7 +996,7 @@ def parse_har_file(
         timings, total_time = _clean_timings(item.get("timings"), item.get("time", 0))
         started_dt = str(item.get("startedDateTime") or "")
         ts_ms = _parse_timestamp_ms(started_dt)
-        normalized_path, path_params = normalize_path(raw_path)
+        base_normalized_path, path_params = normalize_path(raw_path)
 
         explicit_auth_headers = AUTH_HEADER_NAMES - {"cookie"}
         has_explicit_auth = any(
@@ -810,39 +1009,54 @@ def parse_har_file(
                 cookie_names.extend(parse_cookie_header_names(v))
         has_auth = has_explicit_auth or has_session_cookies(cookie_names)
 
-        entry = HarEntry(
-            index=raw_idx,
-            scenario=scenario_name,
-            started_datetime=started_dt,
-            timestamp_ms=ts_ms,
-            method=method,
-            url=url,
-            scheme=scheme,
-            host=host,
-            raw_path=raw_path,
-            normalized_path=normalized_path,
-            path_params=path_params,
-            query_params=query_params,
-            request_headers=req_headers,
-            request_cookies=req_cookies,
-            request_mime_type=req_mime,
-            request_body_raw=req_body_raw,
-            request_json=req_json,
-            request_form=req_form,
-            status=status_code,
-            status_text=str(resp.get("statusText", "")),
-            response_headers=resp_headers,
-            response_headers_list=resp_headers_list,
-            response_mime_type=resp_mime,
-            response_body_raw=resp_body_raw,
-            response_json=resp_json,
-            response_size=resp_size,
-            time_ms=total_time,
-            timings=timings,
-            ttfb_ms=timings.get("wait", 0.0),
-            has_auth=has_auth,
+        gql_ops = _extract_graphql_ops_for_request(
+            method,
+            raw_path,
+            req_mime,
+            req_body_raw,
+            req_json,
+            query_params,
+            resp_json,
         )
-        parsed.append((ts_ms, raw_idx, entry))
+        for op_name, op_type, entry_req_json, entry_resp_json in gql_ops:
+            entry_norm_path = (
+                f"{base_normalized_path}#{op_name}" if op_name else base_normalized_path
+            )
+            entry = HarEntry(
+                index=raw_idx,
+                scenario=scenario_name,
+                started_datetime=started_dt,
+                timestamp_ms=ts_ms,
+                method=method,
+                url=url,
+                scheme=scheme,
+                host=host,
+                raw_path=raw_path,
+                normalized_path=entry_norm_path,
+                path_params=path_params,
+                query_params=query_params,
+                request_headers=req_headers,
+                request_cookies=req_cookies,
+                request_mime_type=req_mime,
+                request_body_raw=req_body_raw,
+                request_json=entry_req_json,
+                request_form=req_form,
+                status=status_code,
+                status_text=str(resp.get("statusText", "")),
+                response_headers=resp_headers,
+                response_headers_list=resp_headers_list,
+                response_mime_type=resp_mime,
+                response_body_raw=resp_body_raw,
+                response_json=entry_resp_json,
+                response_size=resp_size,
+                time_ms=total_time,
+                timings=timings,
+                ttfb_ms=timings.get("wait", 0.0),
+                has_auth=has_auth,
+                graphql_operation_name=op_name,
+                graphql_operation_type=op_type,
+            )
+            parsed.append((ts_ms, raw_idx, entry))
 
     has_timestamps = all(ts > 0.0 for ts, _, _ in parsed) if parsed else False
     if has_timestamps:

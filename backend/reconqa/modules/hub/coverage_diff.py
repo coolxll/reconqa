@@ -19,7 +19,8 @@ _HTTP_METHODS = {"get", "post", "put", "delete", "patch", "head", "options"}
 
 
 def _group_prefix(normalized_path: str) -> str:
-    segments = [s for s in normalized_path.strip("/").split("/") if s]
+    clean = (normalized_path or "/").split("#", 1)[0]
+    segments = [s for s in clean.strip("/").split("/") if s]
     if not segments:
         return "/"
     non_param = [s for s in segments if not s.startswith("{")]

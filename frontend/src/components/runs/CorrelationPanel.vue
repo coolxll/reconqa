@@ -43,6 +43,7 @@ import { listAuthProfiles } from '@/api/projects'
 import { listProjectScenarios } from '@/api/scenarios'
 import { executeChain, listChainRuns, resumeChainRun } from '@/api/chains'
 import { computeResumeStepIndex, matchesChainCheckpoint } from '@/utils/assertionOperators'
+import { hasSyncFeedback } from '@/utils/gateAndExport'
 import { useWorkspace } from '@/stores/workspace'
 import StatusBadge from '@/components/layout/StatusBadge.vue'
 import EmptyState from '@/components/layout/EmptyState.vue'
@@ -55,6 +56,10 @@ const { activeProjectId } = useWorkspace()
 const props = defineProps<{
   runId: string
   projectId?: string
+}>()
+
+const emit = defineEmits<{
+  synced: [payload: { synced_scenarios: number; synced_assertions: number }]
 }>()
 
 interface ScenarioMeta {
@@ -113,6 +118,7 @@ const resumeFromIndexByChain = ref<Record<string, number>>({})
 const overrideVarsByChain = ref<Record<string, string>>({})
 const overrideBodyByChain = ref<Record<string, string>>({})
 const expandedStepPreviews = ref<Record<string, boolean>>({})
+const syncScenariosByChain = ref<Record<string, boolean>>({})
 
 let mermaidReady = false
 let renderCounter = 0
@@ -343,6 +349,18 @@ function resetRunnerState() {
   expandedStepPreviews.value = {}
   runningByChain.value = {}
   resumingByChain.value = {}
+  syncScenariosByChain.value = {}
+}
+
+function isSyncScenarios(chainKey: string): boolean {
+  return syncScenariosByChain.value[chainKey] ?? true
+}
+
+function setSyncScenarios(chainKey: string, enabled: boolean): void {
+  syncScenariosByChain.value = {
+    ...syncScenariosByChain.value,
+    [chainKey]: enabled,
+  }
 }
 
 function selectChainCheckpoint(chainKey: string, run: ChainRunOut) {
@@ -507,11 +525,18 @@ async function handleExecuteChain(item: IndexedChain) {
       base_url: (baseUrlByChain.value[item.key] ?? '').trim() || null,
       db_dsn_ref: (dbDsnRefByChain.value[item.key] ?? '').trim() || null,
       initial_vars: varsRes.value,
+      sync_scenarios: isSyncScenarios(item.key),
       stop_on_failure: true,
     })
     if (reqSeq !== loadSeq || reqRunnerSeq !== runnerSeq) return
     upsertChainRunInHistory(result)
     selectChainCheckpoint(item.key, result)
+    if (hasSyncFeedback(result)) {
+      emit('synced', {
+        synced_scenarios: result.synced_scenarios ?? 0,
+        synced_assertions: result.synced_assertions ?? 0,
+      })
+    }
   } catch (err) {
     if (reqSeq !== loadSeq || reqRunnerSeq !== runnerSeq) return
     chainErrorByChain.value = {
@@ -582,11 +607,18 @@ async function handleResumeChain(item: IndexedChain) {
       ...(selectedCred ? { credential_id: selectedCred } : {}),
       base_url: (baseUrlByChain.value[item.key] ?? '').trim() || null,
       db_dsn_ref: (dbDsnRefByChain.value[item.key] ?? '').trim() || null,
+      sync_scenarios: isSyncScenarios(item.key),
       stop_on_failure: true,
     })
     if (reqSeq !== loadSeq || reqRunnerSeq !== runnerSeq) return
     upsertChainRunInHistory(result)
     selectChainCheckpoint(item.key, result)
+    if (hasSyncFeedback(result)) {
+      emit('synced', {
+        synced_scenarios: result.synced_scenarios ?? 0,
+        synced_assertions: result.synced_assertions ?? 0,
+      })
+    }
   } catch (err) {
     if (reqSeq !== loadSeq || reqRunnerSeq !== runnerSeq) return
     chainErrorByChain.value = {
@@ -1220,7 +1252,18 @@ onMounted(loadData)
                     />
                   </div>
 
-                  <div class="flex items-end justify-end">
+                  <div class="flex flex-wrap items-end justify-between gap-2">
+                    <label class="inline-flex cursor-pointer items-center gap-1.5 pb-1 text-[11px] font-medium text-slate-700">
+                      <input
+                        type="checkbox"
+                        data-testid="chain-sync-scenarios-toggle"
+                        :checked="isSyncScenarios(item.key)"
+                        :disabled="runningByChain[item.key] || resumingByChain[item.key]"
+                        class="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                        @change="setSyncScenarios(item.key, ($event.target as HTMLInputElement).checked)"
+                      />
+                      <span>{{ t('corr.runner.syncScenariosToggle') }}</span>
+                    </label>
                     <button
                       type="button"
                       data-testid="chain-run-btn"
@@ -1321,6 +1364,32 @@ onMounted(loadData)
                     >
                       {{ activeChainRunByChain[item.key]!.base_url }}
                     </span>
+                  </div>
+
+                  <!-- Scenario L3 Sync Feedback Banner -->
+                  <div
+                    v-if="hasSyncFeedback(activeChainRunByChain[item.key])"
+                    data-testid="chain-synced-badge"
+                    class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-900"
+                  >
+                    <div class="flex items-center gap-2">
+                      <CheckCircle2 class="h-4 w-4 shrink-0 text-emerald-600" />
+                      <span class="font-medium">
+                        {{
+                          t('corr.runner.syncedBadge', {
+                            scenarios: activeChainRunByChain[item.key]!.synced_scenarios ?? 0,
+                            assertions: activeChainRunByChain[item.key]!.synced_assertions ?? 0,
+                          })
+                        }}
+                      </span>
+                    </div>
+                    <RouterLink
+                      v-if="effectiveProjectId"
+                      :to="`/p/${encodeURIComponent(effectiveProjectId)}/scenarios`"
+                      class="font-semibold text-emerald-800 hover:underline"
+                    >
+                      {{ t('corr.runner.viewScenarios') }}
+                    </RouterLink>
                   </div>
 
                   <!-- Per-Step Timeline -->
@@ -1554,7 +1623,18 @@ onMounted(loadData)
                       </div>
                     </div>
 
-                    <div class="flex justify-end">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <label class="inline-flex cursor-pointer items-center gap-1.5 text-[11px] font-medium text-slate-700">
+                        <input
+                          type="checkbox"
+                          data-testid="chain-resume-sync-scenarios-toggle"
+                          :checked="isSyncScenarios(item.key)"
+                          :disabled="runningByChain[item.key] || resumingByChain[item.key]"
+                          class="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                          @change="setSyncScenarios(item.key, ($event.target as HTMLInputElement).checked)"
+                        />
+                        <span>{{ t('corr.runner.syncScenariosToggle') }}</span>
+                      </label>
                       <button
                         type="button"
                         data-testid="chain-resume-btn"

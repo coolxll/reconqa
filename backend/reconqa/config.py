@@ -118,6 +118,18 @@ class SecurityAuditConfig(BaseModel):
     custom_secret_patterns: dict[str, str] = Field(default_factory=dict)
 
 
+class GateConfig(BaseModel):
+    max_p0_chain_failures: int = Field(default=0, ge=0)
+    max_new_high_security: int = Field(default=0, ge=0)
+    max_coverage_drop_pct: float = Field(default=5.0, ge=0.0)
+    max_p95_ms: float | None = Field(default=None, ge=0.0)
+    fail_on_high_without_baseline: bool = False
+    feishu_webhook: str | None = None
+    dingtalk_webhook: str | None = None
+    slack_webhook: str | None = None
+    webhook_timeout_sec: float = Field(default=10.0, ge=0.5)
+
+
 class ProjectConfig(BaseModel):
     """Project-level configuration loaded from reconqa.yaml (shared by CLI and Web)."""
 
@@ -137,6 +149,7 @@ class ProjectConfig(BaseModel):
     java: JavaGenConfig = Field(default_factory=JavaGenConfig)
     k6: K6PerfConfig = Field(default_factory=K6PerfConfig)
     security: SecurityAuditConfig = Field(default_factory=SecurityAuditConfig)
+    gate: GateConfig = Field(default_factory=GateConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -246,6 +259,17 @@ k6:
 security:
   include_mutations: false
   custom_secret_patterns: {}
+
+gate:
+  max_p0_chain_failures: 0
+  max_new_high_security: 0
+  max_coverage_drop_pct: 5.0
+  max_p95_ms: null
+  fail_on_high_without_baseline: false
+  feishu_webhook: null
+  dingtalk_webhook: null
+  slack_webhook: null
+  webhook_timeout_sec: 10.0
 """
     target_path.write_text(template, encoding="utf-8")
     return target_path

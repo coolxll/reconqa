@@ -152,6 +152,7 @@ registerMessages({
     "scen.modal.subtitle": "提前规划核心业务场景与优先级，后续导入 HAR 同名场景将自动合并接口且保留此处配置。",
     "scen.modal.submit": "创建场景",
     "scen.modal.creating": "创建中…",
+    "scen.tryItSyncedToast": "调试断言已回写至 {scenarios} 个场景（{assertions} 条断言），列表已自动刷新。",
   },
   en: {
     "scen.title": "Business Scenarios & Testing Effectiveness",
@@ -309,5 +310,6 @@ registerMessages({
       "Plan a core business scenario and priority up front; future HAR imports with the same slug merge endpoints while preserving your spec.",
     "scen.modal.submit": "Create Scenario",
     "scen.modal.creating": "Creating…",
+    "scen.tryItSyncedToast": "Synced {assertions} assertion(s) across {scenarios} scenario(s); view refreshed.",
   },
 });

@@ -7,7 +7,9 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Download,
   ExternalLink,
+  FileText,
   GitCommitHorizontal,
   Loader2,
   Play,
@@ -18,6 +20,7 @@ import {
   X,
 } from "lucide-vue-next";
 import { getProjectCapabilities, promoteCapabilityToScenario } from "@/api/projects";
+import { downloadAcceptanceReport, downloadPostmanCollection } from "@/api/reports";
 import type {
   BusinessCapability,
   CapabilityEndpointRef,
@@ -77,6 +80,24 @@ const promotedBanner = ref<{
 // Inline Try It Drawer
 const tryItOpen = ref(false);
 const tryItEndpoint = ref<TryItEndpointInput | null>(null);
+const exportingKind = ref<"html" | "markdown" | "postman" | null>(null);
+
+async function handleExport(kind: "html" | "markdown" | "postman"): Promise<void> {
+  if (!projectId.value || exportingKind.value) return;
+  exportingKind.value = kind;
+  error.value = null;
+  try {
+    if (kind === "postman") {
+      await downloadPostmanCollection(projectId.value);
+    } else {
+      await downloadAcceptanceReport(projectId.value, { format: kind });
+    }
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : t("cap.errorExport");
+  } finally {
+    exportingKind.value = null;
+  }
+}
 
 let loadSeq = 0;
 let searchDebounceTimer: number | null = null;
@@ -352,6 +373,45 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="space-y-4 pb-8">
+    <!-- Top Deliverable Exports Bar -->
+    <div v-if="projectId && !loading" class="flex flex-wrap items-center justify-end gap-2">
+      <button
+        type="button"
+        data-testid="cap-export-html-btn"
+        class="btn-secondary !py-1.5 !text-xs"
+        :disabled="Boolean(exportingKind)"
+        @click="handleExport('html')"
+      >
+        <Loader2 v-if="exportingKind === 'html'" class="h-3.5 w-3.5 animate-spin" />
+        <FileText v-else class="h-3.5 w-3.5" />
+        <span>{{ exportingKind === "html" ? t("cap.exporting") : t("cap.exportHtml") }}</span>
+      </button>
+      <button
+        type="button"
+        data-testid="cap-export-md-btn"
+        class="btn-secondary !py-1.5 !text-xs"
+        :disabled="Boolean(exportingKind)"
+        @click="handleExport('markdown')"
+      >
+        <Loader2 v-if="exportingKind === 'markdown'" class="h-3.5 w-3.5 animate-spin" />
+        <FileText v-else class="h-3.5 w-3.5" />
+        <span>{{ exportingKind === "markdown" ? t("cap.exporting") : t("cap.exportMd") }}</span>
+      </button>
+      <button
+        type="button"
+        data-testid="cap-export-postman-btn"
+        class="btn-secondary !py-1.5 !text-xs"
+        :disabled="Boolean(exportingKind)"
+        @click="handleExport('postman')"
+      >
+        <Loader2 v-if="exportingKind === 'postman'" class="h-3.5 w-3.5 animate-spin" />
+        <Download v-else class="h-3.5 w-3.5" />
+        <span>
+          {{ exportingKind === "postman" ? t("cap.exporting") : t("cap.exportPostman") }}
+        </span>
+      </button>
+    </div>
+
     <!-- 1. Clear 1-Line Purpose + Visual Legend Bar -->
     <section
       v-if="metrics"
@@ -1037,6 +1097,7 @@ onBeforeUnmount(() => {
       :project-id="projectId"
       :endpoint="tryItEndpoint"
       @close="tryItOpen = false"
+      @synced="fetchCapabilities(true)"
     />
   </div>
 </template>

@@ -36,6 +36,7 @@ import OpenApiExplorer from '@/components/runs/OpenApiExplorer.vue'
 import CorrelationPanel from '@/components/runs/CorrelationPanel.vue'
 import ArtifactsPanel from '@/components/runs/ArtifactsPanel.vue'
 import ExternalToolRunnerCard from '@/components/runs/ExternalToolRunnerCard.vue'
+import QualityGateCard from '@/components/runs/QualityGateCard.vue'
 import '@/i18n/locales/runs'
 import { useI18n } from '@/i18n'
 
@@ -730,6 +731,12 @@ onMounted(() => {
           :project-id="run.project_id"
           :run-id="run.id"
           @executed="reloadRun"
+        />
+
+        <!-- Run Quality Gate Check (R5) -->
+        <QualityGateCard
+          :project-id="run.project_id"
+          :run-id="run.id"
         />
 
         <!-- Live SSE Console -->

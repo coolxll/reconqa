@@ -539,6 +539,36 @@ function openTryIt(ep: InventoryEndpoint): void {
   tryItOpen.value = true;
 }
 
+async function handleTryItSynced(payload: {
+  synced_scenarios: number;
+  synced_assertions: number;
+}): Promise<void> {
+  if (!projectId.value) return;
+  try {
+    listData.value = await listProjectScenarios(projectId.value);
+    if (selectedScenarioId.value) {
+      const refreshed = await getScenarioDetail(projectId.value, selectedScenarioId.value);
+      detail.value = refreshed;
+      editAssertions.value = (refreshed.assertions ?? []).map((a) => ({ ...a }));
+      if (tryItEndpoint.value) {
+        tryItAssertions.value = filterScenarioAssertionsForEndpoint(
+          editAssertions.value,
+          tryItEndpoint.value.method,
+          tryItEndpoint.value.path
+        );
+      }
+    }
+    showSuccess(
+      t("scen.tryItSyncedToast", {
+        scenarios: payload.synced_scenarios,
+        assertions: payload.synced_assertions,
+      })
+    );
+  } catch {
+    // Non-blocking refresh fallback
+  }
+}
+
 function prettyJson(val: unknown): string {
   try {
     return JSON.stringify(val, null, 2);
@@ -1783,6 +1813,7 @@ onMounted(async () => {
       :endpoint="tryItEndpoint"
       :assertions="tryItAssertions"
       @close="tryItOpen = false"
+      @synced="handleTryItSynced"
     />
   </div>
 </template>

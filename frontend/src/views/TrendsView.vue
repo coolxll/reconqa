@@ -19,6 +19,7 @@ import type { Project, ProjectTrendsResponse, TrendPoint } from "@/api/types";
 import { useWorkspace } from "@/stores/workspace";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import StatusBadge from "@/components/layout/StatusBadge.vue";
+import QualityGateCard from "@/components/runs/QualityGateCard.vue";
 import { useI18n } from "@/i18n";
 import "@/i18n/locales/dashboards";
 
@@ -698,6 +699,14 @@ onBeforeUnmount(() => {
           </div>
         </div>
       </div>
+
+      <!-- Run Quality Gate Check (R5) -->
+      <QualityGateCard
+        v-if="selectedProjectId"
+        :project-id="selectedProjectId"
+        :run-id="runBId || null"
+        :baseline-run-id="runAId && runAId !== runBId ? runAId : null"
+      />
 
       <!-- Chart 1: API Coverage % & Endpoint Growth -->
       <div class="card overflow-hidden">

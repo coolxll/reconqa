@@ -6,7 +6,11 @@ import ast
 import json
 import math
 import operator as py_op
+import random
 import re
+import time
+import uuid
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -16,8 +20,12 @@ from reconqa.config import settings
 from reconqa.models.schemas import AssertionEvalResult, ScenarioAssertion
 from reconqa.modules.discovery.auth_resolver import redact_secrets, resolve_env_ref
 
-_TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}")
-_SINGLE_VAR_RE = re.compile(r"^\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}$")
+_RAND_INT_RE = re.compile(r"^\$randInt\(\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*\)$")
+_TEMPLATE_EXPR_INNER = r"(?:[A-Za-z_][A-Za-z0-9_.-]*|\$[A-Za-z_][A-Za-z0-9_]*(?:\([^(){}]*\))?)"
+TEMPLATE_VAR_RE = re.compile(rf"\{{\{{\s*({_TEMPLATE_EXPR_INNER})\s*\}}\}}")
+SINGLE_VAR_RE = re.compile(rf"^\{{\{{\s*({_TEMPLATE_EXPR_INNER})\s*\}}\}}$")
+_TEMPLATE_VAR_RE = TEMPLATE_VAR_RE
+_SINGLE_VAR_RE = SINGLE_VAR_RE
 _ENV_DSN_REF_RE = re.compile(r"^(?:[Ee][Nn][Vv]:(RECONQA_[A-Za-z0-9_]+)|\$\{(RECONQA_[A-Za-z0-9_]+)\})$")
 _FORBIDDEN_ENV_DSN_KEYS = frozenset({"RECONQA_DATABASE_URL"})
 _SQL_FORBIDDEN_RE = re.compile(
@@ -27,7 +35,8 @@ _SQL_FORBIDDEN_RE = re.compile(
     re.IGNORECASE,
 )
 _SQL_PARAM_VAR_RE = re.compile(
-    r"'\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}'|\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}"
+    rf"'\{{\{{\s*({_TEMPLATE_EXPR_INNER})\s*\}}\}}'"
+    rf"|\{{\{{\s*({_TEMPLATE_EXPR_INNER})\s*\}}\}}"
 )
 _URL_CRED_RE = re.compile(r"://[^/\s@]+@")
 _EXTERNAL_REF_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
@@ -141,16 +150,49 @@ def extract_jsonpath(data: Any, path: str) -> tuple[bool, Any]:
 # --- Template rendering & safe arithmetic ---
 
 
+def is_valid_dynamic_var(name: str) -> bool:
+    """Return True iff *name* is a supported built-in dynamic placeholder token."""
+    key = str(name or "").strip()
+    if key in {"$timestamp", "$uuid", "$isoDate"}:
+        return True
+    m = _RAND_INT_RE.fullmatch(key)
+    if m:
+        return int(m.group(1)) <= int(m.group(2))
+    return False
+
+
+def resolve_dynamic_var(name: str) -> tuple[bool, Any]:
+    """Resolve built-in dynamic placeholder ($timestamp, $uuid, $randInt(min,max), $isoDate)."""
+    key = str(name or "").strip()
+    if key == "$timestamp":
+        return True, int(time.time())
+    if key == "$uuid":
+        return True, str(uuid.uuid4())
+    if key == "$isoDate":
+        return True, datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    m = _RAND_INT_RE.fullmatch(key)
+    if m:
+        lo = int(m.group(1))
+        hi = int(m.group(2))
+        if lo > hi:
+            return False, None
+        return True, random.randint(lo, hi)
+    return False, None
+
+
 def render_template_str(raw: str, context_vars: dict[str, Any] | None = None) -> str:
-    """Replace {{var_name}} placeholders with str(context_vars[var_name]) when present."""
+    """Replace {{var_name}} and built-in {{$...}} placeholders."""
     text = str(raw)
-    if not context_vars or "{{" not in text:
+    if "{{" not in text:
         return text
 
     def _repl(match: re.Match[str]) -> str:
-        key = match.group(1)
-        if key in context_vars and context_vars[key] is not None:
+        key = match.group(1).strip()
+        if context_vars and key in context_vars and context_vars[key] is not None:
             return str(context_vars[key])
+        ok, dyn_val = resolve_dynamic_var(key)
+        if ok:
+            return str(dyn_val)
         return match.group(0)
 
     return _TEMPLATE_VAR_RE.sub(_repl, text)
@@ -254,11 +296,16 @@ def safe_eval_arithmetic_decimal(
 
     def _sub_num(match: re.Match[str]) -> str:
         nonlocal missing_or_invalid
-        key = match.group(1)
-        if key not in ctx:
-            missing_or_invalid = True
-            return match.group(0)
-        dec = _to_decimal(ctx[key])
+        key = match.group(1).strip()
+        if key in ctx:
+            raw_val = ctx[key]
+        else:
+            ok, dyn_val = resolve_dynamic_var(key)
+            if not ok:
+                missing_or_invalid = True
+                return match.group(0)
+            raw_val = dyn_val
+        dec = _to_decimal(raw_val)
         if dec is None:
             missing_or_invalid = True
             return match.group(0)
@@ -474,12 +521,17 @@ def execute_readonly_sql(
     missing_vars: list[str] = []
 
     def _bind_var(match: re.Match[str]) -> str:
-        var_name = match.group(1) or match.group(2)
-        if var_name not in ctx:
-            missing_vars.append(var_name)
-            return match.group(0)
+        var_name = (match.group(1) or match.group(2)).strip()
+        if var_name in ctx:
+            val = ctx[var_name]
+        else:
+            ok, dyn_val = resolve_dynamic_var(var_name)
+            if not ok:
+                missing_vars.append(var_name)
+                return match.group(0)
+            val = dyn_val
         param_key = f"v_{len(bind_params)}"
-        bind_params[param_key] = ctx[var_name]
+        bind_params[param_key] = val
         return f":{param_key}"
 
     parameterized_sql = _SQL_PARAM_VAR_RE.sub(_bind_var, cleaned)
@@ -997,15 +1049,19 @@ def evaluate_assertion(
     if op == "var_equals" and "{{" in jsonpath:
         lhs_single = _SINGLE_VAR_RE.match(jsonpath)
         if lhs_single:
-            lhs_name = lhs_single.group(1)
-            if lhs_name not in ctx:
-                return _res(
-                    False,
-                    actual=None,
-                    expected_out=raw_expected,
-                    message=f"Left-hand context variable '{lhs_name}' not found.",
-                )
-            found, actual = True, ctx[lhs_name]
+            lhs_name = lhs_single.group(1).strip()
+            if lhs_name in ctx:
+                found, actual = True, ctx[lhs_name]
+            else:
+                ok, dyn_val = resolve_dynamic_var(lhs_name)
+                if not ok:
+                    return _res(
+                        False,
+                        actual=None,
+                        expected_out=raw_expected,
+                        message=f"Left-hand context variable '{lhs_name}' not found.",
+                    )
+                found, actual = True, dyn_val
         else:
             lhs_arith = safe_eval_arithmetic(jsonpath, ctx)
             if lhs_arith is not None:
@@ -1202,15 +1258,19 @@ def evaluate_assertion(
         raw_exp_stripped = raw_expected.strip()
         single_match = _SINGLE_VAR_RE.match(raw_exp_stripped)
         if single_match:
-            var_name = single_match.group(1)
-            if var_name not in ctx:
-                return _res(
-                    False,
-                    actual=actual,
-                    message=f"Context variable '{var_name}' not found.",
-                    expected_out=raw_expected,
-                )
-            exp_val = ctx[var_name]
+            var_name = single_match.group(1).strip()
+            if var_name in ctx:
+                exp_val = ctx[var_name]
+            else:
+                ok, dyn_val = resolve_dynamic_var(var_name)
+                if not ok:
+                    return _res(
+                        False,
+                        actual=actual,
+                        message=f"Context variable '{var_name}' not found.",
+                        expected_out=raw_expected,
+                    )
+                exp_val = dyn_val
             passed = _values_equal_any(actual, exp_val)
             return _res(
                 passed,

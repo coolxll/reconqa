@@ -389,6 +389,9 @@ registerMessages({
     'corr.runner.stepStatus.passed': '通过',
     'corr.runner.stepStatus.failed': '失败',
     'corr.runner.stepStatus.skipped': '跳过',
+    'corr.runner.syncScenariosToggle': '自动回写断言至业务场景',
+    'corr.runner.syncedBadge': '已回写 {scenarios} 个业务场景（{assertions} 条断言）',
+    'corr.runner.viewScenarios': '查看业务场景 →',
 
     // ArtifactsPanel.vue
     'artifacts.loading': '正在加载运行产物...',
@@ -819,6 +822,9 @@ registerMessages({
     'corr.runner.stepStatus.passed': 'Passed',
     'corr.runner.stepStatus.failed': 'Failed',
     'corr.runner.stepStatus.skipped': 'Skipped',
+    'corr.runner.syncScenariosToggle': 'Auto-sync assertions to Scenarios',
+    'corr.runner.syncedBadge': 'Synced {scenarios} scenario(s) ({assertions} assertion(s))',
+    'corr.runner.viewScenarios': 'View Scenarios →',
 
     // ArtifactsPanel.vue
     'artifacts.loading': 'Loading run artifacts...',

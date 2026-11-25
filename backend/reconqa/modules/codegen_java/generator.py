@@ -458,8 +458,13 @@ def _is_authenticated_operation(
     return False
 
 
+def _strip_fragment(path_str: str) -> str:
+    base = str(path_str or "").split("#", 1)[0].strip()
+    return base or "/"
+
+
 def _build_l2_path_template(step: dict[str, Any]) -> str:
-    raw_path = str(step.get("path") or "/")
+    raw_path = _strip_fragment(str(step.get("path") or "/"))
     raw_url = str(step.get("raw_url") or "")
     uses = step.get("uses") or {}
 
@@ -502,7 +507,7 @@ def _build_l2_path_template(step: dict[str, Any]) -> str:
                     rebuilt.append(t_seg)
             path_template = "/".join(rebuilt)
 
-    return path_template
+    return _strip_fragment(path_template)
 
 
 _SAFE_JSONPATH_RE = re.compile(r"^[A-Za-z0-9_$.\[\]\-\s]{1,120}$")
@@ -838,12 +843,26 @@ def _compile_scenario_assertion_java(assertion: dict[str, Any]) -> dict[str, Any
 
 def _clean_endpoint_path(raw_path: str) -> str:
     p = (raw_path or "").strip()
+    if not p:
+        return "/"
     if p.startswith(("http://", "https://")):
-        p = urlparse(p).path
-    p = p.split("?", 1)[0].strip()
-    if not p.startswith("/"):
-        p = "/" + p
-    return p.rstrip("/") or "/"
+        parsed = urlparse(p)
+        base_p = parsed.path or "/"
+        frag = (parsed.fragment or "").split("?", 1)[0].strip()
+    elif "#" in p:
+        before_frag, after_frag = p.split("#", 1)
+        base_p = before_frag.split("?", 1)[0].strip()
+        frag = after_frag.split("?", 1)[0].strip()
+    else:
+        base_p = p.split("?", 1)[0].strip()
+        frag = ""
+    if frag.startswith(("/", "!")):
+        frag = ""
+    base_p = re.sub(r"/{2,}", "/", base_p)
+    if not base_p.startswith("/"):
+        base_p = "/" + base_p
+    base_p = base_p.rstrip("/") or "/"
+    return f"{base_p}#{frag}" if frag else base_p
 
 
 def _match_scenario_assertions(
@@ -859,6 +878,10 @@ def _match_scenario_assertions(
     ep_method = method_upper.upper().strip()
     ep_clean_tpl = _clean_endpoint_path(path_template)
     ep_clean_conc = _clean_endpoint_path(concrete_path)
+    ep_tpl_frag = ep_clean_tpl.split("#", 1)[1] if "#" in ep_clean_tpl else ""
+    ep_conc_frag = ep_clean_conc.split("#", 1)[1] if "#" in ep_clean_conc else ""
+    use_conc = ep_clean_conc if (not ep_tpl_frag or ep_conc_frag) else ep_clean_tpl
+
     ep_norm, _ = normalize_path(ep_clean_tpl)
     ep_norm_clean = _clean_endpoint_path(ep_norm)
 
@@ -883,14 +906,19 @@ def _match_scenario_assertions(
             continue
 
         t_clean = _clean_endpoint_path(t_path_raw)
+        t_frag = t_clean.split("#", 1)[1] if "#" in t_clean else ""
         t_norm, _ = normalize_path(t_clean)
         t_norm_clean = _clean_endpoint_path(t_norm)
 
         matched = (
-            t_clean in {ep_clean_tpl, ep_clean_conc}
+            t_clean in {ep_clean_tpl, use_conc}
             or t_norm_clean == ep_norm_clean
-            or (len(t_clean) > 1 and ep_clean_tpl.endswith(t_clean))
-            or (len(t_clean) > 1 and ep_clean_conc.endswith(t_clean))
+            or (len(t_clean) > 1 and ep_clean_tpl.endswith(t_clean) and t_frag == ep_tpl_frag)
+            or (
+                len(t_clean) > 1
+                and use_conc.endswith(t_clean)
+                and t_frag == (use_conc.split("#", 1)[1] if "#" in use_conc else "")
+            )
         )
         if not matched:
             continue
@@ -1021,7 +1049,7 @@ def _build_l2_step_model(
     business_assertions = _match_scenario_assertions(
         method_upper,
         norm_path,
-        urlparse(raw_url).path if raw_url else norm_path,
+        raw_url or norm_path,
         scenario_assertions,
     )
 
@@ -1245,7 +1273,7 @@ def generate_java_project(
                         case_id,
                         scenario_name,
                         method_upper,
-                        concrete_path,
+                        _strip_fragment(concrete_path),
                         query_json_path,
                         headers_json_path,
                         payload_json_path,
@@ -1264,7 +1292,7 @@ def generate_java_project(
                         {
                             "case_id": case_id,
                             "method": method_upper,
-                            "path": concrete_path,
+                            "path": _strip_fragment(concrete_path),
                             "assertions": l1_matched,
                         }
                     )
@@ -1302,7 +1330,7 @@ def generate_java_project(
                     {
                         "case_id": l3_case_id,
                         "method": method_upper,
-                        "path": concrete_path,
+                        "path": _strip_fragment(concrete_path),
                         "query_json_path": l3_query_path,
                         "headers_json_path": l3_headers_path,
                         "payload_json_path": l3_payload_path,

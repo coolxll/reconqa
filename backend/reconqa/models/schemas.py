@@ -742,6 +742,8 @@ class ReplayRequest(BaseModel):
     assertions: list[ScenarioAssertion] | None = None
     db_dsn_ref: str | None = None
     context_vars: dict[str, Any] = Field(default_factory=dict)
+    include_scenario_assertions: bool = True
+    sync_scenarios: bool = True
 
 
 class ReplayResponse(BaseModel):
@@ -755,6 +757,8 @@ class ReplayResponse(BaseModel):
     truncated: bool = False
     error: str | None = None
     assertion_results: list[AssertionEvalResult] = Field(default_factory=list)
+    synced_scenarios: int = 0
+    synced_assertions: int = 0
 
 
 # --- Lightweight Chain Runner & Checkpoint/Resume DTOs ---
@@ -784,6 +788,7 @@ class ChainExecuteRequest(BaseModel):
     initial_vars: dict[str, Any] = Field(default_factory=dict)
     step_assertions: dict[str, list[ScenarioAssertion]] = Field(default_factory=dict)
     include_scenario_assertions: bool = True
+    sync_scenarios: bool = True
     db_dsn_ref: str | None = None
     stop_on_failure: bool = True
     timeout_sec: float = 15.0
@@ -803,6 +808,7 @@ class ChainResumeRequest(BaseModel):
     credential_id: str | None = None
     base_url: str | None = None
     db_dsn_ref: str | None = None
+    sync_scenarios: bool = True
     stop_on_failure: bool = True
     timeout_sec: float = 15.0
 
@@ -838,6 +844,8 @@ class ChainRunOut(BaseModel):
     base_url: str = ""
     context_vars: dict[str, Any] = Field(default_factory=dict)
     step_results: list[ChainStepResult] = Field(default_factory=list)
+    synced_scenarios: int = 0
+    synced_assertions: int = 0
     created_at: str
     updated_at: str
 
@@ -1074,3 +1082,71 @@ class JavaGenResult(BaseModel):
     schemas_generated: int = 0
     payloads_generated: int = 0
     files_generated: list[str] = Field(default_factory=list)
+
+
+# --- Quality Gate & Webhook DTOs (R5) ---
+
+
+class GateRuleResult(BaseModel):
+    rule: str
+    label: str
+    passed: bool
+    skipped: bool = False
+    actual: float | int | None = None
+    threshold: float | int | None = None
+    message: str = ""
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class QualityGateMetrics(BaseModel):
+    p0_chain_failures: int = 0
+    p0_failed_chains: int = 0
+    p0_failed_assertions: int = 0
+    total_chain_runs: int = 0
+    high_security_count: int = 0
+    baseline_high_security_count: int | None = None
+    new_high_security_count: int = 0
+    current_coverage_pct: float | None = None
+    baseline_coverage_pct: float | None = None
+    coverage_drop_pct: float | None = None
+    p95_ms: float | None = None
+    p95_source: Literal["k6", "har", "none"] = "none"
+    baseline_available: bool = False
+
+
+class WebhookDeliveryResult(BaseModel):
+    provider: Literal["feishu", "dingtalk", "slack"]
+    url_masked: str
+    sent: bool
+    status_code: int | None = None
+    error: str | None = None
+
+
+class QualityGateRequest(BaseModel):
+    run_id: str | None = None
+    baseline_run_id: str | None = None
+    max_p0_chain_failures: int | None = Field(default=None, ge=0)
+    max_new_high_security: int | None = Field(default=None, ge=0)
+    max_coverage_drop_pct: float | None = Field(default=None, ge=0.0)
+    max_p95_ms: float | None = Field(default=None, ge=0.0)
+    fail_on_high_without_baseline: bool | None = None
+    feishu_webhook: str | None = None
+    dingtalk_webhook: str | None = None
+    slack_webhook: str | None = None
+    webhook_timeout_sec: float | None = Field(default=None, ge=0.5)
+    notify_on_pass: bool = True
+
+
+class QualityGateResult(BaseModel):
+    project_id: str | None = None
+    project_name: str = ""
+    target_label: str = ""
+    run_id: str | None = None
+    baseline_run_id: str | None = None
+    passed: bool
+    status: Literal["passed", "failed"]
+    evaluated_at: str
+    rules: list[GateRuleResult] = Field(default_factory=list)
+    metrics: QualityGateMetrics = Field(default_factory=QualityGateMetrics)
+    summary: str = ""
+    webhook_results: list[WebhookDeliveryResult] = Field(default_factory=list)

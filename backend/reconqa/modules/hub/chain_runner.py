@@ -33,10 +33,14 @@ from reconqa.modules.discovery.auth_resolver import (
     sanitize_url_for_storage,
 )
 from reconqa.modules.hub.assertion_engine import (
+    SINGLE_VAR_RE,
+    TEMPLATE_VAR_RE,
     evaluate_assertion,
     extract_jsonpath,
     is_allowed_env_dsn_ref,
+    is_valid_dynamic_var,
     render_template_str,
+    resolve_dynamic_var,
 )
 from reconqa.utils.io import SENSITIVE_HEADER_NAMES, ensure_dir, read_json, write_json
 
@@ -45,8 +49,8 @@ if TYPE_CHECKING:
 
 _CHAIN_RUN_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{4,64}$")
 _SINGLE_BRACE_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
-_DOUBLE_BRACE_VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}")
-_EXACT_DOUBLE_VAR_RE = re.compile(r"^\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}$")
+_DOUBLE_BRACE_VAR_RE = TEMPLATE_VAR_RE
+_EXACT_DOUBLE_VAR_RE = SINGLE_VAR_RE
 _MAX_BODY_BYTES = 256 * 1024
 _MAX_BODY_PREVIEW_CHARS = 1000
 _SENSITIVE_HEADER_SET = frozenset(SENSITIVE_HEADER_NAMES | _SENSITIVE_AUTH_HEADER_KEYS)
@@ -291,9 +295,12 @@ def _render_body_value(value: Any, context_vars: dict[str, Any]) -> Any:
     if isinstance(value, str):
         exact = _EXACT_DOUBLE_VAR_RE.match(value.strip())
         if exact:
-            key = exact.group(1)
+            key = exact.group(1).strip()
             if key in context_vars:
                 return context_vars[key]
+            ok, dyn_val = resolve_dynamic_var(key)
+            if ok:
+                return dyn_val
         return render_template_str(value, context_vars)
     if isinstance(value, dict):
         return {str(k): _render_body_value(v, context_vars) for k, v in value.items()}
@@ -306,7 +313,10 @@ def _find_unresolved_vars(obj: Any) -> set[str]:
     found: set[str] = set()
     if isinstance(obj, str):
         for m in _DOUBLE_BRACE_VAR_RE.finditer(obj):
-            found.add(m.group(1))
+            token = m.group(1).strip()
+            if is_valid_dynamic_var(token):
+                continue
+            found.add(token)
     elif isinstance(obj, dict):
         for v in obj.values():
             found.update(_find_unresolved_vars(v))
@@ -314,6 +324,10 @@ def _find_unresolved_vars(obj: Any) -> set[str]:
         for item in obj:
             found.update(_find_unresolved_vars(item))
     return found
+
+
+def _strip_url_fragment(raw_url: str) -> str:
+    return str(raw_url or "").split("#", 1)[0]
 
 
 def _origin_of_url(raw_url: str) -> str:
@@ -330,14 +344,14 @@ def _build_step_url(
     *,
     rebase_raw_url: bool = False,
 ) -> str:
-    raw_url = (step.raw_url or "").strip()
-    path = (step.path or "").strip()
+    raw_url = _strip_url_fragment((step.raw_url or "").strip())
+    path = _strip_url_fragment((step.path or "").strip())
     clean_base = (base_url or "").strip().rstrip("/")
     has_path_template = "{" in path
     has_query_params = bool(step.query_params)
 
     if path.startswith(("http://", "https://")):
-        return _render_path_str(path, context_vars)
+        return _strip_url_fragment(_render_path_str(path, context_vars))
 
     # When step.path is templated, query_params exist, or explicit rebase was requested,
     # always build from origin + rendered path (stripping stale recorded query strings & IDs).
@@ -346,7 +360,7 @@ def _build_step_url(
         rel_path = path
         if (not rel_path or rel_path == "/") and not has_path_template and raw_url.startswith(("http://", "https://")):
             rel_path = urlparse(raw_url).path or "/"
-        rendered_path = _render_path_str(rel_path or "/", context_vars)
+        rendered_path = _strip_url_fragment(_render_path_str(rel_path or "/", context_vars))
         if not rendered_path.startswith("/"):
             rendered_path = f"/{rendered_path}"
         if origin:
@@ -354,15 +368,15 @@ def _build_step_url(
         return rendered_path
 
     if raw_url.startswith(("http://", "https://")):
-        return _render_path_str(raw_url, context_vars)
+        return _strip_url_fragment(_render_path_str(raw_url, context_vars))
 
     if clean_base:
-        rendered_path = _render_path_str(path or "/", context_vars)
+        rendered_path = _strip_url_fragment(_render_path_str(path or "/", context_vars))
         if not rendered_path.startswith("/"):
             rendered_path = f"/{rendered_path}"
         return f"{clean_base}{rendered_path}"
 
-    return _render_path_str(raw_url or path, context_vars)
+    return _strip_url_fragment(_render_path_str(raw_url or path, context_vars))
 
 
 async def execute_chain(
