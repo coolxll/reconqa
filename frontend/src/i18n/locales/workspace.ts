@@ -216,6 +216,13 @@ registerMessages({
     "tryit.errMissingUrl": "请填写完整的目标 URL（包含 http:// 或 https://）。",
     "tryit.errInvalidJson": "请求体不是合法的 JSON，请修正后再格式化。",
     "tryit.errSend": "发起在线重放请求失败",
+    "tryit.assertionsToggle": "发送时运行关联业务断言 ({count} 条)",
+    "tryit.assertionsResultsTitle": "业务断言校验结果",
+    "tryit.assertionsSummary": "{passed}/{total} 通过",
+    "tryit.assertionsPassed": "通过",
+    "tryit.assertionsFailed": "失败",
+    "tryit.assertionsActual": "实际",
+    "tryit.assertionsExpected": "期望",
 
     // Project Settings View (ProjectSettingsView)
     "settings.tabGeneral": "基础信息与危险操作",
@@ -583,6 +590,13 @@ registerMessages({
     "tryit.errMissingUrl": "Please enter a valid target URL starting with http:// or https://.",
     "tryit.errInvalidJson": "Request body is not valid JSON.",
     "tryit.errSend": "Failed to execute replay request",
+    "tryit.assertionsToggle": "Run scenario assertions on send ({count})",
+    "tryit.assertionsResultsTitle": "Assertion Evaluation Results",
+    "tryit.assertionsSummary": "{passed}/{total} Passed",
+    "tryit.assertionsPassed": "PASSED",
+    "tryit.assertionsFailed": "FAILED",
+    "tryit.assertionsActual": "Actual",
+    "tryit.assertionsExpected": "Expected",
 
     // Project Settings View (ProjectSettingsView)
     "settings.tabGeneral": "General & Danger Zone",

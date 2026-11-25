@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 # --- API / Persistence DTOs ---
 
@@ -389,12 +389,25 @@ ScenarioAssertionOperator = Literal[
     "equals",
     "not_equals",
     "not_empty",
+    "is_empty",
     "gt",
     "gte",
     "lt",
     "lte",
     "contains",
+    "not_contains",
     "matches",
+    "array_contains",
+    "length_eq",
+    "length_gt",
+    "type_is",
+    "status_code",
+    "header_equals",
+    "latency_lt",
+    "json_schema",
+    "var_equals",
+    "sql_equals",
+    "sql_exists",
     "custom",
 ]
 ScenarioAssertionStatus = Literal["pending", "passed", "failed"]
@@ -422,12 +435,32 @@ class ScenarioAssertion(BaseModel):
     expected: str = ""
     note: str = ""
     status: ScenarioAssertionStatus = "pending"
+    db_dsn_ref: str | None = None
 
     @field_validator("id", mode="before")
     @classmethod
     def _ensure_id(cls, value: Any) -> str:
         text = str(value or "").strip()
         return text or uuid.uuid4().hex[:12]
+
+    @field_serializer("db_dsn_ref")
+    def _serialize_db_dsn_ref(self, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return _mask_header_ref_value(text)
+
+
+class AssertionEvalResult(BaseModel):
+    id: str = ""
+    title: str = ""
+    operator: str
+    passed: bool
+    actual: Any = None
+    expected: str = ""
+    message: str = ""
 
 
 class ScenarioNegativeCase(BaseModel):
@@ -706,6 +739,9 @@ class ReplayRequest(BaseModel):
     body: Any = None
     credential_id: str | None = None
     timeout_sec: float = 15.0
+    assertions: list[ScenarioAssertion] | None = None
+    db_dsn_ref: str | None = None
+    context_vars: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReplayResponse(BaseModel):
@@ -718,6 +754,92 @@ class ReplayResponse(BaseModel):
     content_type: str = ""
     truncated: bool = False
     error: str | None = None
+    assertion_results: list[AssertionEvalResult] = Field(default_factory=list)
+
+
+# --- Lightweight Chain Runner & Checkpoint/Resume DTOs ---
+
+
+class ChainStepInput(BaseModel):
+    step: int = 1
+    name: str = ""
+    method: str = "GET"
+    path: str = "/"
+    raw_url: str = ""
+    request_headers: dict[str, str] = Field(default_factory=dict)
+    query_params: dict[str, str] = Field(default_factory=dict)
+    request_body: Any = None
+    expected_status: int | None = None
+    extracts: dict[str, str] = Field(default_factory=dict)
+    assertions: list[ScenarioAssertion] = Field(default_factory=list)
+
+
+class ChainExecuteRequest(BaseModel):
+    run_id: str | None = None
+    chain_name: str | None = None
+    chain_index: int | None = None
+    steps: list[ChainStepInput] | None = None
+    base_url: str | None = None
+    credential_id: str | None = None
+    initial_vars: dict[str, Any] = Field(default_factory=dict)
+    step_assertions: dict[str, list[ScenarioAssertion]] = Field(default_factory=dict)
+    include_scenario_assertions: bool = True
+    db_dsn_ref: str | None = None
+    stop_on_failure: bool = True
+    timeout_sec: float = 15.0
+
+
+class ChainResumeRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_step_index: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("from_step_index", "from_step"),
+    )
+    override_vars: dict[str, Any] = Field(default_factory=dict)
+    override_step_body: Any = None
+    override_step_headers: dict[str, str] | None = None
+    override_step_assertions: list[ScenarioAssertion] | None = None
+    credential_id: str | None = None
+    base_url: str | None = None
+    db_dsn_ref: str | None = None
+    stop_on_failure: bool = True
+    timeout_sec: float = 15.0
+
+
+class ChainStepResult(BaseModel):
+    step_index: int
+    step: int
+    name: str = ""
+    method: str
+    url: str
+    status: Literal["passed", "failed", "skipped"]
+    status_code: int = 0
+    duration_ms: float = 0.0
+    extracted_vars: dict[str, Any] = Field(default_factory=dict)
+    assertions: list[AssertionEvalResult] = Field(default_factory=list)
+    body_preview: str = ""
+    error: str | None = None
+
+
+class ChainRunOut(BaseModel):
+    chain_run_id: str
+    project_id: str
+    run_id: str | None = None
+    chain_name: str
+    chain_index: int | None = None
+    credential_id: str | None = None
+    db_dsn_ref: str | None = None
+    status: Literal["passed", "failed"]
+    total_steps: int
+    completed_steps: int
+    failed_step_index: int | None = None
+    resumed_from_index: int | None = None
+    base_url: str = ""
+    context_vars: dict[str, Any] = Field(default_factory=dict)
+    step_results: list[ChainStepResult] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
 
 
 class ReplayMatrixRequest(BaseModel):

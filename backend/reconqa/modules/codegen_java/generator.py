@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -548,27 +549,105 @@ def _compile_scenario_assertion_java(assertion: dict[str, Any]) -> dict[str, Any
     operator = str(assertion.get("operator") or "not_empty").strip().lower()
     expected = "" if assertion.get("expected") is None else str(assertion.get("expected"))
     raw_jsonpath = str(assertion.get("jsonpath") or "").strip()
+
+    comment = f"// Business Assertion [{priority}]: {title}"
+    expected_esc = escape_java_string(expected)
+    title_esc = escape_java_string(title)
+
+    # Operators whose `jsonpath` is not a JSONPath (SQL query, HTTP header, status, latency, custom)
+    if operator == "custom":
+        return {"comment": comment, "lines": [f"// TODO Business Rule: {note or title}"]}
+
+    if operator == "status_code":
+        exp_clean = expected.strip().lower()
+        if re.fullmatch(r"\d{3}", exp_clean):
+            return {
+                "comment": comment,
+                "lines": [f"response.then().assertThat().statusCode({int(exp_clean)});"],
+            }
+        if re.fullmatch(r"[1-5]xx", exp_clean):
+            base = int(exp_clean[0]) * 100
+            return {
+                "comment": comment,
+                "lines": [
+                    f"response.then().assertThat().statusCode("
+                    f"Matchers.allOf(Matchers.greaterThanOrEqualTo({base}), Matchers.lessThan({base + 100})));"
+                ],
+            }
+        if "," in exp_clean:
+            codes = [p.strip() for p in exp_clean.split(",") if re.fullmatch(r"\d{3}", p.strip())]
+            if codes:
+                return {
+                    "comment": comment,
+                    "lines": [
+                        f"response.then().assertThat().statusCode(Matchers.isOneOf({', '.join(codes)}));"
+                    ],
+                }
+        return {
+            "comment": comment,
+            "lines": [f"// TODO Business Rule: verify status_code == {_sanitize_java_comment(expected)}"],
+        }
+
+    if operator == "header_equals":
+        if raw_jsonpath and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", raw_jsonpath):
+            hdr_esc = escape_java_string(raw_jsonpath)
+            return {
+                "comment": comment,
+                "lines": [
+                    f'response.then().assertThat().header("{hdr_esc}", Matchers.equalTo("{expected_esc}"));'
+                ],
+            }
+        return {
+            "comment": comment,
+            "lines": [
+                f"// TODO Business Rule: verify header {_sanitize_java_comment(raw_jsonpath)} == {_sanitize_java_comment(expected)}"
+            ],
+        }
+
+    if operator == "latency_lt":
+        try:
+            ms_float = float(expected.strip())
+            if not math.isfinite(ms_float) or ms_float < 0:
+                raise ValueError("Non-finite or negative latency")
+            ms_val = int(ms_float)
+            return {
+                "comment": comment,
+                "lines": [
+                    f"org.hamcrest.MatcherAssert.assertThat(response.time(), Matchers.lessThan(Long.valueOf({ms_val}L)));"
+                ],
+            }
+        except (ValueError, OverflowError):
+            return {
+                "comment": comment,
+                "lines": [f"// TODO Business Rule: verify latency < {_sanitize_java_comment(expected)}ms"],
+            }
+
+    if operator in {"sql_equals", "sql_exists"}:
+        safe_sql = _sanitize_java_comment(raw_jsonpath or note)
+        safe_exp = _sanitize_java_comment(expected)
+        return {
+            "comment": comment,
+            "lines": [
+                f"// TODO Read-Only SQL Verification ({operator}): {safe_sql}"
+                + (f" == {safe_exp}" if operator == "sql_equals" and safe_exp else "")
+            ],
+        }
+
     if raw_jsonpath and (
         not _SAFE_JSONPATH_RE.fullmatch(raw_jsonpath)
         or not _has_balanced_brackets(raw_jsonpath)
     ):
         safe_jp = _sanitize_java_comment(raw_jsonpath)
         return {
-            "comment": f"// Business Assertion [{priority}]: {title}",
+            "comment": comment,
             "lines": [f"// Skipped unsafe jsonpath: {safe_jp}"],
         }
     gpath = jsonpath_to_gpath(raw_jsonpath)
     gpath_esc = escape_java_string(gpath)
-    expected_esc = escape_java_string(expected)
-    title_esc = escape_java_string(title)
 
-    comment = f"// Business Assertion [{priority}]: {title}"
     lines: list[str] = []
 
-    if operator == "custom":
-        todo_detail = note or title
-        lines.append(f"// TODO Business Rule: {todo_detail}")
-    elif operator == "not_empty":
+    if operator == "not_empty":
         if gpath:
             lines.append(
                 f'response.then().assertThat().body("{gpath_esc}", Matchers.notNullValue());'
@@ -576,6 +655,19 @@ def _compile_scenario_assertion_java(assertion: dict[str, Any]) -> dict[str, Any
         else:
             lines.append(
                 f'Assert.assertFalse(response.getBody().asString().trim().isEmpty(), "{title_esc}");'
+            )
+    elif operator == "is_empty":
+        if gpath:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", '
+                'Matchers.anyOf(Matchers.nullValue(), '
+                'Matchers.hasToString(Matchers.emptyOrNullString()), '
+                'Matchers.hasToString(Matchers.equalTo("[]")), '
+                'Matchers.hasToString(Matchers.equalTo("{}"))));'
+            )
+        else:
+            lines.append(
+                f'Assert.assertTrue(response.getBody().asString().trim().isEmpty(), "{title_esc}");'
             )
     elif operator in {"equals", "not_equals"}:
         if gpath:
@@ -607,6 +699,16 @@ def _compile_scenario_assertion_java(assertion: dict[str, Any]) -> dict[str, Any
             lines.append(
                 f'response.then().assertThat().body(Matchers.containsString("{expected_esc}"));'
             )
+    elif operator == "not_contains":
+        if gpath:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", '
+                f'Matchers.not(Matchers.hasToString(Matchers.containsString("{expected_esc}"))));'
+            )
+        else:
+            lines.append(
+                f'response.then().assertThat().body(Matchers.not(Matchers.containsString("{expected_esc}")));'
+            )
     elif operator == "matches":
         if gpath:
             lines.append(
@@ -616,6 +718,95 @@ def _compile_scenario_assertion_java(assertion: dict[str, Any]) -> dict[str, Any
         else:
             lines.append(
                 f'response.then().assertThat().body(Matchers.matchesPattern("{expected_esc}"));'
+            )
+    elif operator == "array_contains":
+        if gpath:
+            exp_strip = expected.strip()
+            low = exp_strip.lower()
+            if exp_strip.startswith("{"):
+                lines.append(
+                    f'response.then().assertThat().body("{gpath_esc}", Matchers.not(Matchers.empty()));'
+                )
+                lines.append(
+                    f"// TODO Business Rule: verify array {gpath} contains subset {_sanitize_java_comment(exp_strip)}"
+                )
+            else:
+                if low in {"true", "false"}:
+                    matcher_val = low
+                else:
+                    num_lit = _parse_java_number_literal(exp_strip)
+                    matcher_val = num_lit if num_lit is not None else f'"{expected_esc}"'
+                lines.append(
+                    f'response.then().assertThat().body("{gpath_esc}", Matchers.hasItem({matcher_val}));'
+                )
+        else:
+            lines.append(
+                f'response.then().assertThat().body(Matchers.containsString("{expected_esc}"));'
+            )
+    elif operator in {"length_eq", "length_gt"}:
+        if re.fullmatch(r"\d+", expected.strip()):
+            n_val = int(expected.strip())
+            if gpath:
+                size_matcher = (
+                    f"Matchers.hasSize({n_val})"
+                    if operator == "length_eq"
+                    else f"Matchers.hasSize(Matchers.greaterThan({n_val}))"
+                )
+                lines.append(f'response.then().assertThat().body("{gpath_esc}", {size_matcher});')
+            elif operator == "length_eq":
+                lines.append(
+                    f'Assert.assertEquals(response.getBody().asString().length(), {n_val}, "{title_esc}");'
+                )
+            else:
+                lines.append(
+                    f'Assert.assertTrue(response.getBody().asString().length() > {n_val}, "{title_esc}");'
+                )
+        else:
+            lines.append(
+                f"// TODO Business Rule: verify {gpath or 'body'} {operator} {_sanitize_java_comment(expected)}"
+            )
+    elif operator == "type_is":
+        type_map = {
+            "string": "String.class",
+            "str": "String.class",
+            "integer": "Integer.class",
+            "int": "Integer.class",
+            "number": "Number.class",
+            "float": "Number.class",
+            "boolean": "Boolean.class",
+            "bool": "Boolean.class",
+            "array": "java.util.List.class",
+            "list": "java.util.List.class",
+            "object": "java.util.Map.class",
+            "dict": "java.util.Map.class",
+        }
+        norm_t = expected.strip().lower()
+        if gpath and norm_t in {"null", "none"}:
+            lines.append(f'response.then().assertThat().body("{gpath_esc}", Matchers.nullValue());')
+        elif gpath and norm_t in type_map:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", Matchers.instanceOf({type_map[norm_t]}));'
+            )
+        else:
+            lines.append(
+                f"// TODO Business Rule: verify {gpath or 'body'} type_is {_sanitize_java_comment(expected)}"
+            )
+    elif operator == "var_equals":
+        if gpath:
+            lines.append(
+                f'response.then().assertThat().body("{gpath_esc}", Matchers.notNullValue());'
+            )
+        lines.append(
+            f"// TODO Cross-Step Var Assertion: verify {gpath or 'body'} == {_sanitize_java_comment(expected)}"
+        )
+    elif operator == "json_schema":
+        if not gpath and expected.strip().startswith("{"):
+            lines.append(
+                f'response.then().assertThat().body(io.restassured.module.jsv.JsonSchemaValidator.matchesJsonSchema("{expected_esc}"));'
+            )
+        else:
+            lines.append(
+                f"// TODO JSON Schema Assertion: validate {gpath or 'body'} against {_sanitize_java_comment(expected[:160])}"
             )
     elif operator in {"gt", "gte", "lt", "lte"}:
         cmp_map = {

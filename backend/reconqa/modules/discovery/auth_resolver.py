@@ -366,15 +366,18 @@ def load_storage_state_cookies_for_host(
                 continue
             c_name = str(ck.get("name") or "").strip()
             c_val = str(ck.get("value") or "")
-            c_dom = str(ck.get("domain") or "").lstrip(".").lower()
+            raw_dom = str(ck.get("domain") or "").strip().lower()
+            is_domain_cookie = raw_dom.startswith(".")
+            c_dom = raw_dom.lstrip(".")
             if not c_name:
                 continue
-            if (
+            domain_matches = (
                 not clean_host
                 or not c_dom
                 or clean_host == c_dom
-                or clean_host.endswith("." + c_dom)
-            ):
+                or (is_domain_cookie and clean_host.endswith("." + c_dom))
+            )
+            if domain_matches:
                 cookies.append(f"{c_name}={c_val}")
                 if c_val:
                     secrets.append(c_val)

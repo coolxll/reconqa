@@ -3,12 +3,14 @@ import { computed, ref, watch } from "vue";
 import {
   AlertTriangle,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   Clock,
   Copy,
   ExternalLink,
   KeyRound,
+  ListChecks,
   Loader2,
   Plus,
   Send,
@@ -17,6 +19,7 @@ import {
   Trash2,
   Users,
   X,
+  XCircle,
 } from "lucide-vue-next";
 import {
   createAuthProfile,
@@ -26,7 +29,14 @@ import {
   replayEndpoint,
   replayEndpointMatrix,
 } from "@/api/projects";
-import type { AuthProfile, ReplayMatrixResponse, ReplayResponse, RoleTag } from "@/api/types";
+import type {
+  AssertionEvalResult,
+  AuthProfile,
+  ReplayMatrixResponse,
+  ReplayResponse,
+  RoleTag,
+  ScenarioAssertion,
+} from "@/api/types";
 import { useI18n } from "@/i18n";
 import { copyToClipboard } from "@/utils/clipboard";
 
@@ -50,6 +60,7 @@ const props = defineProps<{
   open: boolean;
   projectId: string;
   endpoint: TryItEndpointInput | null;
+  assertions?: ScenarioAssertion[];
 }>();
 
 const emit = defineEmits<{
@@ -126,6 +137,29 @@ const matrixResponse = ref<ReplayMatrixResponse | null>(null);
 const expandedMatrixRows = ref<Set<number>>(new Set());
 const respTab = ref<"body" | "headers">("body");
 const copiedResp = ref(false);
+const runAssertions = ref(true);
+
+const activeAssertions = computed<ScenarioAssertion[]>(() => props.assertions ?? []);
+const assertionResults = computed<AssertionEvalResult[]>(
+  () => response.value?.assertion_results ?? []
+);
+const assertionPassCount = computed(
+  () => assertionResults.value.filter((a) => a.passed).length
+);
+
+function formatAssertionVal(val: unknown): string {
+  if (val === undefined) return "undefined";
+  if (val === null) return "null";
+  if (typeof val === "string") {
+    return val.length > 60 ? `${val.slice(0, 57)}...` : val;
+  }
+  try {
+    const serialized = JSON.stringify(val);
+    return serialized.length > 60 ? `${serialized.slice(0, 57)}...` : serialized;
+  } catch {
+    return String(val);
+  }
+}
 
 // Inline Quick Add Credential mini-form state
 const showQuickAddCred = ref(false);
@@ -345,6 +379,7 @@ async function hydrateFromEndpoint(): Promise<void> {
   expandedMatrixRows.value = new Set();
   errorMsg.value = null;
   respTab.value = "body";
+  runAssertions.value = true;
 
   await loadProjectContext(props.projectId);
 
@@ -465,6 +500,11 @@ async function handleSend(): Promise<void> {
   sending.value = true;
   response.value = null;
   try {
+    const shouldAttachAssertions = runAssertions.value && activeAssertions.value.length > 0;
+    const firstDbDsnRef = shouldAttachAssertions
+      ? activeAssertions.value.find((a) => a.db_dsn_ref?.trim())?.db_dsn_ref?.trim() || null
+      : null;
+
     response.value = await replayEndpoint(props.projectId, {
       method: method.value,
       url,
@@ -473,6 +513,8 @@ async function handleSend(): Promise<void> {
       body: parsedBody,
       credential_id: credentialId.value || null,
       timeout_sec: timeoutSec.value,
+      ...(shouldAttachAssertions ? { assertions: activeAssertions.value } : {}),
+      ...(firstDbDsnRef ? { db_dsn_ref: firstDbDsnRef } : {}),
     });
     respTab.value = "body";
   } catch (err) {
@@ -975,6 +1017,38 @@ async function copyResponseBody(): Promise<void> {
             />
           </div>
 
+          <!-- Scenario Assertions Toggle -->
+          <div
+            v-if="activeAssertions.length > 0"
+            data-testid="try-it-assertions-panel"
+            class="rounded-xl border border-teal-200 bg-teal-50/60 p-3.5"
+          >
+            <label class="flex cursor-pointer items-center justify-between gap-2">
+              <span class="inline-flex items-center gap-2 text-xs font-semibold text-teal-900">
+                <input
+                  v-model="runAssertions"
+                  data-testid="try-it-assertions-toggle"
+                  type="checkbox"
+                  class="h-3.5 w-3.5 rounded border-teal-300 text-teal-600 focus:ring-teal-500"
+                />
+                <ListChecks class="h-3.5 w-3.5 text-teal-600" />
+                <span>{{ t("tryit.assertionsToggle", { count: activeAssertions.length }) }}</span>
+              </span>
+            </label>
+            <div v-if="runAssertions" class="mt-2 flex flex-wrap gap-1.5">
+              <span
+                v-for="asrt in activeAssertions"
+                :key="asrt.id || asrt.title"
+                class="inline-flex items-center gap-1 rounded-md border border-teal-200 bg-white px-2 py-0.5 text-[11px] text-slate-700"
+              >
+                <span class="font-medium text-slate-800">{{ asrt.title }}</span>
+                <span class="rounded bg-teal-50 px-1 font-mono text-[10px] font-semibold text-teal-700">
+                  {{ asrt.operator }}
+                </span>
+              </span>
+            </div>
+          </div>
+
           <!-- Error Notice -->
           <div
             v-if="errorMsg"
@@ -1180,6 +1254,81 @@ async function copyResponseBody(): Promise<void> {
               >
                 <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
                 <span>{{ t("tryit.htmlResponseHint") }}</span>
+              </div>
+
+              <!-- Scenario Assertion Evaluation Results -->
+              <div
+                v-if="assertionResults.length > 0"
+                data-testid="try-it-assertion-results"
+                class="mb-3 rounded-xl border border-slate-200 bg-slate-50/70 p-3"
+              >
+                <div class="mb-2 flex items-center justify-between gap-2">
+                  <span class="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
+                    <ListChecks class="h-3.5 w-3.5 text-teal-600" />
+                    <span>{{ t("tryit.assertionsResultsTitle") }}</span>
+                  </span>
+                  <span
+                    class="rounded-full px-2 py-0.5 font-mono text-[11px] font-bold"
+                    :class="
+                      assertionPassCount === assertionResults.length
+                        ? 'bg-emerald-100 text-emerald-800'
+                        : 'bg-rose-100 text-rose-800'
+                    "
+                  >
+                    {{
+                      t("tryit.assertionsSummary", {
+                        passed: assertionPassCount,
+                        total: assertionResults.length,
+                      })
+                    }}
+                  </span>
+                </div>
+
+                <ul class="space-y-1.5">
+                  <li
+                    v-for="res in assertionResults"
+                    :key="res.id || `${res.title}-${res.operator}`"
+                    data-testid="try-it-assertion-result-item"
+                    class="rounded-lg border px-2.5 py-2 text-xs"
+                    :class="
+                      res.passed
+                        ? 'border-emerald-200 bg-emerald-50/60 text-emerald-950'
+                        : 'border-rose-200 bg-rose-50/70 text-rose-950'
+                    "
+                  >
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <div class="flex flex-wrap items-center gap-1.5">
+                        <CheckCircle2 v-if="res.passed" class="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+                        <XCircle v-else class="h-3.5 w-3.5 shrink-0 text-rose-600" />
+                        <span class="font-semibold">{{ res.title || res.operator }}</span>
+                        <span class="rounded bg-white/80 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-700 ring-1 ring-slate-200">
+                          {{ res.operator }}
+                        </span>
+                      </div>
+                      <span
+                        class="rounded-full px-1.5 py-0.5 text-[10px] font-bold"
+                        :class="
+                          res.passed
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-rose-600 text-white'
+                        "
+                      >
+                        {{ res.passed ? t("tryit.assertionsPassed") : t("tryit.assertionsFailed") }}
+                      </span>
+                    </div>
+                    <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] opacity-90">
+                      <span v-if="res.actual !== undefined">
+                        {{ t("tryit.assertionsActual") }}: <strong>{{ formatAssertionVal(res.actual) }}</strong>
+                      </span>
+                      <span v-if="res.expected">
+                        {{ t("tryit.assertionsExpected") }}: <strong>{{ res.expected }}</strong>
+                      </span>
+                    </div>
+                    <p v-if="res.message" class="mt-1 text-[11px] opacity-85">
+                      {{ res.message }}
+                    </p>
+                  </li>
+                </ul>
               </div>
 
               <pre

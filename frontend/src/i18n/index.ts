@@ -59,6 +59,16 @@ export function registerMessages(bundle: {
   Object.assign(dictionaries.en, bundle.en);
 }
 
+export function getRegisteredDictionaries(): {
+  zh: Record<string, string>;
+  en: Record<string, string>;
+} {
+  return {
+    zh: { ...dictionaries.zh },
+    en: { ...dictionaries.en },
+  };
+}
+
 export function setLocale(next: Locale): void {
   locale.value = next;
 }

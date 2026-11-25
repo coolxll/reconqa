@@ -658,12 +658,25 @@ export type ScenarioAssertionOperator =
   | "equals"
   | "not_equals"
   | "not_empty"
+  | "is_empty"
   | "gt"
   | "gte"
   | "lt"
   | "lte"
   | "contains"
+  | "not_contains"
   | "matches"
+  | "array_contains"
+  | "length_eq"
+  | "length_gt"
+  | "type_is"
+  | "status_code"
+  | "header_equals"
+  | "latency_lt"
+  | "json_schema"
+  | "var_equals"
+  | "sql_equals"
+  | "sql_exists"
   | "custom";
 
 export type ScenarioAssertionStatus = "pending" | "passed" | "failed";
@@ -687,6 +700,17 @@ export interface ScenarioAssertion {
   expected: string;
   note: string;
   status: ScenarioAssertionStatus;
+  db_dsn_ref?: string | null;
+}
+
+export interface AssertionEvalResult {
+  id: string;
+  title: string;
+  operator: string;
+  passed: boolean;
+  actual?: unknown;
+  expected: string;
+  message: string;
 }
 
 export interface ScenarioNegativeCase {
@@ -785,6 +809,9 @@ export interface ReplayRequest {
   body?: unknown;
   credential_id?: string | null;
   timeout_sec?: number;
+  assertions?: Array<Partial<ScenarioAssertion> & { operator: ScenarioAssertionOperator }> | null;
+  db_dsn_ref?: string | null;
+  context_vars?: Record<string, unknown>;
 }
 
 export interface ReplayResponse {
@@ -797,6 +824,86 @@ export interface ReplayResponse {
   content_type: string;
   truncated: boolean;
   error?: string | null;
+  assertion_results?: AssertionEvalResult[];
+}
+
+// --- Lightweight Chain Runner & Checkpoint/Resume ---
+
+export interface ChainStepInput {
+  step?: number;
+  name?: string;
+  method: string;
+  path: string;
+  raw_url?: string;
+  request_headers?: Record<string, string>;
+  query_params?: Record<string, string>;
+  request_body?: unknown;
+  expected_status?: number | null;
+  extracts?: Record<string, string>;
+  assertions?: Array<Partial<ScenarioAssertion> & { title: string; operator: ScenarioAssertionOperator }>;
+}
+
+export interface ChainExecuteRequest {
+  run_id?: string | null;
+  chain_name?: string | null;
+  chain_index?: number | null;
+  steps?: ChainStepInput[] | null;
+  base_url?: string | null;
+  credential_id?: string | null;
+  initial_vars?: Record<string, unknown>;
+  step_assertions?: Record<string, Array<Partial<ScenarioAssertion>>>;
+  include_scenario_assertions?: boolean;
+  db_dsn_ref?: string | null;
+  stop_on_failure?: boolean;
+  timeout_sec?: number;
+}
+
+export interface ChainResumeRequest {
+  from_step_index?: number | null;
+  override_vars?: Record<string, unknown>;
+  override_step_body?: unknown;
+  override_step_headers?: Record<string, string> | null;
+  override_step_assertions?: Array<Partial<ScenarioAssertion>> | null;
+  credential_id?: string | null;
+  base_url?: string | null;
+  db_dsn_ref?: string | null;
+  stop_on_failure?: boolean;
+  timeout_sec?: number;
+}
+
+export interface ChainStepResult {
+  step_index: number;
+  step: number;
+  name: string;
+  method: string;
+  url: string;
+  status: "passed" | "failed" | "skipped";
+  status_code: number;
+  duration_ms: number;
+  extracted_vars: Record<string, unknown>;
+  assertions: AssertionEvalResult[];
+  body_preview: string;
+  error?: string | null;
+}
+
+export interface ChainRunOut {
+  chain_run_id: string;
+  project_id: string;
+  run_id?: string | null;
+  chain_name: string;
+  chain_index?: number | null;
+  credential_id?: string | null;
+  db_dsn_ref?: string | null;
+  status: "passed" | "failed";
+  total_steps: number;
+  completed_steps: number;
+  failed_step_index?: number | null;
+  resumed_from_index?: number | null;
+  base_url: string;
+  context_vars: Record<string, unknown>;
+  step_results: ChainStepResult[];
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ReplayMatrixRequest {

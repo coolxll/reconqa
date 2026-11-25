@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronRight,
   Code2,
+  Database,
   ExternalLink,
   ListChecks,
   Loader2,
@@ -48,6 +49,12 @@ import type {
 import { useWorkspace } from "@/stores/workspace";
 import { useI18n } from "@/i18n";
 import "@/i18n/locales/scenarios";
+import {
+  ASSERTION_OPERATOR_GROUPS,
+  filterScenarioAssertionsForEndpoint,
+  getOperatorMeta,
+  isSqlOperator,
+} from "@/utils/assertionOperators";
 import EmptyState from "@/components/layout/EmptyState.vue";
 import StatusBadge from "@/components/layout/StatusBadge.vue";
 import TryItDrawer, { type TryItEndpointInput } from "@/components/runs/TryItDrawer.vue";
@@ -55,18 +62,6 @@ import TryItDrawer, { type TryItEndpointInput } from "@/components/runs/TryItDra
 const PRIORITIES: ScenarioPriority[] = ["P0", "P1", "P2", "P3"];
 const EFFECTIVENESS_LEVELS: ScenarioEffectivenessLevel[] = ["L0", "L1", "L2", "L3", "L4"];
 const STATUSES: ScenarioStatus[] = ["active", "verified", "draft", "archived"];
-const ASSERTION_OPERATORS: ScenarioAssertionOperator[] = [
-  "not_empty",
-  "equals",
-  "not_equals",
-  "contains",
-  "gt",
-  "gte",
-  "lt",
-  "lte",
-  "matches",
-  "custom",
-];
 const NEGATIVE_CATEGORIES: ScenarioNegativeCategory[] = [
   "auth",
   "validation",
@@ -78,7 +73,7 @@ const NEGATIVE_CATEGORIES: ScenarioNegativeCategory[] = [
 
 const route = useRoute();
 const router = useRouter();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const { activeProjectId, ensureLoaded } = useWorkspace();
 
 const projectId = computed(
@@ -130,7 +125,10 @@ const newAssertEndpoint = ref("");
 const newAssertJsonpath = ref("");
 const newAssertOperator = ref<ScenarioAssertionOperator>("not_empty");
 const newAssertExpected = ref("");
+const newAssertDbDsnRef = ref("");
 const newAssertNote = ref("");
+
+const activeOperatorMeta = computed(() => getOperatorMeta(newAssertOperator.value));
 
 // New negative case form
 const newNegTitle = ref("");
@@ -152,6 +150,7 @@ const createPreconditions = ref("");
 // Try It Drawer state
 const tryItOpen = ref(false);
 const tryItEndpoint = ref<TryItEndpointInput | null>(null);
+const tryItAssertions = ref<ScenarioAssertion[]>([]);
 
 const scenarios = computed<ScenarioItem[]>(() => listData.value?.scenarios ?? []);
 
@@ -393,6 +392,10 @@ async function persistScenario(silentToast = false): Promise<void> {
 
 async function handleAddAssertion(): Promise<void> {
   if (!newAssertTitle.value.trim()) return;
+  const dbDsnRef =
+    activeOperatorMeta.value.needsDbDsn && newAssertDbDsnRef.value.trim()
+      ? newAssertDbDsnRef.value.trim()
+      : null;
   editAssertions.value = [
     ...editAssertions.value,
     {
@@ -404,11 +407,13 @@ async function handleAddAssertion(): Promise<void> {
       expected: newAssertExpected.value.trim(),
       note: newAssertNote.value.trim(),
       status: "pending",
+      ...(dbDsnRef ? { db_dsn_ref: dbDsnRef } : {}),
     },
   ];
   newAssertTitle.value = "";
   newAssertJsonpath.value = "";
   newAssertExpected.value = "";
+  newAssertDbDsnRef.value = "";
   newAssertNote.value = "";
   await persistScenario();
 }
@@ -526,6 +531,11 @@ function openTryIt(ep: InventoryEndpoint): void {
     requestExample: ep.request_example,
     customHeaders: ep.custom_headers,
   };
+  tryItAssertions.value = filterScenarioAssertionsForEndpoint(
+    editAssertions.value,
+    ep.method,
+    ep.path
+  );
   tryItOpen.value = true;
 }
 
@@ -1226,11 +1236,26 @@ onMounted(async () => {
                           <span v-if="asrt.jsonpath" class="rounded bg-slate-100 px-1.5 py-0.5 text-slate-800">
                             {{ asrt.jsonpath }}
                           </span>
-                          <span class="rounded bg-teal-50 px-1.5 py-0.5 font-semibold text-teal-700">
+                          <span
+                            class="rounded px-1.5 py-0.5 font-semibold"
+                            :class="
+                              isSqlOperator(asrt.operator)
+                                ? 'bg-violet-50 text-violet-700'
+                                : 'bg-teal-50 text-teal-700'
+                            "
+                          >
                             {{ asrt.operator }}
                           </span>
                           <span v-if="asrt.expected" class="rounded bg-slate-900 px-1.5 py-0.5 text-emerald-300">
                             {{ asrt.expected }}
+                          </span>
+                          <span
+                            v-if="asrt.db_dsn_ref"
+                            data-testid="assertion-db-dsn-badge"
+                            class="inline-flex items-center gap-1 rounded border border-violet-200 bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700"
+                          >
+                            <Database class="h-3 w-3 shrink-0" />
+                            <span>{{ t("scen.assert.dbBadgePrefix") }}: {{ asrt.db_dsn_ref }}</span>
                           </span>
                         </div>
                         <p v-if="asrt.note" class="text-[11px] text-slate-500">{{ asrt.note }}</p>
@@ -1299,37 +1324,61 @@ onMounted(async () => {
 
                     <div>
                       <label class="mb-1 block text-xs font-medium text-slate-700">
-                        {{ t("scen.assert.jsonpathLabel") }}
-                      </label>
-                      <input
-                        v-model="newAssertJsonpath"
-                        data-testid="assertion-jsonpath-input"
-                        type="text"
-                        :placeholder="t('scen.assert.jsonpathPlaceholder')"
-                        class="input-field font-mono text-xs"
-                      />
-                    </div>
-
-                    <div>
-                      <label class="mb-1 block text-xs font-medium text-slate-700">
                         {{ t("scen.assert.operatorLabel") }}
                       </label>
-                      <select v-model="newAssertOperator" class="input-field font-mono text-xs">
-                        <option v-for="op in ASSERTION_OPERATORS" :key="op" :value="op">
-                          {{ op }}
-                        </option>
+                      <select
+                        v-model="newAssertOperator"
+                        data-testid="assertion-operator-select"
+                        class="input-field font-mono text-xs"
+                      >
+                        <optgroup
+                          v-for="group in ASSERTION_OPERATOR_GROUPS"
+                          :key="group.id"
+                          :label="locale === 'zh' ? group.labelZh : group.labelEn"
+                        >
+                          <option
+                            v-for="op in group.operators"
+                            :key="op.value"
+                            :value="op.value"
+                          >
+                            {{ op.value }} — {{ locale === "zh" ? op.labelZh : op.labelEn }}
+                          </option>
+                        </optgroup>
                       </select>
                     </div>
 
                     <div>
                       <label class="mb-1 block text-xs font-medium text-slate-700">
-                        {{ t("scen.assert.expectedLabel") }}
+                        {{
+                          locale === "zh"
+                            ? activeOperatorMeta.jsonpathLabelZh
+                            : activeOperatorMeta.jsonpathLabelEn
+                        }}
+                      </label>
+                      <input
+                        v-model="newAssertJsonpath"
+                        data-testid="assertion-jsonpath-input"
+                        type="text"
+                        :placeholder="activeOperatorMeta.jsonpathPlaceholder"
+                        class="input-field font-mono text-xs"
+                      />
+                    </div>
+
+                    <div>
+                      <label class="mb-1 flex items-center gap-1.5 text-xs font-medium text-slate-700">
+                        <span>{{ t("scen.assert.expectedLabel") }}</span>
+                        <span
+                          v-if="!activeOperatorMeta.needsExpected"
+                          class="text-[10px] font-normal text-slate-400"
+                        >
+                          {{ t("scen.assert.expectedOptional") }}
+                        </span>
                       </label>
                       <input
                         v-model="newAssertExpected"
                         data-testid="assertion-expected-input"
                         type="text"
-                        :placeholder="t('scen.assert.expectedPlaceholder')"
+                        :placeholder="activeOperatorMeta.expectedPlaceholder"
                         class="input-field font-mono text-xs"
                       />
                     </div>
@@ -1344,6 +1393,35 @@ onMounted(async () => {
                         :placeholder="t('scen.assert.notePlaceholder')"
                         class="input-field text-xs"
                       />
+                    </div>
+
+                    <div
+                      v-if="activeOperatorMeta.hintZh || activeOperatorMeta.hintEn"
+                      class="sm:col-span-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-[11px] text-slate-600"
+                    >
+                      {{ locale === "zh" ? activeOperatorMeta.hintZh : activeOperatorMeta.hintEn }}
+                    </div>
+
+                    <div
+                      v-if="activeOperatorMeta.needsDbDsn"
+                      class="sm:col-span-2 space-y-2 rounded-lg border border-violet-200 bg-violet-50/70 p-3"
+                    >
+                      <div>
+                        <label class="mb-1 flex items-center gap-1.5 text-xs font-medium text-violet-900">
+                          <Database class="h-3.5 w-3.5 text-violet-600" />
+                          <span>{{ t("scen.assert.dbDsnLabel") }}</span>
+                        </label>
+                        <input
+                          v-model="newAssertDbDsnRef"
+                          data-testid="assertion-db-dsn-input"
+                          type="text"
+                          :placeholder="t('scen.assert.dbDsnPlaceholder')"
+                          class="input-field font-mono text-xs"
+                        />
+                      </div>
+                      <p class="text-[11px] leading-relaxed text-violet-800">
+                        {{ t("scen.assert.dbReadonlyHint") }}
+                      </p>
                     </div>
                   </div>
 
@@ -1703,6 +1781,7 @@ onMounted(async () => {
       :open="tryItOpen"
       :project-id="projectId"
       :endpoint="tryItEndpoint"
+      :assertions="tryItAssertions"
       @close="tryItOpen = false"
     />
   </div>

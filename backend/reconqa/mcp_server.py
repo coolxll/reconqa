@@ -1381,6 +1381,123 @@ def create_mcp_server(
             "effectiveness_level": data.get("effectiveness_level", "L0"),
         }
 
+    @mcp.tool()
+    async def reconqa_execute_chain(
+        project_id: str,
+        run_id: str | None = None,
+        chain_name: str | None = None,
+        chain_index: int | None = None,
+        steps: list[dict[str, Any]] | None = None,
+        base_url: str | None = None,
+        credential_id: str | None = None,
+        initial_vars: dict[str, Any] | None = None,
+        step_assertions: dict[str, list[dict[str, Any]]] | None = None,
+        db_dsn_ref: str | None = None,
+        stop_on_failure: bool = True,
+    ) -> dict[str, Any]:
+        """Execute a multi-step API chain with deep assertions and checkpoint saving for resume."""
+        payload: dict[str, Any] = {
+            "run_id": run_id,
+            "chain_name": chain_name,
+            "chain_index": chain_index,
+            "steps": steps,
+            "base_url": base_url,
+            "credential_id": credential_id,
+            "initial_vars": dict(initial_vars or {}),
+            "step_assertions": dict(step_assertions or {}),
+            "db_dsn_ref": db_dsn_ref,
+            "stop_on_failure": stop_on_failure,
+        }
+        data = await client.request_json(
+            "POST",
+            f"/projects/{project_id}/chains/execute",
+            json_body=payload,
+            timeout=120.0,
+        )
+        return {
+            "chain_run_id": data.get("chain_run_id"),
+            "project_id": data.get("project_id", project_id),
+            "run_id": data.get("run_id"),
+            "chain_name": data.get("chain_name", ""),
+            "status": data.get("status", "failed"),
+            "total_steps": int(data.get("total_steps", 0) or 0),
+            "completed_steps": int(data.get("completed_steps", 0) or 0),
+            "failed_step_index": data.get("failed_step_index"),
+            "resumed_from_index": data.get("resumed_from_index"),
+            "context_vars": data.get("context_vars") or {},
+            "step_results": [
+                {
+                    "step_index": sr.get("step_index"),
+                    "step": sr.get("step"),
+                    "name": sr.get("name", ""),
+                    "method": sr.get("method", ""),
+                    "url": sr.get("url", ""),
+                    "status": sr.get("status", ""),
+                    "status_code": sr.get("status_code", 0),
+                    "duration_ms": sr.get("duration_ms", 0.0),
+                    "extracted_vars": sr.get("extracted_vars") or {},
+                    "assertions": sr.get("assertions") or [],
+                    "error": sr.get("error"),
+                }
+                for sr in (data.get("step_results") or [])
+            ],
+        }
+
+    @mcp.tool()
+    async def reconqa_resume_chain(
+        project_id: str,
+        chain_run_id: str,
+        from_step_index: int | None = None,
+        override_vars: dict[str, Any] | None = None,
+        override_step_body: Any = None,
+        override_step_assertions: list[dict[str, Any]] | None = None,
+        credential_id: str | None = None,
+        db_dsn_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Resume a failed/partial chain run from its checkpoint step without re-running prior passed steps."""
+        payload: dict[str, Any] = {
+            "from_step_index": from_step_index,
+            "override_vars": dict(override_vars or {}),
+            "override_step_body": override_step_body,
+            "override_step_assertions": override_step_assertions,
+            "credential_id": credential_id,
+            "db_dsn_ref": db_dsn_ref,
+        }
+        data = await client.request_json(
+            "POST",
+            f"/projects/{project_id}/chain-runs/{chain_run_id}/resume",
+            json_body=payload,
+            timeout=120.0,
+        )
+        return {
+            "chain_run_id": data.get("chain_run_id", chain_run_id),
+            "project_id": data.get("project_id", project_id),
+            "run_id": data.get("run_id"),
+            "chain_name": data.get("chain_name", ""),
+            "status": data.get("status", "failed"),
+            "total_steps": int(data.get("total_steps", 0) or 0),
+            "completed_steps": int(data.get("completed_steps", 0) or 0),
+            "failed_step_index": data.get("failed_step_index"),
+            "resumed_from_index": data.get("resumed_from_index"),
+            "context_vars": data.get("context_vars") or {},
+            "step_results": [
+                {
+                    "step_index": sr.get("step_index"),
+                    "step": sr.get("step"),
+                    "name": sr.get("name", ""),
+                    "method": sr.get("method", ""),
+                    "url": sr.get("url", ""),
+                    "status": sr.get("status", ""),
+                    "status_code": sr.get("status_code", 0),
+                    "duration_ms": sr.get("duration_ms", 0.0),
+                    "extracted_vars": sr.get("extracted_vars") or {},
+                    "assertions": sr.get("assertions") or [],
+                    "error": sr.get("error"),
+                }
+                for sr in (data.get("step_results") or [])
+            ],
+        }
+
     # --- 3 MCP Resources ---
 
     @mcp.resource(

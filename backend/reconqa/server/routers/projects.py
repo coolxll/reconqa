@@ -52,6 +52,7 @@ from reconqa.modules.discovery.auth_resolver import (
     redact_secrets,
     resolve_auth_from_profile,
 )
+from reconqa.modules.hub.assertion_engine import evaluate_assertion
 from reconqa.modules.hub.inventory import build_project_inventory
 from reconqa.server.routers.explore import find_project_explores
 from reconqa.utils.io import ensure_dir, slugify
@@ -1158,6 +1159,21 @@ async def replay_project_endpoint(
         profile=profile,
         timeout_sec=clamped_timeout,
     )
+    if body.assertions:
+        resp.assertion_results = [
+            await asyncio.to_thread(
+                evaluate_assertion,
+                assertion,
+                status_code=resp.status_code,
+                duration_ms=resp.duration_ms,
+                response_headers=resp.response_headers,
+                body_json=resp.body_json,
+                body_text=resp.body_text,
+                context_vars=body.context_vars,
+                db_dsn_ref=body.db_dsn_ref,
+            )
+            for assertion in body.assertions
+        ]
     return resp
 
 

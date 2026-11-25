@@ -6,17 +6,31 @@ import mermaid from 'mermaid'
 import {
   AlertTriangle,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Clock,
   Code2,
   Copy,
+  Database,
   Eye,
   GitBranch,
+  History,
   Layers,
+  Loader2,
+  Play,
+  RotateCcw,
   Search,
   ShieldAlert,
+  SkipForward,
+  Terminal,
+  XCircle,
 } from 'lucide-vue-next'
 import type {
+  AuthProfile,
+  ChainRunOut,
+  ChainStepResult,
+  CorrelationChain,
   CorrelationReport,
   CorrelationVariable,
   CoverageDiffReport,
@@ -25,7 +39,10 @@ import type {
   UncoveredEndpoint,
 } from '@/api/types'
 import { getRunCorrelation, getRunCoverage } from '@/api/runs'
+import { listAuthProfiles } from '@/api/projects'
 import { listProjectScenarios } from '@/api/scenarios'
+import { executeChain, listChainRuns, resumeChainRun } from '@/api/chains'
+import { computeResumeStepIndex, matchesChainCheckpoint } from '@/utils/assertionOperators'
 import { useWorkspace } from '@/stores/workspace'
 import StatusBadge from '@/components/layout/StatusBadge.vue'
 import EmptyState from '@/components/layout/EmptyState.vue'
@@ -80,8 +97,27 @@ const uncoveredSearch = ref('')
 const expandedPrefixes = ref<Record<string, boolean>>({})
 const visibleLimitByPrefix = ref<Record<string, number>>({})
 
+// Lightweight Chain Runner & Checkpoint/Resume state
+const authProfiles = ref<AuthProfile[]>([])
+const chainRuns = ref<ChainRunOut[]>([])
+const expandedRunners = ref<Record<string, boolean>>({})
+const credentialByChain = ref<Record<string, string>>({})
+const baseUrlByChain = ref<Record<string, string>>({})
+const dbDsnRefByChain = ref<Record<string, string>>({})
+const initialVarsByChain = ref<Record<string, string>>({})
+const runningByChain = ref<Record<string, boolean>>({})
+const resumingByChain = ref<Record<string, boolean>>({})
+const chainErrorByChain = ref<Record<string, string>>({})
+const activeChainRunByChain = ref<Record<string, ChainRunOut | null>>({})
+const resumeFromIndexByChain = ref<Record<string, number>>({})
+const overrideVarsByChain = ref<Record<string, string>>({})
+const overrideBodyByChain = ref<Record<string, string>>({})
+const expandedStepPreviews = ref<Record<string, boolean>>({})
+
 let mermaidReady = false
 let renderCounter = 0
+let loadSeq = 0
+let runnerSeq = 0
 
 const effectiveProjectId = computed(() => props.projectId || activeProjectId.value || '')
 
@@ -263,13 +299,24 @@ const filteredVariables = computed<CorrelationVariable[]>(() => {
   )
 })
 
-const filteredChains = computed(() => {
+interface IndexedChain {
+  chain: CorrelationChain
+  chainIndex: number
+  key: string
+}
+
+const filteredChains = computed<IndexedChain[]>(() => {
   const chains = correlation.value?.chains ?? []
-  if (selectedScenario.value === 'ALL') return chains
-  return chains.filter(
-    (c) =>
-      c.scenario === selectedScenario.value ||
-      c.steps.some((s) => s.scenario === selectedScenario.value),
+  const indexed = chains.map((chain, chainIndex) => ({
+    chain,
+    chainIndex,
+    key: `${chainIndex}::${chain.name}`,
+  }))
+  if (selectedScenario.value === 'ALL') return indexed
+  return indexed.filter(
+    ({ chain }) =>
+      chain.scenario === selectedScenario.value ||
+      chain.steps.some((s) => s.scenario === selectedScenario.value),
   )
 })
 
@@ -281,6 +328,325 @@ const activeMermaidCode = computed(() => {
   return buildFocusedMermaid(filteredVariables.value)
 })
 
+function resetRunnerState() {
+  chainRuns.value = []
+  credentialByChain.value = {}
+  baseUrlByChain.value = {}
+  dbDsnRefByChain.value = {}
+  initialVarsByChain.value = {}
+  activeChainRunByChain.value = {}
+  resumeFromIndexByChain.value = {}
+  overrideVarsByChain.value = {}
+  overrideBodyByChain.value = {}
+  chainErrorByChain.value = {}
+  expandedRunners.value = {}
+  expandedStepPreviews.value = {}
+  runningByChain.value = {}
+  resumingByChain.value = {}
+}
+
+function selectChainCheckpoint(chainKey: string, run: ChainRunOut) {
+  activeChainRunByChain.value = {
+    ...activeChainRunByChain.value,
+    [chainKey]: run,
+  }
+  resumeFromIndexByChain.value = {
+    ...resumeFromIndexByChain.value,
+    [chainKey]: computeResumeStepIndex(run),
+  }
+  overrideVarsByChain.value = {
+    ...overrideVarsByChain.value,
+    [chainKey]: '',
+  }
+  overrideBodyByChain.value = {
+    ...overrideBodyByChain.value,
+    [chainKey]: '',
+  }
+  chainErrorByChain.value = {
+    ...chainErrorByChain.value,
+    [chainKey]: '',
+  }
+  if (
+    run.credential_id &&
+    authProfiles.value.some((p) => p.id === run.credential_id)
+  ) {
+    credentialByChain.value = {
+      ...credentialByChain.value,
+      [chainKey]: run.credential_id,
+    }
+  } else {
+    // Clear stale credential selection when checkpoint had no credential or its credential was deleted
+    // so resume falls back to backend checkpoint validation rather than submitting a stale profile.
+    credentialByChain.value = {
+      ...credentialByChain.value,
+      [chainKey]: '',
+    }
+  }
+  if (typeof run.db_dsn_ref === 'string' && run.db_dsn_ref.trim()) {
+    dbDsnRefByChain.value = {
+      ...dbDsnRefByChain.value,
+      [chainKey]: run.db_dsn_ref.trim(),
+    }
+  } else if (run.db_dsn_ref === null) {
+    dbDsnRefByChain.value = {
+      ...dbDsnRefByChain.value,
+      [chainKey]: '',
+    }
+  }
+}
+
+function hydrateLatestCheckpoints() {
+  const chains = correlation.value?.chains ?? []
+  for (let i = 0; i < chains.length; i += 1) {
+    const chain = chains[i]
+    const key = `${i}::${chain.name}`
+    if (activeChainRunByChain.value[key]) continue
+    const match = chainRuns.value.find((cr) =>
+      matchesChainCheckpoint(cr, i, chain.name),
+    )
+    if (match) {
+      selectChainCheckpoint(key, match)
+    }
+  }
+}
+
+function checkpointsForChain(chainIndex: number, chainName: string): ChainRunOut[] {
+  return chainRuns.value.filter((cr) =>
+    matchesChainCheckpoint(cr, chainIndex, chainName),
+  )
+}
+
+function toggleChainRunner(chainKey: string) {
+  const next = !expandedRunners.value[chainKey]
+  expandedRunners.value = {
+    ...expandedRunners.value,
+    [chainKey]: next,
+  }
+}
+
+function setResumeStep(chainKey: string, stepIndex: number) {
+  resumeFromIndexByChain.value = {
+    ...resumeFromIndexByChain.value,
+    [chainKey]: Math.max(0, stepIndex),
+  }
+}
+
+function stepPreviewKey(chainRunId: string, stepIndex: number): string {
+  return `${chainRunId}::${stepIndex}`
+}
+
+function toggleStepPreview(chainRunId: string, stepIndex: number) {
+  const k = stepPreviewKey(chainRunId, stepIndex)
+  expandedStepPreviews.value = {
+    ...expandedStepPreviews.value,
+    [k]: !expandedStepPreviews.value[k],
+  }
+}
+
+function parseJsonObjectOrError(
+  raw: string | undefined,
+  fieldLabel: string,
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  const trimmed = (raw ?? '').trim()
+  if (!trimmed) return { ok: true, value: {} }
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { ok: true, value: parsed as Record<string, unknown> }
+    }
+    return { ok: false, error: t('corr.runner.invalidJsonError', { field: fieldLabel }) }
+  } catch {
+    return { ok: false, error: t('corr.runner.invalidJsonError', { field: fieldLabel }) }
+  }
+}
+
+function upsertChainRunInHistory(updated: ChainRunOut) {
+  const idx = chainRuns.value.findIndex((r) => r.chain_run_id === updated.chain_run_id)
+  if (idx >= 0) {
+    const copy = [...chainRuns.value]
+    copy[idx] = updated
+    chainRuns.value = copy
+  } else {
+    chainRuns.value = [updated, ...chainRuns.value]
+  }
+}
+
+async function handleExecuteChain(item: IndexedChain) {
+  const pid = effectiveProjectId.value
+  if (!pid) {
+    chainErrorByChain.value = {
+      ...chainErrorByChain.value,
+      [item.key]: t('corr.runner.noProjectError'),
+    }
+    return
+  }
+
+  const varsRes = parseJsonObjectOrError(
+    initialVarsByChain.value[item.key],
+    t('corr.runner.initialVarsLabel'),
+  )
+  if (!varsRes.ok) {
+    chainErrorByChain.value = {
+      ...chainErrorByChain.value,
+      [item.key]: varsRes.error,
+    }
+    return
+  }
+
+  const reqSeq = loadSeq
+  const reqRunnerSeq = runnerSeq
+  runningByChain.value = { ...runningByChain.value, [item.key]: true }
+  chainErrorByChain.value = { ...chainErrorByChain.value, [item.key]: '' }
+
+  try {
+    const result = await executeChain(pid, {
+      run_id: props.runId,
+      chain_name: item.chain.name,
+      chain_index: item.chainIndex,
+      credential_id: credentialByChain.value[item.key] || null,
+      base_url: (baseUrlByChain.value[item.key] ?? '').trim() || null,
+      db_dsn_ref: (dbDsnRefByChain.value[item.key] ?? '').trim() || null,
+      initial_vars: varsRes.value,
+      stop_on_failure: true,
+    })
+    if (reqSeq !== loadSeq || reqRunnerSeq !== runnerSeq) return
+    upsertChainRunInHistory(result)
+    selectChainCheckpoint(item.key, result)
+  } catch (err) {
+    if (reqSeq !== loadSeq || reqRunnerSeq !== runnerSeq) return
+    chainErrorByChain.value = {
+      ...chainErrorByChain.value,
+      [item.key]: err instanceof Error ? err.message : String(err),
+    }
+  } finally {
+    if (reqSeq === loadSeq && reqRunnerSeq === runnerSeq) {
+      runningByChain.value = { ...runningByChain.value, [item.key]: false }
+    }
+  }
+}
+
+async function handleResumeChain(item: IndexedChain) {
+  const pid = effectiveProjectId.value
+  const activeRun = activeChainRunByChain.value[item.key]
+  if (!pid || !activeRun) {
+    chainErrorByChain.value = {
+      ...chainErrorByChain.value,
+      [item.key]: t('corr.runner.noProjectError'),
+    }
+    return
+  }
+
+  const varsRes = parseJsonObjectOrError(
+    overrideVarsByChain.value[item.key],
+    t('corr.runner.overrideVarsLabel'),
+  )
+  if (!varsRes.ok) {
+    chainErrorByChain.value = {
+      ...chainErrorByChain.value,
+      [item.key]: varsRes.error,
+    }
+    return
+  }
+
+  let parsedOverrideBody: unknown = undefined
+  const rawBody = (overrideBodyByChain.value[item.key] ?? '').trim()
+  if (rawBody) {
+    try {
+      parsedOverrideBody = JSON.parse(rawBody)
+    } catch {
+      chainErrorByChain.value = {
+        ...chainErrorByChain.value,
+        [item.key]: t('corr.runner.invalidJsonError', {
+          field: t('corr.runner.overrideBodyLabel'),
+        }),
+      }
+      return
+    }
+  }
+
+  const fromStepIdx =
+    resumeFromIndexByChain.value[item.key] ?? computeResumeStepIndex(activeRun)
+
+  const reqSeq = loadSeq
+  const reqRunnerSeq = runnerSeq
+  resumingByChain.value = { ...resumingByChain.value, [item.key]: true }
+  chainErrorByChain.value = { ...chainErrorByChain.value, [item.key]: '' }
+
+  try {
+    const rawOverrideVarsText = (overrideVarsByChain.value[item.key] ?? '').trim()
+    const selectedCred = (credentialByChain.value[item.key] ?? '').trim()
+    const result = await resumeChainRun(pid, activeRun.chain_run_id, {
+      from_step_index: fromStepIdx,
+      ...(rawOverrideVarsText ? { override_vars: varsRes.value } : {}),
+      ...(parsedOverrideBody !== undefined ? { override_step_body: parsedOverrideBody } : {}),
+      ...(selectedCred ? { credential_id: selectedCred } : {}),
+      base_url: (baseUrlByChain.value[item.key] ?? '').trim() || null,
+      db_dsn_ref: (dbDsnRefByChain.value[item.key] ?? '').trim() || null,
+      stop_on_failure: true,
+    })
+    if (reqSeq !== loadSeq || reqRunnerSeq !== runnerSeq) return
+    upsertChainRunInHistory(result)
+    selectChainCheckpoint(item.key, result)
+  } catch (err) {
+    if (reqSeq !== loadSeq || reqRunnerSeq !== runnerSeq) return
+    chainErrorByChain.value = {
+      ...chainErrorByChain.value,
+      [item.key]: err instanceof Error ? err.message : String(err),
+    }
+  } finally {
+    if (reqSeq === loadSeq && reqRunnerSeq === runnerSeq) {
+      resumingByChain.value = { ...resumingByChain.value, [item.key]: false }
+    }
+  }
+}
+
+function stepStatusBadgeClass(status: ChainStepResult['status']): string {
+  switch (status) {
+    case 'passed':
+      return 'border-emerald-200 bg-emerald-50 text-emerald-700'
+    case 'failed':
+      return 'border-rose-200 bg-rose-50 text-rose-700'
+    default:
+      return 'border-slate-200 bg-slate-100 text-slate-500'
+  }
+}
+
+function formatVarChipValue(val: unknown): string {
+  if (typeof val === 'string') {
+    return val.length > 28 ? `${val.slice(0, 25)}...` : val
+  }
+  const serialized = JSON.stringify(val)
+  if (!serialized) return String(val)
+  return serialized.length > 28 ? `${serialized.slice(0, 25)}...` : serialized
+}
+
+async function loadRunnerResources() {
+  const seq = ++runnerSeq
+  const pid = effectiveProjectId.value
+  const currentRunId = props.runId
+  if (!pid) {
+    authProfiles.value = []
+    chainRuns.value = []
+    return
+  }
+  const [authRes, runsRes] = await Promise.allSettled([
+    listAuthProfiles(pid),
+    listChainRuns(pid, currentRunId),
+  ])
+  if (seq !== runnerSeq) return
+  if (authRes.status === 'fulfilled') {
+    authProfiles.value = authRes.value ?? []
+  } else {
+    authProfiles.value = []
+  }
+  if (runsRes.status === 'fulfilled') {
+    chainRuns.value = runsRes.value ?? []
+  } else {
+    chainRuns.value = []
+  }
+  hydrateLatestCheckpoints()
+}
+
 async function loadScenarios() {
   const pid = effectiveProjectId.value
   if (!pid) {
@@ -289,6 +655,7 @@ async function loadScenarios() {
   }
   try {
     const res = await listProjectScenarios(pid)
+    if (pid !== effectiveProjectId.value) return
     const nextMap: Record<string, ScenarioMeta> = {}
     for (const sc of (res.scenarios ?? []) as ScenarioItem[]) {
       nextMap[sc.slug] = {
@@ -301,11 +668,14 @@ async function loadScenarios() {
     }
     scenarioMap.value = nextMap
   } catch {
-    scenarioMap.value = {}
+    if (pid === effectiveProjectId.value) {
+      scenarioMap.value = {}
+    }
   }
 }
 
 async function loadData() {
+  const seq = ++loadSeq
   loading.value = true
   correlation.value = null
   coverage.value = null
@@ -315,12 +685,16 @@ async function loadData() {
   expandedPrefixes.value = {}
   visibleLimitByPrefix.value = {}
   uncoveredSearch.value = ''
+  resetRunnerState()
 
   const [corrRes, covRes] = await Promise.allSettled([
     getRunCorrelation(props.runId),
     getRunCoverage(props.runId),
     loadScenarios(),
+    loadRunnerResources(),
   ])
+
+  if (seq !== loadSeq) return
 
   if (corrRes.status === 'fulfilled') {
     correlation.value = corrRes.value
@@ -328,6 +702,7 @@ async function loadData() {
   if (covRes.status === 'fulfilled') {
     coverage.value = covRes.value
   }
+  hydrateLatestCheckpoints()
   loading.value = false
 
   if (activeMermaidCode.value) {
@@ -493,9 +868,9 @@ watch(activeMermaidCode, async (code) => {
 
 watch(() => props.runId, loadData)
 watch(effectiveProjectId, () => {
-  if (!loading.value) {
-    void loadScenarios()
-  }
+  resetRunnerState()
+  void loadScenarios()
+  void loadRunnerResources()
 })
 onMounted(loadData)
 </script>
@@ -653,42 +1028,558 @@ onMounted(loadData)
             v-html="renderedSvg"
           />
 
-          <!-- Chains Summary Strip -->
+          <!-- Chains Summary Strip & Lightweight Chain Runner -->
           <div
             v-if="filteredChains.length > 0"
             class="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2"
           >
             <div
-              v-for="chain in filteredChains"
-              :key="chain.name"
-              class="flex items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50/80 px-3.5 py-2.5 text-xs"
+              v-for="item in filteredChains"
+              :key="item.key"
+              class="rounded-xl border border-slate-200 bg-slate-50/80 text-xs transition"
+              :class="expandedRunners[item.key] ? 'md:col-span-2 bg-white shadow-sm ring-1 ring-indigo-100' : ''"
             >
-              <div class="min-w-0">
-                <div class="truncate font-semibold text-slate-800">{{ chain.name }}</div>
-                <div class="mt-0.5 flex flex-wrap items-center gap-1.5 text-slate-500">
-                  <RouterLink
-                    v-if="scenarioRoute(chain.scenario)"
-                    :to="scenarioRoute(chain.scenario)!"
-                    class="inline-flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700 transition hover:bg-indigo-100"
-                  >
+              <!-- Chain Card Header -->
+              <div class="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5">
+                <div class="min-w-0 flex-1">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="truncate font-semibold text-slate-800">{{ item.chain.name }}</span>
                     <span
-                      v-if="getScenarioMeta(chain.scenario)?.priority"
-                      class="rounded px-1 text-[9px] font-bold"
-                      :class="priorityBadgeClass(getScenarioMeta(chain.scenario)!.priority)"
+                      v-if="activeChainRunByChain[item.key]"
+                      class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold"
+                      :class="
+                        activeChainRunByChain[item.key]!.status === 'passed'
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                          : 'border-rose-200 bg-rose-50 text-rose-700'
+                      "
                     >
-                      {{ getScenarioMeta(chain.scenario)!.priority }}
+                      <CheckCircle2
+                        v-if="activeChainRunByChain[item.key]!.status === 'passed'"
+                        class="h-3 w-3"
+                      />
+                      <XCircle v-else class="h-3 w-3" />
+                      <span>
+                        {{ activeChainRunByChain[item.key]!.completed_steps }}/{{
+                          activeChainRunByChain[item.key]!.total_steps
+                        }}
+                      </span>
                     </span>
-                    <span class="max-w-[160px] truncate">{{ scenarioDisplayName(chain.scenario) }}</span>
-                  </RouterLink>
-                  <span>{{ t('corr.chainMeta', { scenario: scenarioDisplayName(chain.scenario), steps: chain.steps.length }) }}</span>
+                  </div>
+                  <div class="mt-0.5 flex flex-wrap items-center gap-1.5 text-slate-500">
+                    <RouterLink
+                      v-if="scenarioRoute(item.chain.scenario)"
+                      :to="scenarioRoute(item.chain.scenario)!"
+                      class="inline-flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700 transition hover:bg-indigo-100"
+                    >
+                      <span
+                        v-if="getScenarioMeta(item.chain.scenario)?.priority"
+                        class="rounded px-1 text-[9px] font-bold"
+                        :class="priorityBadgeClass(getScenarioMeta(item.chain.scenario)!.priority)"
+                      >
+                        {{ getScenarioMeta(item.chain.scenario)!.priority }}
+                      </span>
+                      <span class="max-w-[160px] truncate">{{
+                        scenarioDisplayName(item.chain.scenario)
+                      }}</span>
+                    </RouterLink>
+                    <span>{{
+                      t('corr.chainMeta', {
+                        scenario: scenarioDisplayName(item.chain.scenario),
+                        steps: item.chain.steps.length,
+                      })
+                    }}</span>
+                  </div>
+                </div>
+
+                <div class="flex shrink-0 flex-wrap items-center gap-2">
+                  <span
+                    v-if="item.chain.cleanup_step"
+                    class="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
+                  >
+                    {{
+                      t('corr.cleanupBadge', {
+                        method: item.chain.cleanup_step.method,
+                        path: item.chain.cleanup_step.path,
+                      })
+                    }}
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="chain-runner-toggle-btn"
+                    class="inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition"
+                    :class="
+                      expandedRunners[item.key]
+                        ? 'border-indigo-300 bg-indigo-600 text-white hover:bg-indigo-700'
+                        : 'border-indigo-200 bg-white text-indigo-700 hover:bg-indigo-50'
+                    "
+                    @click="toggleChainRunner(item.key)"
+                  >
+                    <Play v-if="!expandedRunners[item.key]" class="h-3 w-3" />
+                    <ChevronDown v-else class="h-3 w-3" />
+                    <span>
+                      {{
+                        expandedRunners[item.key]
+                          ? t('corr.runner.toggleClose')
+                          : t('corr.runner.toggleOpen')
+                      }}
+                    </span>
+                  </button>
                 </div>
               </div>
-              <span
-                v-if="chain.cleanup_step"
-                class="shrink-0 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700"
+
+              <!-- Collapsible Chain Runner & Checkpoint/Resume Drawer -->
+              <div
+                v-if="expandedRunners[item.key]"
+                class="space-y-4 border-t border-slate-200 bg-white px-4 py-4"
               >
-                {{ t('corr.cleanupBadge', { method: chain.cleanup_step.method, path: chain.cleanup_step.path }) }}
-              </span>
+                <!-- Recent Checkpoints Selector Pill Bar -->
+                <div
+                  v-if="checkpointsForChain(item.chainIndex, item.chain.name).length > 0"
+                  class="flex flex-wrap items-center gap-1.5"
+                >
+                  <span class="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-500">
+                    <History class="h-3.5 w-3.5" />
+                    {{ t('corr.runner.recentCheckpoints') }}:
+                  </span>
+                  <button
+                    v-for="cp in checkpointsForChain(item.chainIndex, item.chain.name)"
+                    :key="cp.chain_run_id"
+                    type="button"
+                    class="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 font-mono text-[11px] transition"
+                    :class="
+                      activeChainRunByChain[item.key]?.chain_run_id === cp.chain_run_id
+                        ? 'border-indigo-400 bg-indigo-50 font-semibold text-indigo-800'
+                        : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
+                    "
+                    @click="selectChainCheckpoint(item.key, cp)"
+                  >
+                    <span
+                      class="h-1.5 w-1.5 rounded-full"
+                      :class="cp.status === 'passed' ? 'bg-emerald-500' : 'bg-rose-500'"
+                    />
+                    <span>#{{ cp.chain_run_id.slice(0, 8) }}</span>
+                    <span class="text-slate-400">{{ cp.completed_steps }}/{{ cp.total_steps }}</span>
+                  </button>
+                </div>
+
+                <!-- Execution Controls -->
+                <div class="grid grid-cols-1 gap-3 rounded-lg border border-slate-200 bg-slate-50/70 p-3 md:grid-cols-3">
+                  <div>
+                    <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                      {{ t('corr.runner.credentialLabel') }}
+                    </label>
+                    <select
+                      v-model="credentialByChain[item.key]"
+                      class="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-800 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                    >
+                      <option value="">{{ t('corr.runner.credentialNone') }}</option>
+                      <option
+                        v-for="prof in authProfiles"
+                        :key="prof.id"
+                        :value="prof.id"
+                      >
+                        {{ prof.name }} ({{ prof.role_tag }})
+                      </option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                      {{ t('corr.runner.baseUrlLabel') }}
+                    </label>
+                    <input
+                      v-model="baseUrlByChain[item.key]"
+                      type="text"
+                      :placeholder="t('corr.runner.baseUrlPlaceholder')"
+                      class="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-800 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                    />
+                  </div>
+
+                  <div>
+                    <label class="mb-1 flex items-center gap-1 text-[11px] font-medium text-slate-600">
+                      <Database class="h-3 w-3 text-violet-500" />
+                      <span>{{ t('corr.runner.dbDsnLabel') }}</span>
+                    </label>
+                    <input
+                      v-model="dbDsnRefByChain[item.key]"
+                      type="text"
+                      :placeholder="t('corr.runner.dbDsnPlaceholder')"
+                      class="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-800 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                    />
+                  </div>
+
+                  <div class="md:col-span-2">
+                    <label class="mb-1 block text-[11px] font-medium text-slate-600">
+                      {{ t('corr.runner.initialVarsLabel') }}
+                    </label>
+                    <input
+                      v-model="initialVarsByChain[item.key]"
+                      type="text"
+                      :placeholder="t('corr.runner.initialVarsPlaceholder')"
+                      class="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs text-slate-800 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                    />
+                  </div>
+
+                  <div class="flex items-end justify-end">
+                    <button
+                      type="button"
+                      data-testid="chain-run-btn"
+                      :disabled="runningByChain[item.key] || resumingByChain[item.key]"
+                      class="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60 md:w-auto"
+                      @click="handleExecuteChain(item)"
+                    >
+                      <Loader2 v-if="runningByChain[item.key]" class="h-3.5 w-3.5 animate-spin" />
+                      <Play v-else class="h-3.5 w-3.5" />
+                      <span>
+                        {{
+                          runningByChain[item.key]
+                            ? t('corr.runner.runningBtn')
+                            : t('corr.runner.runBtn')
+                        }}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Error Banner -->
+                <div
+                  v-if="chainErrorByChain[item.key]"
+                  class="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800"
+                >
+                  <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
+                  <span class="break-all">{{ chainErrorByChain[item.key] }}</span>
+                </div>
+
+                <!-- Live Step Timeline & Checkpoint Resume -->
+                <div
+                  v-if="activeChainRunByChain[item.key]"
+                  class="space-y-3"
+                >
+                  <!-- Overall Summary Header -->
+                  <div
+                    class="flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3.5 py-2.5"
+                    :class="
+                      activeChainRunByChain[item.key]!.status === 'passed'
+                        ? 'border-emerald-200 bg-emerald-50/70'
+                        : 'border-rose-200 bg-rose-50/70'
+                    "
+                  >
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span
+                        class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-bold"
+                        :class="
+                          activeChainRunByChain[item.key]!.status === 'passed'
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-rose-600 text-white'
+                        "
+                      >
+                        <CheckCircle2
+                          v-if="activeChainRunByChain[item.key]!.status === 'passed'"
+                          class="h-3.5 w-3.5"
+                        />
+                        <XCircle v-else class="h-3.5 w-3.5" />
+                        <span>
+                          {{
+                            activeChainRunByChain[item.key]!.status === 'passed'
+                              ? t('corr.runner.statusPassed')
+                              : activeChainRunByChain[item.key]!.failed_step_index != null
+                                ? t('corr.runner.statusFailedAt', {
+                                    step: activeChainRunByChain[item.key]!.failed_step_index! + 1,
+                                  })
+                                : t('corr.runner.statusFailed')
+                          }}
+                        </span>
+                      </span>
+
+                      <span class="text-xs font-semibold text-slate-700">
+                        {{
+                          t('corr.runner.progress', {
+                            completed: activeChainRunByChain[item.key]!.completed_steps,
+                            total: activeChainRunByChain[item.key]!.total_steps,
+                          })
+                        }}
+                      </span>
+
+                      <span
+                        v-if="activeChainRunByChain[item.key]!.resumed_from_index != null"
+                        class="inline-flex items-center gap-1 rounded-full border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700"
+                      >
+                        <RotateCcw class="h-3 w-3" />
+                        <span>
+                          {{
+                            t('corr.runner.resumedFrom', {
+                              step: activeChainRunByChain[item.key]!.resumed_from_index! + 1,
+                            })
+                          }}
+                        </span>
+                      </span>
+                    </div>
+
+                    <span
+                      v-if="activeChainRunByChain[item.key]!.base_url"
+                      class="font-mono text-[11px] text-slate-500"
+                    >
+                      {{ activeChainRunByChain[item.key]!.base_url }}
+                    </span>
+                  </div>
+
+                  <!-- Per-Step Timeline -->
+                  <ol class="space-y-2">
+                    <li
+                      v-for="stepRes in activeChainRunByChain[item.key]!.step_results"
+                      :key="`${activeChainRunByChain[item.key]!.chain_run_id}-${stepRes.step_index}`"
+                      class="rounded-lg border border-slate-200 bg-white p-3"
+                      :class="
+                        stepRes.status === 'failed'
+                          ? 'border-rose-300 bg-rose-50/30'
+                          : stepRes.status === 'skipped'
+                            ? 'opacity-70'
+                            : ''
+                      "
+                    >
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="flex min-w-0 flex-wrap items-center gap-2">
+                          <CheckCircle2
+                            v-if="stepRes.status === 'passed'"
+                            class="h-4 w-4 shrink-0 text-emerald-600"
+                          />
+                          <XCircle
+                            v-else-if="stepRes.status === 'failed'"
+                            class="h-4 w-4 shrink-0 text-rose-600"
+                          />
+                          <SkipForward
+                            v-else
+                            class="h-4 w-4 shrink-0 text-slate-400"
+                          />
+
+                          <span
+                            class="rounded-full border px-2 py-0.5 text-[10px] font-semibold"
+                            :class="stepStatusBadgeClass(stepRes.status)"
+                          >
+                            {{ t('corr.runner.stepLabel', { step: stepRes.step_index + 1 }) }} ·
+                            {{ t(`corr.runner.stepStatus.${stepRes.status}`) }}
+                          </span>
+
+                          <span
+                            class="rounded border px-1.5 py-0.5 font-mono text-[10px] font-bold"
+                            :class="methodPillClass(stepRes.method)"
+                          >
+                            {{ stepRes.method }}
+                          </span>
+
+                          <span class="truncate font-mono text-xs text-slate-800">
+                            {{ stepRes.url || stepRes.name }}
+                          </span>
+                        </div>
+
+                        <div class="flex shrink-0 items-center gap-2">
+                          <span
+                            v-if="stepRes.status_code > 0"
+                            class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] font-semibold"
+                            :class="
+                              stepRes.status_code < 400 ? 'text-emerald-700' : 'text-rose-700'
+                            "
+                          >
+                            HTTP {{ stepRes.status_code }}
+                          </span>
+                          <span class="inline-flex items-center gap-0.5 font-mono text-[11px] text-slate-500">
+                            <Clock class="h-3 w-3" />
+                            {{ Math.round(stepRes.duration_ms) }} ms
+                          </span>
+                          <button
+                            type="button"
+                            class="rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600 transition hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700"
+                            @click="setResumeStep(item.key, stepRes.step_index)"
+                          >
+                            {{ t('corr.runner.setResumeStep') }}
+                          </button>
+                          <button
+                            type="button"
+                            class="inline-flex items-center gap-1 rounded border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-600 hover:bg-slate-50"
+                            @click="
+                              toggleStepPreview(
+                                activeChainRunByChain[item.key]!.chain_run_id,
+                                stepRes.step_index,
+                              )
+                            "
+                          >
+                            <Terminal class="h-3 w-3" />
+                            <span>
+                              {{
+                                expandedStepPreviews[
+                                  stepPreviewKey(
+                                    activeChainRunByChain[item.key]!.chain_run_id,
+                                    stepRes.step_index,
+                                  )
+                                ]
+                                  ? t('corr.runner.previewHide')
+                                  : t('corr.runner.previewShow')
+                              }}
+                            </span>
+                          </button>
+                        </div>
+                      </div>
+
+                      <!-- Extracted {{var}} Chips -->
+                      <div
+                        v-if="Object.keys(stepRes.extracted_vars || {}).length > 0"
+                        class="mt-2 flex flex-wrap items-center gap-1.5"
+                      >
+                        <span class="text-[10px] font-semibold text-slate-500">
+                          {{ t('corr.runner.extractedVars') }}:
+                        </span>
+                        <span
+                          v-for="[vName, vVal] in Object.entries(stepRes.extracted_vars)"
+                          :key="vName"
+                          class="inline-flex items-center gap-1 rounded border border-indigo-200 bg-indigo-50 px-1.5 py-0.5 font-mono text-[10px] text-indigo-800"
+                        >
+                          <span class="font-semibold">&#123;&#123;{{ vName }}&#125;&#125;</span>
+                          <span class="text-indigo-500">=</span>
+                          <span>{{ formatVarChipValue(vVal) }}</span>
+                        </span>
+                      </div>
+
+                      <!-- Assertion Pass/Fail Chips -->
+                      <div
+                        v-if="stepRes.assertions && stepRes.assertions.length > 0"
+                        class="mt-2 flex flex-wrap items-center gap-1.5"
+                      >
+                        <span class="text-[10px] font-semibold text-slate-500">
+                          {{ t('corr.runner.assertions') }}:
+                        </span>
+                        <span
+                          v-for="asrt in stepRes.assertions"
+                          :key="asrt.id || asrt.title"
+                          :title="asrt.message"
+                          class="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium"
+                          :class="
+                            asrt.passed
+                              ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                              : 'border-rose-200 bg-rose-50 text-rose-800'
+                          "
+                        >
+                          <CheckCircle2 v-if="asrt.passed" class="h-3 w-3 shrink-0" />
+                          <XCircle v-else class="h-3 w-3 shrink-0" />
+                          <span>{{ asrt.title || asrt.operator }}</span>
+                          <span v-if="!asrt.passed && asrt.message" class="font-mono text-[10px] opacity-90">
+                            — {{ asrt.message }}
+                          </span>
+                        </span>
+                      </div>
+
+                      <!-- Step Error Message -->
+                      <div
+                        v-if="stepRes.error"
+                        class="mt-2 rounded border border-rose-200 bg-rose-50 px-2.5 py-1.5 font-mono text-[11px] text-rose-800"
+                      >
+                        {{ stepRes.error }}
+                      </div>
+
+                      <!-- Expandable Response Body Preview -->
+                      <pre
+                        v-if="
+                          expandedStepPreviews[
+                            stepPreviewKey(
+                              activeChainRunByChain[item.key]!.chain_run_id,
+                              stepRes.step_index,
+                            )
+                          ]
+                        "
+                        class="mt-2 max-h-48 overflow-auto rounded-lg bg-slate-950 p-2.5 font-mono text-[11px] leading-relaxed text-slate-100"
+                      >{{ stepRes.body_preview || t('corr.runner.emptyBody') }}</pre>
+                    </li>
+                  </ol>
+
+                  <!-- Checkpoint & Resume Controls -->
+                  <div
+                    class="space-y-3 rounded-xl border p-3.5"
+                    :class="
+                      activeChainRunByChain[item.key]!.status === 'failed'
+                        ? 'border-amber-300 bg-amber-50/60'
+                        : 'border-slate-200 bg-slate-50/70'
+                    "
+                  >
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h5 class="flex items-center gap-1.5 text-xs font-bold text-slate-900">
+                          <RotateCcw class="h-3.5 w-3.5 text-amber-600" />
+                          <span>{{ t('corr.runner.resumeTitle') }}</span>
+                        </h5>
+                        <p class="mt-0.5 text-[11px] text-slate-600">
+                          {{ t('corr.runner.resumeHint') }}
+                        </p>
+                      </div>
+
+                      <div class="flex items-center gap-2">
+                        <label class="text-[11px] font-medium text-slate-700">
+                          {{ t('corr.runner.resumeFromLabel') }}:
+                        </label>
+                        <select
+                          v-model.number="resumeFromIndexByChain[item.key]"
+                          class="rounded-lg border border-slate-300 bg-white px-2 py-1 font-mono text-xs text-slate-800 focus:border-indigo-400 focus:outline-none"
+                        >
+                          <option
+                            v-for="idx in activeChainRunByChain[item.key]!.total_steps"
+                            :key="idx"
+                            :value="idx - 1"
+                          >
+                            {{ t('corr.runner.stepLabel', { step: idx }) }}
+                          </option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                      <div>
+                        <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                          {{ t('corr.runner.overrideVarsLabel') }}
+                        </label>
+                        <textarea
+                          v-model="overrideVarsByChain[item.key]"
+                          rows="4"
+                          class="w-full rounded-lg border border-slate-200 bg-white p-2 font-mono text-[11px] text-slate-800 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                        />
+                      </div>
+
+                      <div>
+                        <label class="mb-1 block text-[11px] font-medium text-slate-700">
+                          {{ t('corr.runner.overrideBodyLabel') }}
+                        </label>
+                        <textarea
+                          v-model="overrideBodyByChain[item.key]"
+                          rows="4"
+                          :placeholder="t('corr.runner.overrideBodyPlaceholder')"
+                          class="w-full rounded-lg border border-slate-200 bg-white p-2 font-mono text-[11px] text-slate-800 focus:border-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                        />
+                      </div>
+                    </div>
+
+                    <div class="flex justify-end">
+                      <button
+                        type="button"
+                        data-testid="chain-resume-btn"
+                        :disabled="runningByChain[item.key] || resumingByChain[item.key]"
+                        class="inline-flex items-center gap-1.5 rounded-lg bg-amber-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+                        @click="handleResumeChain(item)"
+                      >
+                        <Loader2 v-if="resumingByChain[item.key]" class="h-3.5 w-3.5 animate-spin" />
+                        <RotateCcw v-else class="h-3.5 w-3.5" />
+                        <span>
+                          {{
+                            resumingByChain[item.key]
+                              ? t('corr.runner.resumingBtn')
+                              : t('corr.runner.resumeBtn', {
+                                  step:
+                                    (resumeFromIndexByChain[item.key] ??
+                                      computeResumeStepIndex(activeChainRunByChain[item.key])) + 1,
+                                })
+                          }}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
