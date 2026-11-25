@@ -1447,3 +1447,191 @@ async def test_p1_correlation_bindings_duplicate_chains_cred_resume_redaction_an
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+@pytest.mark.asyncio
+async def test_p1_resume_syncs_only_reexecuted_steps_and_persists_virtual_path(
+    order_server: StatefulOrderServer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex Round 1 P1 #6 (Resume) & #9 (virtual_path): resume only syncs steps[start_index:] and persists virtual_path."""
+    ws_dir = tmp_path / "workspaces"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    db_file = ws_dir / "resume_sync_p1.db"
+    monkeypatch.setattr(settings, "data_dir", ws_dir)
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_file}")
+
+    from reconqa.models import db as db_mod
+
+    monkeypatch.setattr(db_mod, "_engine", None)
+    monkeypatch.setattr(db_mod, "_session_factory", None)
+
+    from reconqa.server.app import create_app
+
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            proj = (await client.post("/api/v1/projects", json={"name": "Resume Sync QA"})).json()
+            project_id = proj["id"]
+            cred = (
+                await client.post(
+                    f"/api/v1/projects/{project_id}/auth-profiles",
+                    json={
+                        "name": "Buyer",
+                        "role_tag": "buyer",
+                        "auth_type": "headers",
+                        "extra_headers_ref": {"Authorization": order_server.required_token},
+                    },
+                )
+            ).json()
+            cred_id = cred["id"]
+
+            # Scenario A targets Step 0 (POST /orders); Scenario B targets Step 1 (POST /orders/{id}/pay)
+            sc_a = (
+                await client.post(
+                    f"/api/v1/projects/{project_id}/scenarios",
+                    json={
+                        "slug": "step0-create",
+                        "name": "Step 0 Create",
+                        "priority": "P0",
+                        "assertions": [
+                            {
+                                "id": "assert-step0",
+                                "title": "Order pending",
+                                "target_endpoint": "POST /orders",
+                                "jsonpath": "$.data.status",
+                                "operator": "equals",
+                                "expected": "PENDING",
+                                "status": "pending",
+                            }
+                        ],
+                    },
+                )
+            ).json()
+            sc_b = (
+                await client.post(
+                    f"/api/v1/projects/{project_id}/scenarios",
+                    json={
+                        "slug": "step1-pay",
+                        "name": "Step 1 Pay",
+                        "priority": "P0",
+                        "assertions": [
+                            {
+                                "id": "assert-step1",
+                                "title": "Order paid",
+                                "target_endpoint": "POST /orders/{id}/pay",
+                                "jsonpath": "$.data.status",
+                                "operator": "equals",
+                                "expected": "PAID",
+                                "status": "pending",
+                            }
+                        ],
+                    },
+                )
+            ).json()
+
+            # Run 1: Step 0 passes (syncs assert-step0 -> passed), Step 1 fails (syncs assert-step1 -> failed)
+            exec_resp = await client.post(
+                f"/api/v1/projects/{project_id}/chains/execute",
+                json={
+                    "chain_name": "Resume Isolation Chain",
+                    "base_url": order_server.base_url,
+                    "credential_id": cred_id,
+                    "include_scenario_assertions": True,
+                    "sync_scenarios": True,
+                    "steps": [
+                        {
+                            "step": 1,
+                            "name": "Create",
+                            "method": "POST",
+                            "path": "/orders",
+                            "request_body": {"amount": 40},
+                            "expected_status": 201,
+                            "extracts": {"order_id": "$.data.order_id"},
+                        },
+                        {
+                            "step": 2,
+                            "name": "Pay",
+                            "method": "POST",
+                            "path": "/orders/{order_id}/pay",
+                            "request_body": {"pay_code": "BAD"},
+                            "expected_status": 200,
+                        },
+                    ],
+                },
+            )
+            assert exec_resp.status_code == 200, exec_resp.text
+            r1 = exec_resp.json()
+            assert r1["status"] == "failed"
+            assert r1["failed_step_index"] == 1
+            # virtual_path persisted on every step result
+            assert r1["step_results"][0]["virtual_path"] == "/orders"
+            assert r1["step_results"][1]["virtual_path"] == "/orders/{order_id}/pay"
+
+            # Verify initial sync set assert-step0=passed and assert-step1=failed
+            sc_a_after_r1 = (await client.get(f"/api/v1/projects/{project_id}/scenarios/{sc_a['id']}")).json()
+            sc_b_after_r1 = (await client.get(f"/api/v1/projects/{project_id}/scenarios/{sc_b['id']}")).json()
+            assert sc_a_after_r1["assertions"][0]["status"] == "passed"
+            assert sc_b_after_r1["assertions"][0]["status"] == "failed"
+
+            # Now externally mark Scenario A's assertion as 'failed' (simulating a newer run failing Step 0)
+            upd = await client.patch(
+                f"/api/v1/projects/{project_id}/scenarios/{sc_a['id']}",
+                json={
+                    "assertions": [
+                        {
+                            **sc_a_after_r1["assertions"][0],
+                            "status": "failed",
+                        }
+                    ]
+                },
+            )
+            assert upd.status_code == 200
+            assert upd.json()["assertions"][0]["status"] == "failed"
+
+            # Resume from step_index=1 with fixed body and sync_scenarios=True
+            res_resp = await client.post(
+                f"/api/v1/projects/{project_id}/chain-runs/{r1['chain_run_id']}/resume",
+                json={
+                    "override_step_body": {"pay_code": "VALID-PAY"},
+                    "sync_scenarios": True,
+                },
+            )
+            assert res_resp.status_code == 200, res_resp.text
+            assert res_resp.json()["status"] == "passed"
+
+            # Step 1 assertion MUST now be 'passed', while un-re-run Step 0 assertion MUST STAY 'failed'!
+            sc_a_after_resume = (await client.get(f"/api/v1/projects/{project_id}/scenarios/{sc_a['id']}")).json()
+            sc_b_after_resume = (await client.get(f"/api/v1/projects/{project_id}/scenarios/{sc_b['id']}")).json()
+            assert sc_b_after_resume["assertions"][0]["status"] == "passed"
+            assert sc_a_after_resume["assertions"][0]["status"] == "failed"
+
+            # Also verify GraphQL virtual_path with #OperationName is preserved on ChainStepResult
+            gql_resp = await client.post(
+                f"/api/v1/projects/{project_id}/chains/execute",
+                json={
+                    "chain_name": "GraphQL Virtual Path Chain",
+                    "base_url": order_server.base_url,
+                    "credential_id": cred_id,
+                    "steps": [
+                        {
+                            "step": 1,
+                            "name": "GQL GetOrder",
+                            "method": "POST",
+                            "path": "/graphql#GetOrderList",
+                            "request_body": {"query": "{ orders { id } }"},
+                        }
+                    ],
+                },
+            )
+            assert gql_resp.status_code == 200
+            gql_sr = gql_resp.json()["step_results"][0]
+            assert gql_sr["virtual_path"] == "/graphql#GetOrderList"
+            assert "#GetOrderList" not in gql_sr["url"]
+
+        if db_mod._engine is not None:
+            await db_mod._engine.dispose()
+        db_mod._engine = None
+        db_mod._session_factory = None

@@ -819,6 +819,7 @@ class ChainStepResult(BaseModel):
     name: str = ""
     method: str
     url: str
+    virtual_path: str = ""
     status: Literal["passed", "failed", "skipped"]
     status_code: int = 0
     duration_ms: float = 0.0
@@ -834,6 +835,7 @@ class ChainRunOut(BaseModel):
     run_id: str | None = None
     chain_name: str
     chain_index: int | None = None
+    batch_id: str | None = None
     credential_id: str | None = None
     db_dsn_ref: str | None = None
     status: Literal["passed", "failed"]
@@ -848,6 +850,30 @@ class ChainRunOut(BaseModel):
     synced_assertions: int = 0
     created_at: str
     updated_at: str
+
+
+class ChainBatchExecuteRequest(BaseModel):
+    run_id: str | None = None
+    chain_indices: list[int] | None = None
+    base_url: str | None = None
+    credential_id: str | None = None
+    initial_vars: dict[str, Any] = Field(default_factory=dict)
+    include_scenario_assertions: bool = True
+    sync_scenarios: bool = True
+    db_dsn_ref: str | None = None
+    stop_on_failure: bool = True
+    timeout_sec: float = 15.0
+    max_chains: int = Field(default=50, ge=1, le=200)
+
+
+class ChainBatchExecuteResponse(BaseModel):
+    batch_id: str
+    project_id: str
+    run_id: str | None = None
+    total_chains: int = 0
+    passed_chains: int = 0
+    failed_chains: int = 0
+    chain_runs: list[ChainRunOut] = Field(default_factory=list)
 
 
 class ReplayMatrixRequest(BaseModel):
@@ -1125,6 +1151,12 @@ class WebhookDeliveryResult(BaseModel):
 class QualityGateRequest(BaseModel):
     run_id: str | None = None
     baseline_run_id: str | None = None
+    batch_id: str | None = None
+    execute_chains: bool = False
+    chain_indices: list[int] | None = None
+    credential_id: str | None = None
+    base_url: str | None = None
+    db_dsn_ref: str | None = None
     max_p0_chain_failures: int | None = Field(default=None, ge=0)
     max_new_high_security: int | None = Field(default=None, ge=0)
     max_coverage_drop_pct: float | None = Field(default=None, ge=0.0)
@@ -1143,6 +1175,7 @@ class QualityGateResult(BaseModel):
     target_label: str = ""
     run_id: str | None = None
     baseline_run_id: str | None = None
+    batch_id: str | None = None
     passed: bool
     status: Literal["passed", "failed"]
     evaluated_at: str

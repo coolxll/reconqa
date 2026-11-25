@@ -247,6 +247,11 @@ def _extract_request_candidates(entry: HarEntry) -> list[tuple[str, str, str]]:
             val = _normalize_candidate_value(raw_val)
             if val is not None:
                 results.append(("body", param, val))
+    elif entry.request_body_raw and "graphql" in (entry.request_mime_type or "").lower():
+        for raw_lit in re.findall(r'"([^"\\\r\n]{4,256})"', entry.request_body_raw):
+            val = _normalize_candidate_value(raw_lit)
+            if val is not None:
+                results.append(("body", "graphql_query", val))
 
     return results
 
@@ -338,15 +343,26 @@ def _is_cleanup_entry(entry: HarEntry) -> bool:
     return any(tok in _CLEANUP_PATH_TOKENS for tok in segments)
 
 
-def _sanitize_step_headers(headers: dict[str, str]) -> dict[str, str]:
+def _sanitize_step_headers(
+    headers: dict[str, str],
+    *,
+    request_mime_type: str = "",
+) -> dict[str, str]:
     clean: dict[str, str] = {}
+    has_gql_ct = False
     for name, value in headers.items():
         lower = name.lower()
         if lower in SENSITIVE_HEADER_NAMES:
             continue
+        if lower == "content-type" and "application/graphql" in str(value or "").lower():
+            clean[name] = value
+            has_gql_ct = True
+            continue
         if lower in _IGNORED_CORRELATION_HEADERS or lower.startswith("sec-"):
             continue
         clean[name] = value
+    if not has_gql_ct and "application/graphql" in str(request_mime_type or "").lower():
+        clean["Content-Type"] = request_mime_type.strip()
     return clean
 
 
@@ -681,15 +697,26 @@ def analyze_correlations(
 
         for step in comp:
             entry = entries_by_step[step]
+            if entry.request_json is not None:
+                step_req_body: Any = entry.request_json
+            elif entry.request_form:
+                step_req_body = entry.request_form
+            elif entry.request_body_raw and "graphql" in (entry.request_mime_type or "").lower():
+                step_req_body = entry.request_body_raw
+            else:
+                step_req_body = None
             step_model = CorrelationChainStep(
                 step=step,
                 scenario=entry.scenario,
                 method=entry.method,
                 path=entry.normalized_path,
                 raw_url=entry.url,
-                request_headers=_sanitize_step_headers(entry.request_headers),
+                request_headers=_sanitize_step_headers(
+                    entry.request_headers,
+                    request_mime_type=entry.request_mime_type,
+                ),
                 query_params=dict(entry.query_params),
-                request_body=entry.request_json if entry.request_json is not None else (entry.request_form or None),
+                request_body=step_req_body,
                 expected_status=entry.status or 200,
                 extracts=dict(extracts_by_step.get(step, {})),
                 uses=dict(uses_by_step.get(step, {})),

@@ -1284,3 +1284,95 @@ def test_graphql_edge_cases_r2_regressions(tmp_path: Path) -> None:
     assert caps_by_key["graphql/getorderlist"]["actions"] == ["list"]
     assert caps_by_key["graphql/createorder"]["module"] == "graphql"
     assert caps_by_key["graphql/createorder"]["actions"] == ["create"]
+
+
+def test_graphql_underscore_op_names_batch_metadata_and_raw_graphql_correlation(
+    tmp_path: Path,
+) -> None:
+    """P1 #8 & #9 (HAR/GraphQL): preserve _Lookup/Lookup/Lookup_, batch metadata, and application/graphql correlation."""
+    from reconqa.modules.hub.correlation import analyze_correlations
+
+    har_dir = tmp_path / "har_p1_gql"
+    har_dir.mkdir()
+    batch_payload_raw = json.dumps(
+        [
+            {"operationName": "_Lookup", "query": "query _Lookup { a }"},
+            {"operationName": "Lookup", "query": "query Lookup { b }"},
+            {"operationName": "Lookup_", "query": "query Lookup_ { c }"},
+        ]
+    )
+    raw_gql_create = 'mutation CreateTicket { createTicket(title: "bug") { id } }'
+    raw_gql_get = 'query GetTicket { ticket(id: "TKT-98765") { id status } }'
+
+    har_doc = {
+        "log": {
+            "entries": [
+                _make_har_entry(
+                    method="POST",
+                    url="https://shop.example.com/graphql",
+                    req_text=batch_payload_raw,
+                    resp_json=[
+                        {"data": {"a": 1}},
+                        {"data": {"b": 2}},
+                        {"data": {"c": 3}},
+                    ],
+                    started="2026-11-25T05:00:01.000Z",
+                ),
+                _make_har_entry(
+                    method="POST",
+                    url="https://shop.example.com/graphql",
+                    req_mime="application/graphql",
+                    req_text=raw_gql_create,
+                    resp_json={"data": {"createTicket": {"id": "TKT-98765"}}},
+                    started="2026-11-25T05:00:02.000Z",
+                    headers=[{"name": "Content-Type", "value": "application/graphql"}],
+                ),
+                _make_har_entry(
+                    method="POST",
+                    url="https://shop.example.com/graphql",
+                    req_mime="application/graphql",
+                    req_text=raw_gql_get,
+                    resp_json={"data": {"ticket": {"id": "TKT-98765", "status": "OPEN"}}},
+                    started="2026-11-25T05:00:03.000Z",
+                    headers=[{"name": "Content-Type", "value": "application/graphql"}],
+                ),
+            ]
+        }
+    }
+    har_file = har_dir / "gql_exact.har"
+    har_file.write_text(json.dumps(har_doc), encoding="utf-8")
+
+    # 1. Underscore operation names stay completely distinct & batch raw body/index preserved
+    entries = parse_har_file(har_file, scenario="gql_exact", target_domain="shop.example.com")
+    by_norm_path = {e.normalized_path: e for e in entries}
+    assert "/graphql#_Lookup" in by_norm_path
+    assert "/graphql#Lookup" in by_norm_path
+    assert "/graphql#Lookup_" in by_norm_path
+
+    e0 = by_norm_path["/graphql#_Lookup"]
+    e1 = by_norm_path["/graphql#Lookup"]
+    e2 = by_norm_path["/graphql#Lookup_"]
+    assert e0.graphql_operation_name == "_Lookup"
+    assert e1.graphql_operation_name == "Lookup"
+    assert e2.graphql_operation_name == "Lookup_"
+    assert [e0.graphql_batch_index, e1.graphql_batch_index, e2.graphql_batch_index] == [0, 1, 2]
+    assert [e0.graphql_batch_size, e1.graphql_batch_size, e2.graphql_batch_size] == [3, 3, 3]
+    assert e0.request_body_raw == batch_payload_raw
+    assert e1.request_body_raw == batch_payload_raw
+    assert e2.request_body_raw == batch_payload_raw
+
+    # 2. Correlation preserves raw application/graphql request_body and Content-Type header
+    corr_out = analyze_correlations(
+        har_dir,
+        tmp_path / "corr_out",
+        target_domain="shop.example.com",
+    )
+    assert len(corr_out["chains"]) == 1
+    steps = corr_out["chains"][0]["steps"]
+    assert len(steps) == 2
+    assert steps[0]["path"] == "/graphql#CreateTicket"
+    assert steps[0]["request_body"] == raw_gql_create
+    assert steps[0]["request_headers"].get("Content-Type") == "application/graphql"
+    assert steps[1]["path"] == "/graphql#GetTicket"
+    assert steps[1]["request_body"] == raw_gql_get
+    assert steps[1]["request_headers"].get("Content-Type") == "application/graphql"

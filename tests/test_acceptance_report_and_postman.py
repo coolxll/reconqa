@@ -1246,3 +1246,323 @@ def test_postman_chain_step_preserves_graphql_operation_fragment() -> None:
     # SPA #/ route fragment is ignored
     assert spa_step["name"] == "GET /app"
     assert spa_step["request"]["url"]["raw"] == "{{baseUrl}}/app"
+
+
+def test_acceptance_report_sanitizes_har_urls_findings_and_chain_runs() -> None:
+    """P1 #3: Raw HAR query tokens/sigs/userinfo NEVER leak into HTML, Markdown, or JSON reports."""
+    report = build_acceptance_report_data(
+        project_id="proj_sec",
+        project_name="Sanitization QA",
+        har_perf_report={
+            "summary": {
+                "total_requests": 10,
+                "avg_ttfb_ms": 220.0,
+                "p95_ttfb_ms": 1850.0,
+                "p95_total_ms": 2100.0,
+                "large_body_count": 1,
+            },
+            "slowest_ttfb": [
+                {
+                    "method": "GET",
+                    "path": "/api/v1/export",
+                    "url": "https://svc:harPass99@api.example.test/api/v1/export?token=secret_xyz&sig=sig_secret_11&page=1",
+                    "ttfb_ms": 1850.0,
+                }
+            ],
+            "slowest_total": [
+                {
+                    "method": "GET",
+                    "url": "https://api.example.test/api/v1/dl?api_key=ak_live_777&X-Amz-Signature=amz_sig_888",
+                    "total_ms": 2400.0,
+                }
+            ],
+            "largest_responses": [
+                {
+                    "method": "GET",
+                    "url": "https://api.example.test/api/v1/dump?access_token=dump_tok_555",
+                    "size_bytes": 512000,
+                }
+            ],
+        },
+        findings=[
+            {
+                "id": "f1",
+                "category": "perf_slow_ttfb",
+                "severity": "high",
+                "endpoint": "GET https://api.example.test/api/v1/export?token=secret_xyz",
+                "title": "Slow export on https://api.example.test/api/v1/export?sig=sig_title_33",
+                "evidence": {
+                    "url": "https://user1:evPass44@api.example.test/api/v1/export?token=secret_xyz&api_key=ev_key_66",
+                    "authorization": "Bearer ev_bearer_secret_99",
+                },
+            }
+        ],
+        chain_runs=[
+            {
+                "chain_run_id": "cr_sec_1",
+                "chain_name": "Export Flow",
+                "status": "passed",
+                "total_steps": 1,
+                "completed_steps": 1,
+                "step_results": [
+                    {
+                        "step_index": 0,
+                        "step": 1,
+                        "name": "Download",
+                        "method": "GET",
+                        "url": "https://u:chainPass77@api.example.test/dl?token=chain_tok_123&sig=chain_sig_456",
+                        "status": "passed",
+                        "status_code": 200,
+                        "duration_ms": 55.0,
+                        "assertions": [
+                            {
+                                "id": "ca1",
+                                "title": "Download link present",
+                                "operator": "not_empty",
+                                "passed": True,
+                                "actual": {
+                                    "download_url": "https://cdn.example.test/f.zip?token=actual_tok_999",
+                                    "api_key": "actual_key_888",
+                                },
+                                "expected": "",
+                                "message": "Fetched https://api.example.test/dl?token=msg_tok_222",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    json_text = json.dumps(report.model_dump(mode="json"), ensure_ascii=False)
+    md_text = render_acceptance_report_markdown(report)
+    html_text = render_acceptance_report_html(report)
+
+    leaked_secrets = (
+        "secret_xyz",
+        "harPass99",
+        "sig_secret_11",
+        "ak_live_777",
+        "amz_sig_888",
+        "dump_tok_555",
+        "sig_title_33",
+        "evPass44",
+        "ev_key_66",
+        "ev_bearer_secret_99",
+        "chainPass77",
+        "chain_tok_123",
+        "chain_sig_456",
+        "actual_tok_999",
+        "actual_key_888",
+        "msg_tok_222",
+    )
+    for secret in leaked_secrets:
+        assert secret not in json_text, f"Leaked {secret} in JSON report"
+        assert secret not in md_text, f"Leaked {secret} in Markdown report"
+        assert secret not in html_text, f"Leaked {secret} in HTML report"
+
+    # Non-sensitive params and redaction markers are retained
+    assert "[REDACTED]" in json_text
+    assert "page=1" in report.performance.slowest_ttfb[0]["url"]
+    assert "[REDACTED]" in md_text
+    assert "[REDACTED]" in html_text
+
+
+def test_postman_signed_urls_sensitive_assertions_multihost_and_raw_graphql() -> None:
+    """P1 #4 & #5: Signed URL redaction, sensitive assertion JS scrubbing, per-host vars, application/graphql."""
+    raw_gql_query = "query GetProfile { me { id email } }"
+    col = export_postman_collection(
+        project_id="proj_p1_pm",
+        project_name="MultiHost Shop",
+        base_url="https://api.example.test",
+        openapi_doc={
+            "servers": [
+                {"url": "https://api.example.test"},
+                {"url": "https://billing.example.test:8443"},
+            ],
+            "paths": {
+                "/graphql#GetProfile": {
+                    "post": {
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/graphql": {
+                                    "schema": {"type": "string"},
+                                    "example": raw_gql_query,
+                                }
+                            },
+                        }
+                    }
+                }
+            },
+        },
+        inventory={
+            "endpoints": [
+                {
+                    "method": "GET",
+                    "path": "/api/v1/files/{id}",
+                    "host": "api.example.test",
+                    "parameters": [
+                        {
+                            "name": "X-Amz-Signature",
+                            "in": "query",
+                            "required": True,
+                            "example": "amz-query-sig-secret-111",
+                        },
+                        {
+                            "name": "sig",
+                            "in": "query",
+                            "required": True,
+                            "example": "short-sig-secret-222",
+                        },
+                    ],
+                    "status_codes": [200],
+                    "response_example": {
+                        "download_url": (
+                            "https://cdn.example.test/files/report.pdf"
+                            "?X-Amz-Signature=amz-resp-sig-333&token=resp-dl-tok-444&inline=1"
+                        )
+                    },
+                },
+                {
+                    "method": "POST",
+                    "path": "/v1/invoices",
+                    "host": "billing.example.test:8443",
+                    "status_codes": [201],
+                    "request_example": {"amount": 499},
+                },
+                {
+                    "method": "POST",
+                    "path": "/graphql#GetProfile",
+                    "host": "api.example.test",
+                    "status_codes": [200],
+                    "request_example": raw_gql_query,
+                },
+            ]
+        },
+        chains=[
+            {
+                "name": "Cross-Service Billing Flow",
+                "steps": [
+                    {
+                        "step": 1,
+                        "method": "POST",
+                        "path": "/api/v1/login",
+                        "raw_url": "https://api.example.test/api/v1/login",
+                        "request_body": {"user": "alice"},
+                        "expected_status": 200,
+                    },
+                    {
+                        "step": 2,
+                        "method": "POST",
+                        "path": "/v1/invoices",
+                        "raw_url": "https://billing.example.test:8443/v1/invoices?sig=chain-sig-555",
+                        "request_body": {
+                            "callback": "https://hooks.example.test/cb?token=cb-tok-666&ok=1"
+                        },
+                        "expected_status": 201,
+                    },
+                    {
+                        "step": 3,
+                        "method": "POST",
+                        "path": "/graphql#GetProfile",
+                        "raw_url": "https://api.example.test/graphql",
+                        "request_headers": {"Content-Type": "application/graphql"},
+                        "request_body": raw_gql_query,
+                        "expected_status": 200,
+                    },
+                ],
+            }
+        ],
+        scenario_assertions=[
+            {
+                "id": "sa_cookie",
+                "title": "Session cookie set",
+                "target_endpoint": "POST /api/v1/login",
+                "jsonpath": "Set-Cookie",
+                "operator": "header_equals",
+                "expected": "sessionid=super-secret-cookie-777; HttpOnly",
+            },
+            {
+                "id": "sa_tok",
+                "title": "Access token returned",
+                "target_endpoint": "POST /api/v1/login",
+                "jsonpath": "$.data.token",
+                "operator": "equals",
+                "expected": "raw-login-jwt-secret-888",
+            },
+        ],
+    )
+
+    # 1. Per-host collection variables created for distinct origin
+    var_map = {v["key"]: v["value"] for v in col["variable"]}
+    assert var_map["baseUrl"] == "https://api.example.test"
+    assert var_map["baseUrl_billing_example_test_8443"] == "https://billing.example.test:8443"
+
+    # Locate items
+    all_asset_items = [
+        item
+        for folder in col["item"][0]["item"]
+        for item in folder["item"]
+    ]
+    by_name = {item["name"]: item for item in all_asset_items}
+    file_item = by_name["GET /api/v1/files/{id}"]
+    invoice_item = by_name["POST /v1/invoices"]
+    gql_item = by_name["POST /graphql#GetProfile"]
+
+    # Billing endpoint bound to its own host variable, NOT {{baseUrl}}
+    assert invoice_item["request"]["url"]["host"] == ["{{baseUrl_billing_example_test_8443}}"]
+    assert invoice_item["request"]["url"]["raw"] == "{{baseUrl_billing_example_test_8443}}/v1/invoices"
+
+    # Raw application/graphql preserved on both Asset Library endpoint and Chain step
+    gql_hdrs = {h["key"].lower(): h["value"] for h in gql_item["request"]["header"]}
+    assert gql_hdrs["content-type"] == "application/graphql"
+    assert gql_item["request"]["body"]["raw"] == raw_gql_query
+    assert gql_item["request"]["body"]["options"]["raw"]["language"] != "json"
+
+    chain_steps = col["item"][1]["item"][0]["item"]
+    login_step, billing_step, gql_step = chain_steps
+    assert billing_step["request"]["url"]["host"] == ["{{baseUrl_billing_example_test_8443}}"]
+    assert billing_step["request"]["url"]["raw"].startswith(
+        "{{baseUrl_billing_example_test_8443}}/v1/invoices"
+    )
+    gql_step_hdrs = {h["key"].lower(): h["value"] for h in gql_step["request"]["header"]}
+    assert gql_step_hdrs["content-type"] == "application/graphql"
+    assert gql_step["request"]["body"]["raw"] == raw_gql_query
+
+    # Response example signed URL redacted while preserving non-sensitive param
+    resp_example = json.loads(file_item["response"][0]["body"])
+    assert "X-Amz-Signature=[REDACTED]" in resp_example["download_url"]
+    assert "token=[REDACTED]" in resp_example["download_url"]
+    assert "inline=1" in resp_example["download_url"]
+
+    # Sensitive assertion JS scripts redact expected values and remain valid JS
+    login_js = "\n".join(login_step["event"][0]["script"]["exec"])
+    assert "Sensitive expected value redacted" in login_js
+    assert "pm.expect(_hdrVal).to.be.ok;" in login_js
+    assert "pm.expect(_val).to.be.ok;" in login_js
+
+    node_bin = shutil.which("node")
+    if node_bin:
+        proc = subprocess.run(
+            [node_bin, "--check"],
+            input=login_js,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    # Zero leakage anywhere in the entire serialized Postman collection
+    serialized = json.dumps(col, ensure_ascii=False)
+    for secret in (
+        "amz-query-sig-secret-111",
+        "short-sig-secret-222",
+        "amz-resp-sig-333",
+        "resp-dl-tok-444",
+        "chain-sig-555",
+        "cb-tok-666",
+        "super-secret-cookie-777",
+        "raw-login-jwt-secret-888",
+    ):
+        assert secret not in serialized, f"Leaked {secret} in Postman collection"

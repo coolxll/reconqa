@@ -682,17 +682,94 @@ def match_endpoint_scenario_assertions(
     return [item for _, item in scored]
 
 
+def _normalize_assertion_jsonpath(op: str, jp: str) -> str:
+    raw = (jp or "").strip()
+    if not raw:
+        return ""
+    op_low = (op or "").strip().lower()
+    if op_low == "header_equals":
+        return raw.lower()
+    if op_low in {"sql_equals", "sql_exists"}:
+        return re.sub(r"\s+", " ", raw).strip().lower()
+    if raw == "$":
+        return ""
+    if raw.startswith("$."):
+        return raw[2:].strip()
+    if raw.startswith("$"):
+        return raw[1:].strip()
+    return raw
+
+
+def _assertion_definition_matches(
+    persisted: ScenarioAssertion,
+    ev: AssertionEvalResult,
+    src_assertion: ScenarioAssertion | None = None,
+) -> bool:
+    """Verify operator and (when provided) jsonpath/expected match before mutating persisted status."""
+    p_op = str(persisted.operator or "").strip().lower()
+    ev_op = str(ev.operator or "").strip().lower()
+    if ev_op and p_op != ev_op:
+        return False
+
+    if src_assertion is not None:
+        src_op = str(src_assertion.operator or "").strip().lower()
+        if src_op and p_op != src_op:
+            return False
+        p_jp = _normalize_assertion_jsonpath(p_op, persisted.jsonpath)
+        s_jp = _normalize_assertion_jsonpath(p_op, src_assertion.jsonpath)
+        if p_jp != s_jp:
+            return False
+        p_exp = str(persisted.expected or "").strip()
+        s_exp = str(src_assertion.expected or "").strip()
+        if p_exp != s_exp:
+            return False
+        return True
+
+    ev_jp_raw = getattr(ev, "jsonpath", None)
+    if isinstance(ev_jp_raw, str) and ev_jp_raw.strip():
+        if _normalize_assertion_jsonpath(p_op, persisted.jsonpath) != _normalize_assertion_jsonpath(
+            p_op, ev_jp_raw
+        ):
+            return False
+
+    p_exp = str(persisted.expected or "").strip()
+    ev_exp = str(ev.expected or "").strip()
+    if ev_exp and p_exp and "{{" not in p_exp and ev_exp != p_exp:
+        return False
+    return True
+
+
 async def sync_assertion_evals_to_scenarios(
     db: AsyncSession,
     project_id: str,
-    eval_items: list[tuple[str, str, list[AssertionEvalResult]]],
+    eval_items: list[
+        tuple[str, str, list[AssertionEvalResult]]
+        | tuple[str, str, list[AssertionEvalResult], list[ScenarioAssertion] | None]
+    ],
+    *,
+    executed_method: str | None = None,
+    executed_path: str | None = None,
+    evaluated_assertions: list[ScenarioAssertion] | None = None,
 ) -> tuple[int, int]:
     """Sync evaluated AssertionEvalResult statuses back to non-archived ScenarioModel assertions.
 
-    Returns ``(synced_scenarios, synced_assertions)`` counting modified rows/assertions and
-    commits only when at least one ScenarioModel row changed.
+    Each entry in ``eval_items`` may be a 3-tuple ``(method, endpoint, results)`` or a 4-tuple
+    ``(method, endpoint, results, evaluated_assertions)`` supplying per-step assertion definitions.
+
+    Returns ``(synced_scenarios, synced_assertions)`` counting distinct modified ScenarioModel rows
+    and updated assertions, committing only when at least one row changed.
     """
-    non_empty_items = [(m, u, res) for m, u, res in eval_items if res]
+    non_empty_items: list[
+        tuple[str, str, list[AssertionEvalResult], list[ScenarioAssertion] | None]
+    ] = []
+    for item in eval_items:
+        if len(item) == 4:
+            m, u, res_list, item_defs = item
+        else:
+            m, u, res_list = item
+            item_defs = None
+        if res_list:
+            non_empty_items.append((m, u, res_list, item_defs))
     if not non_empty_items:
         return 0, 0
 
@@ -720,26 +797,61 @@ async def sync_assertion_evals_to_scenarios(
     if not rows_assertions:
         return 0, 0
 
-    by_id: dict[str, list[AssertionEvalResult]] = {}
-    fallback_items: list[tuple[str, str, AssertionEvalResult]] = []
-    for method, url_or_path, results in non_empty_items:
-        for ev in results:
+    src_by_idx: list[ScenarioAssertion] = list(evaluated_assertions or [])
+    by_id: dict[str, list[tuple[str, str, AssertionEvalResult, ScenarioAssertion | None]]] = {}
+    fallback_items: list[tuple[str, str, AssertionEvalResult, ScenarioAssertion | None]] = []
+    for item_idx, (method, url_or_path, results, item_defs) in enumerate(non_empty_items):
+        eff_method = (executed_method or method or "GET").strip().upper()
+        eff_path = (executed_path or url_or_path or "").strip()
+        src_list = (
+            list(item_defs)
+            if item_defs
+            else (src_by_idx if len(non_empty_items) == 1 and item_idx == 0 else [])
+        )
+        src_by_id: dict[str, list[ScenarioAssertion]] = {}
+        for sa in src_list:
+            if sa.id:
+                src_by_id.setdefault(sa.id, []).append(sa)
+        src_id_cursor: dict[str, int] = {}
+        has_leading_synthetic_status = (
+            len(results) == len(src_list) + 1
+            and bool(results)
+            and str(results[0].id or "").startswith("status-")
+            and str(results[0].operator or "").strip().lower() == "status_code"
+            and all(str(sa.id or "") != str(results[0].id or "") for sa in src_list)
+        )
+        for ev_idx, ev in enumerate(results):
+            if str(ev.operator or "").strip().lower() == "custom":
+                continue
+            src_a: ScenarioAssertion | None = None
+            if ev.id and ev.id in src_by_id:
+                cur = src_id_cursor.get(ev.id, 0)
+                bucket = src_by_id[ev.id]
+                if cur < len(bucket):
+                    src_a = bucket[cur]
+                    src_id_cursor[ev.id] = cur + 1
+            elif len(src_list) == len(results):
+                src_a = src_list[ev_idx]
+            elif has_leading_synthetic_status and ev_idx > 0:
+                src_a = src_list[ev_idx - 1]
             if ev.id and ev.id in all_persisted_ids:
-                by_id.setdefault(ev.id, []).append(ev)
+                by_id.setdefault(ev.id, []).append((eff_method, eff_path, ev, src_a))
             else:
-                fallback_items.append((method, url_or_path, ev))
+                fallback_items.append((eff_method, eff_path, ev, src_a))
 
     fallback_by_assertion_key: dict[tuple[int, int], list[AssertionEvalResult]] = {}
     if fallback_items:
-        for method, url_or_path, ev in fallback_items:
+        for method, url_or_path, ev, src_a in fallback_items:
             ev_title = (ev.title or "").strip().lower()
             ev_op = (ev.operator or "").strip().lower()
-            if not (ev_title and ev_op):
+            if not (ev_title and ev_op) or ev_op == "custom":
                 continue
             max_endpoint_score = 0
             matched_keys: list[tuple[int, int, int]] = []
             for row_idx, (_row, assertions) in enumerate(rows_assertions):
                 for a_idx, a in enumerate(assertions):
+                    if str(a.operator or "").strip().lower() == "custom":
+                        continue
                     target = a.target_endpoint.strip()
                     if not target:
                         continue
@@ -751,6 +863,7 @@ async def sync_assertion_evals_to_scenarios(
                     if (
                         (a.title or "").strip().lower() == ev_title
                         and str(a.operator or "").strip().lower() == ev_op
+                        and _assertion_definition_matches(a, ev, src_a)
                     ):
                         matched_keys.append((score, row_idx, a_idx))
             min_score = 2 if max_endpoint_score >= 2 else 1
@@ -765,7 +878,18 @@ async def sync_assertion_evals_to_scenarios(
     for row_idx, (row, assertions) in enumerate(rows_assertions):
         row_changed = False
         for a_idx, a in enumerate(assertions):
-            matched_evals: list[AssertionEvalResult] = list(by_id.get(a.id, ()))
+            if str(a.operator or "").strip().lower() == "custom":
+                continue
+
+            matched_evals: list[AssertionEvalResult] = []
+            target = a.target_endpoint.strip()
+            for eff_method, eff_path, ev, src_a in by_id.get(a.id, ()):
+                if target and not endpoint_matches_target(eff_method, eff_path, target):
+                    continue
+                if not _assertion_definition_matches(a, ev, src_a):
+                    continue
+                matched_evals.append(ev)
+
             matched_evals.extend(fallback_by_assertion_key.get((row_idx, a_idx), ()))
 
             if not matched_evals:

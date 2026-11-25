@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -15,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from reconqa.models.db import get_db
 from reconqa.models.schemas import (
     AssertionEvalResult,
+    ChainBatchExecuteRequest,
+    ChainBatchExecuteResponse,
     ChainExecuteRequest,
     ChainResumeRequest,
     ChainRunOut,
@@ -316,47 +319,48 @@ async def _sync_chain_out_to_scenarios(
     project_id: str,
     steps: list[ChainStepInput],
     out: ChainRunOut,
+    *,
+    step_results: list[ChainStepResult] | None = None,
 ) -> ChainRunOut:
-    """Sync all non-skipped step assertions in ``out.step_results`` back to ScenarioModel.
+    """Sync non-skipped step assertions in ``step_results`` (or ``out.step_results``) back to ScenarioModel.
 
-    On resume, ``out.step_results`` contains the full effective chain run (both prior
-    non-skipped steps and newly resumed steps), keeping writeback idempotent on already-synced
-    prior steps while transitioning resumed steps and supporting ``sync_scenarios=False -> True``.
+    On resume, callers pass ONLY ``out.step_results[start_index:]`` (newly re-executed steps)
+    so prior un-re-run steps never overwrite newer ScenarioModel assertion statuses.
     """
-    eval_items: list[tuple[str, str, list[AssertionEvalResult]]] = []
-    for sr in out.step_results:
+    target_results = out.step_results if step_results is None else step_results
+    eval_items: list[
+        tuple[str, str, list[AssertionEvalResult], list[ScenarioAssertion] | None]
+    ] = []
+    for sr in target_results:
         if sr.status == "skipped" or not sr.assertions:
             continue
-        st_path = ""
+        st_path = (sr.virtual_path or "").strip()
         st_raw = ""
         step_frag = ""
         if 0 <= sr.step_index < len(steps):
             st = steps[sr.step_index]
-            st_path = (st.path or "").strip()
+            st_path = (st.path or "").strip() or st_path
             st_raw = (st.raw_url or "").strip()
             _, path_frag = _split_path_and_fragment(st_path)
             _, raw_frag = _split_path_and_fragment(st_raw)
             step_frag = path_frag or raw_frag
+        elif st_path:
+            _, step_frag = _split_path_and_fragment(st_path)
 
+        st_assertions = steps[sr.step_index].assertions if 0 <= sr.step_index < len(steps) else []
         if step_frag:
             base_sr = sr.url.split("#", 1)[0]
-            frag_sr = f"{base_sr}#{step_frag}"
-            eval_items.append((sr.method, frag_sr, sr.assertions))
-            if st_path and st_path != "/" and st_path != frag_sr:
-                eval_items.append((sr.method, st_path, sr.assertions))
-            if st_raw and "#" in st_raw and st_raw != st_path and st_raw != frag_sr:
-                eval_items.append((sr.method, st_raw, sr.assertions))
+            actual_endpoint = f"{base_sr}#{step_frag}"
         else:
-            eval_items.append((sr.method, sr.url, sr.assertions))
-            if st_path and st_path != "/" and st_path != sr.url:
-                eval_items.append((sr.method, st_path, sr.assertions))
-            if st_raw and "#" in st_raw and st_raw != sr.url and st_raw != st_path:
-                eval_items.append((sr.method, st_raw, sr.assertions))
+            actual_endpoint = sr.url
+        eval_items.append((sr.method, actual_endpoint, sr.assertions, st_assertions or None))
     if not eval_items:
         return out
 
     synced_scenarios, synced_assertions = await sync_assertion_evals_to_scenarios(
-        db, project_id, eval_items
+        db,
+        project_id,
+        eval_items,
     )
     out.synced_scenarios = synced_scenarios
     out.synced_assertions = synced_assertions
@@ -372,11 +376,12 @@ async def _sync_chain_out_to_scenarios(
 async def list_project_chain_runs(
     project_id: str,
     run_id: str | None = Query(default=None),
+    batch_id: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> list[ChainRunOut]:
     """List saved chain execution checkpoints for a project (newest first, max 50)."""
     await _get_project_or_404(db, project_id)
-    return list_checkpoints(project_id, run_id=run_id, limit=50)
+    return list_checkpoints(project_id, run_id=run_id, batch_id=batch_id, limit=50)
 
 
 @router.get("/projects/{project_id}/chain-runs/{chain_run_id}", response_model=ChainRunOut)
@@ -535,6 +540,175 @@ async def execute_project_chain(
     return out
 
 
+async def execute_project_chain_batch(
+    db: AsyncSession,
+    project_id: str,
+    body: ChainBatchExecuteRequest,
+) -> ChainBatchExecuteResponse:
+    """Execute all (or selected) correlation chains for a run sequentially under a single batch_id."""
+    await _get_project_or_404(db, project_id)
+    profile = await _load_profile_or_error(db, project_id, body.credential_id)
+    scope_domains = await _get_project_scope_domains(db, project_id)
+
+    run_obj: Run | None = None
+    if body.run_id:
+        run_obj = await db.get(Run, body.run_id)
+        if run_obj is None or run_obj.project_id != project_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Run '{body.run_id}' not found in project '{project_id}'",
+            )
+    else:
+        runs_res = await db.execute(
+            select(Run)
+            .where(Run.project_id == project_id, Run.status == "completed")
+            .order_by(Run.finished_at.desc(), Run.started_at.desc())
+            .limit(1)
+        )
+        run_obj = runs_res.scalar_one_or_none()
+        if run_obj is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No completed run found in project '{project_id}' for batch chain execution.",
+            )
+
+    corr_path = Path(run_obj.workspace_dir) / "hub" / "correlation.json"
+    if not corr_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Correlation report not found for run '{run_obj.id}'.",
+        )
+    corr_data = read_json(corr_path)
+    chains = [
+        ch for ch in (corr_data.get("chains") or []) if isinstance(ch, dict)
+    ] if isinstance(corr_data, dict) else []
+
+    batch_id = f"batch_{uuid.uuid4().hex[:10]}"
+    if not chains:
+        return ChainBatchExecuteResponse(
+            batch_id=batch_id,
+            project_id=project_id,
+            run_id=run_obj.id,
+            total_chains=0,
+            passed_chains=0,
+            failed_chains=0,
+            chain_runs=[],
+        )
+
+    if body.chain_indices is not None:
+        selected_indices: list[int] = []
+        seen_idx: set[int] = set()
+        for raw_idx in body.chain_indices:
+            idx = int(raw_idx)
+            if idx < 0 or idx >= len(chains):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"chain_index {idx} out of range (available: {len(chains)}).",
+                )
+            if idx not in seen_idx:
+                seen_idx.add(idx)
+                selected_indices.append(idx)
+        if len(selected_indices) > body.max_chains:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Requested {len(selected_indices)} chains which exceeds max_chains={body.max_chains}; "
+                    "increase max_chains or select fewer chain_indices."
+                ),
+            )
+    else:
+        if len(chains) > body.max_chains:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Run contains {len(chains)} chains which exceeds max_chains={body.max_chains}; "
+                    "increase max_chains or pass explicit chain_indices."
+                ),
+            )
+        selected_indices = list(range(len(chains)))
+
+    explicit_base_url = (body.base_url or "").strip()
+    base_url = explicit_base_url
+    if not base_url and isinstance(run_obj.config_snapshot, dict):
+        base_url = str(run_obj.config_snapshot.get("target_url") or "").strip()
+    if not base_url:
+        res_t = await db.execute(select(Target).where(Target.project_id == project_id).limit(1))
+        first_target = res_t.scalar_one_or_none()
+        if first_target and first_target.base_url:
+            base_url = first_target.base_url.strip()
+
+    project_assertions: list[dict[str, Any]] = []
+    if body.include_scenario_assertions:
+        project_assertions = await collect_project_scenario_assertions(db, project_id)
+
+    chain_runs: list[ChainRunOut] = []
+    for idx in selected_indices:
+        ch = chains[idx]
+        chain_name = str(ch.get("name") or f"Chain {idx}")
+        raw_steps = list(ch.get("steps") or [])
+        steps = [_apply_uses_to_step(st) for st in raw_steps if isinstance(st, dict)]
+        if not steps:
+            continue
+
+        if project_assertions:
+            for st in steps:
+                existing_ids = {a.id for a in st.assertions}
+                matched_sc = _match_step_scenario_assertions(
+                    st.method, st.path, st.raw_url, project_assertions
+                )
+                for ma in matched_sc:
+                    if ma.id not in existing_ids:
+                        st.assertions.append(ma)
+                        existing_ids.add(ma.id)
+
+        try:
+            out = await execute_chain(
+                project_id=project_id,
+                chain_name=chain_name,
+                steps=steps,
+                base_url=base_url,
+                rebase_raw_url=bool(explicit_base_url),
+                run_id=run_obj.id,
+                chain_index=idx,
+                batch_id=batch_id,
+                credential_id=body.credential_id,
+                profile=profile,
+                scope_domains=scope_domains,
+                initial_vars=body.initial_vars,
+                db_dsn_ref=body.db_dsn_ref,
+                stop_on_failure=body.stop_on_failure,
+                timeout_sec=body.timeout_sec,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if body.sync_scenarios:
+            out = await _sync_chain_out_to_scenarios(db, project_id, steps, out)
+        chain_runs.append(out)
+
+    passed_chains = sum(1 for r in chain_runs if r.status == "passed")
+    failed_chains = sum(1 for r in chain_runs if r.status != "passed")
+    return ChainBatchExecuteResponse(
+        batch_id=batch_id,
+        project_id=project_id,
+        run_id=run_obj.id,
+        total_chains=len(chain_runs),
+        passed_chains=passed_chains,
+        failed_chains=failed_chains,
+        chain_runs=chain_runs,
+    )
+
+
+@router.post("/projects/{project_id}/chains/execute-batch", response_model=ChainBatchExecuteResponse)
+async def execute_project_chains_batch(
+    project_id: str,
+    body: ChainBatchExecuteRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ChainBatchExecuteResponse:
+    """Execute all (or selected) correlation chains sequentially and tag checkpoints with a shared batch_id."""
+    return await execute_project_chain_batch(db, project_id, body)
+
+
 @router.post("/projects/{project_id}/chain-runs/{chain_run_id}/resume", response_model=ChainRunOut)
 async def resume_project_chain_run(
     project_id: str,
@@ -544,8 +718,8 @@ async def resume_project_chain_run(
 ) -> ChainRunOut:
     """Resume a failed or partial chain run from a checkpoint step without re-executing prior steps.
 
-    When ``sync_scenarios=True``, syncs the full effective ``ChainRunOut.step_results`` (both prior
-    non-skipped steps and newly resumed steps) to matching ``ScenarioModel`` assertions.
+    When ``sync_scenarios=True``, syncs ONLY the newly re-executed steps
+    (``out.step_results[start_index:]``) to matching ``ScenarioModel`` assertions.
     """
     await _get_project_or_404(db, project_id)
     try:
@@ -630,6 +804,7 @@ async def resume_project_chain_run(
             rebase_raw_url=eff_rebase,
             run_id=checkpoint.get("run_id"),
             chain_index=checkpoint.get("chain_index"),
+            batch_id=checkpoint.get("batch_id"),
             credential_id=eff_credential_id,
             profile=profile,
             scope_domains=scope_domains,
@@ -647,5 +822,11 @@ async def resume_project_chain_run(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if body.sync_scenarios:
-        out = await _sync_chain_out_to_scenarios(db, project_id, steps, out)
+        out = await _sync_chain_out_to_scenarios(
+            db,
+            project_id,
+            steps,
+            out,
+            step_results=out.step_results[start_index:],
+        )
     return out

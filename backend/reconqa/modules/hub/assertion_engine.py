@@ -948,8 +948,10 @@ def evaluate_assertion(
         )
 
     if op == "custom":
-        msg = "Custom manual rule noted" + (f": {note}" if note else "")
-        return _res(True, actual=None, message=msg, expected_out=raw_expected)
+        msg = "Manual verification required (custom rule not auto-passed)" + (
+            f": {note}" if note else ""
+        )
+        return _res(False, actual=None, message=msg, expected_out=raw_expected)
 
     if op == "status_code":
         exp = expected_rendered.strip().lower()
@@ -985,13 +987,28 @@ def evaluate_assertion(
         if actual_hdr is None:
             return _res(False, actual=None, message=f"Response header '{hdr_name}' not found.")
         passed = actual_hdr.strip() == expected_rendered.strip()
+        is_sensitive_hdr = hdr_name.lower() in {
+            "set-cookie",
+            "cookie",
+            "authorization",
+            "proxy-authorization",
+            "x-auth-token",
+            "x-access-token",
+            "x-api-key",
+            "x-token",
+            "token",
+            "accesstoken",
+        }
+        safe_actual = "[REDACTED]" if is_sensitive_hdr else actual_hdr
+        safe_expected = "[REDACTED]" if is_sensitive_hdr else expected_rendered
         return _res(
             passed,
-            actual=actual_hdr,
+            actual=safe_actual,
+            expected_out=safe_expected,
             message=(
-                f"Header '{hdr_name}' matched '{expected_rendered}'"
+                f"Header '{hdr_name}' matched '{safe_expected}'"
                 if passed
-                else f"Header '{hdr_name}' was '{actual_hdr}', expected '{expected_rendered}'"
+                else f"Header '{hdr_name}' was '{safe_actual}', expected '{safe_expected}'"
             ),
         )
 

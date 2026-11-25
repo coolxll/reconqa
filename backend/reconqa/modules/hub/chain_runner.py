@@ -251,6 +251,7 @@ def list_checkpoints(
     project_id: str,
     *,
     run_id: str | None = None,
+    batch_id: str | None = None,
     limit: int = 50,
 ) -> list[ChainRunOut]:
     base_dir = _chain_runs_dir()
@@ -265,6 +266,8 @@ def list_checkpoints(
             if raw.get("project_id") != project_id:
                 continue
             if run_id and raw.get("run_id") != run_id:
+                continue
+            if batch_id and raw.get("batch_id") != batch_id:
                 continue
             items.append(checkpoint_to_out(raw))
         except Exception:
@@ -379,6 +382,19 @@ def _build_step_url(
     return _strip_url_fragment(_render_path_str(raw_url or path, context_vars))
 
 
+def _build_step_virtual_path(step: ChainStepInput, secrets: list[str]) -> str:
+    """Persist sanitized step.path (preserving GraphQL #OperationName fragments)."""
+    raw_vp = (step.path or "").strip()
+    if (not raw_vp or raw_vp == "/") and step.raw_url:
+        parsed = urlparse(step.raw_url.strip())
+        vp_path = parsed.path or "/"
+        vp_frag = (parsed.fragment or "").strip()
+        raw_vp = f"{vp_path}#{vp_frag}" if vp_frag else vp_path
+    if not raw_vp:
+        return ""
+    return redact_secrets(sanitize_url_for_storage(raw_vp), secrets)
+
+
 async def execute_chain(
     *,
     project_id: str,
@@ -388,6 +404,7 @@ async def execute_chain(
     rebase_raw_url: bool = False,
     run_id: str | None = None,
     chain_index: int | None = None,
+    batch_id: str | None = None,
     credential_id: str | None = None,
     profile: AuthProfile | None = None,
     scope_domains: list[str] | None = None,
@@ -467,6 +484,7 @@ async def execute_chain(
                     name=st.name,
                     method=(st.method or "GET").strip().upper(),
                     url=redact_secrets(sanitize_url_for_storage(planned_url), secret_values),
+                    virtual_path=_build_step_virtual_path(st, secret_values),
                     status="skipped",
                 )
             )
@@ -548,6 +566,7 @@ async def execute_chain(
                     name=st.name,
                     method=method,
                     url=redact_secrets(sanitize_url_for_storage(resolved_url), secret_values),
+                    virtual_path=_build_step_virtual_path(st, secret_values),
                     status="failed",
                     status_code=0,
                     duration_ms=0.0,
@@ -681,6 +700,7 @@ async def execute_chain(
 
         safe_name = redact_secrets(sanitize_url_for_storage(st.name), secret_values) if st.name else ""
         safe_url = redact_secrets(sanitize_url_for_storage(resolved_url), secret_values)
+        safe_virtual_path = _build_step_virtual_path(st, secret_values)
         safe_preview = redact_secrets(body_text[:_MAX_BODY_PREVIEW_CHARS], secret_values)
         safe_error = redact_secrets(error_msg, secret_values) if error_msg else None
         safe_extracted = _mask_context_vars(extracted_vars, secret_values)
@@ -693,6 +713,7 @@ async def execute_chain(
                 name=safe_name,
                 method=method,
                 url=safe_url,
+                virtual_path=safe_virtual_path,
                 status=step_status,  # type: ignore[arg-type]
                 status_code=status_code,
                 duration_ms=duration_ms,
@@ -721,6 +742,7 @@ async def execute_chain(
         run_id=run_id,
         chain_name=chain_name,
         chain_index=chain_index,
+        batch_id=batch_id,
         credential_id=credential_id,
         db_dsn_ref=safe_dsn_ref,
         status=overall_status,  # type: ignore[arg-type]

@@ -855,15 +855,15 @@ async def test_mcp_tools_sync_scenarios_parity(
                     {
                         "project_id": pid,
                         "method": "GET",
-                        "url": f"{order_srv.base_url}/orders/{order_id}",
+                        "url": f"{order_srv.base_url}/orders/ORD-NONEXISTENT",
                         "credential_id": cred_id,
                         "assertions": [
                             {
                                 "id": "mcp-get",
                                 "title": "Get order verified",
-                                "jsonpath": "$.data.status",
-                                "operator": "equals",
-                                "expected": "CANCELLED",
+                                "jsonpath": "$.data.tags",
+                                "operator": "array_contains",
+                                "expected": "verified",
                             }
                         ],
                         "sync_scenarios": True,
@@ -1205,14 +1205,14 @@ async def test_replay_unreachable_with_explicit_assertions_preserves_db_status(
                 sc_unchanged = (await client.get(f"/api/v1/projects/{pid}/scenarios/{sc_id}")).json()
                 assert sc_unchanged["assertions"][0]["status"] == "passed"
 
-                # Control check: reachable HTTP 400 (resp.error is None) DOES evaluate and flip DB to "failed"
-                rp_400 = await client.post(
+                # Control check: reachable HTTP 401 on the SAME endpoint POST /orders (resp.error is None)
+                # DOES evaluate and flip DB to "failed"
+                rp_401 = await client.post(
                     f"/api/v1/projects/{pid}/replay",
                     json={
                         "method": "POST",
-                        "url": f"{order_srv.base_url}/orders/ORD-MISSING/pay",
-                        "body": {"pay_code": "INVALID-CODE"},
-                        "credential_id": cred_id,
+                        "url": f"{order_srv.base_url}/orders",
+                        "body": {"amount": 10},
                         "assertions": [
                             {
                                 "id": "exp-err-1",
@@ -1223,10 +1223,10 @@ async def test_replay_unreachable_with_explicit_assertions_preserves_db_status(
                         ],
                     },
                 )
-                assert rp_400.status_code == 200
-                fail_data = rp_400.json()
+                assert rp_401.status_code == 200
+                fail_data = rp_401.json()
                 assert fail_data["error"] is None
-                assert fail_data["status_code"] == 400
+                assert fail_data["status_code"] == 401
                 assert fail_data["assertion_results"][0]["passed"] is False
                 assert fail_data["synced_scenarios"] == 1
                 assert fail_data["synced_assertions"] == 1
@@ -1730,7 +1730,7 @@ async def test_correlation_driven_chain_with_sql_assertions_aiosqlite_and_replay
                 sql_eq_saved = next(a for a in sc_passed["assertions"] if a["id"] == "corr-sql-eq")
                 assert sql_eq_saved["db_dsn_ref"] == "ENV:RECONQA_TEST_CORR_SQL_DB"
 
-                # Negative SQL writeback via TryIt Replay
+                # Negative SQL writeback via TryIt Replay (same assertion definition, missing order -> 0 rows)
                 order_id = out["context_vars"]["order_id"]
                 rp_fail = await client.post(
                     f"/api/v1/projects/{pid}/replay",
@@ -1738,14 +1738,14 @@ async def test_correlation_driven_chain_with_sql_assertions_aiosqlite_and_replay
                         "method": "GET",
                         "url": f"{order_srv.base_url}/orders/{order_id}",
                         "credential_id": cred_id,
-                        "context_vars": {"order_id": order_id},
+                        "context_vars": {"order_id": "ORD-MISSING-999"},
                         "assertions": [
                             {
                                 "id": "corr-sql-eq",
                                 "title": "SQL DB status PAID",
                                 "jsonpath": "SELECT status FROM orders WHERE id = {{order_id}}",
                                 "operator": "sql_equals",
-                                "expected": "CANCELLED",
+                                "expected": "PAID",
                                 "db_dsn_ref": "ENV:RECONQA_TEST_CORR_SQL_DB",
                             }
                         ],
@@ -1986,3 +1986,197 @@ async def test_correlation_two_param_partial_bind_e2e_and_sync(
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+@pytest.mark.asyncio
+async def test_custom_assertions_stay_pending_and_tryit_endpoint_mismatch_does_not_overwrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1 #6 & #7: custom rules never auto-pass, and TryIt edits to URL/method/definition never corrupt other assertions."""
+    from reconqa.models.schemas import ScenarioAssertion
+    from reconqa.modules.hub.assertion_engine import evaluate_assertion
+
+    _setup_isolated_env(tmp_path, monkeypatch, "r1_p1_6_7_safety.db")
+    db_path = tmp_path / "orders_p1_6_7.db"
+    required_token = "Bearer p1-6-7-token"
+
+    # Unit check: evaluate_assertion never auto-passes custom rules
+    custom_ev = evaluate_assertion(
+        ScenarioAssertion(
+            id="cust-unit",
+            title="Manual audit check",
+            operator="custom",
+            note="Verify audit table manually",
+        ),
+        status_code=200,
+        duration_ms=10.0,
+        response_headers={},
+        body_json={"ok": True},
+        body_text='{"ok": true}',
+    )
+    assert custom_ev.passed is False
+    assert "Manual verification required" in custom_ev.message
+
+    from reconqa.server.app import create_app
+
+    with StatefulOrderServer(db_path=db_path, required_token=required_token) as order_srv:
+        app = create_app()
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                pid, cred_id = await _seed_project_and_cred(
+                    client, order_srv.base_url, required_token, name="Writeback Safety"
+                )
+
+                sc = (
+                    await client.post(
+                        f"/api/v1/projects/{pid}/scenarios",
+                        json={
+                            "slug": "writeback_safety",
+                            "name": "Writeback Safety",
+                            "priority": "P0",
+                            "assertions": [
+                                {
+                                    "id": "safe-create",
+                                    "title": "Order created PENDING",
+                                    "target_endpoint": "POST /orders",
+                                    "jsonpath": "$.data.status",
+                                    "operator": "equals",
+                                    "expected": "PENDING",
+                                    "status": "pending",
+                                },
+                                {
+                                    "id": "safe-custom",
+                                    "title": "Manual cross-resource invariant",
+                                    "target_endpoint": "POST /orders",
+                                    "jsonpath": "",
+                                    "operator": "custom",
+                                    "note": "Check accounting ledger manually",
+                                    "status": "pending",
+                                },
+                            ],
+                        },
+                    )
+                ).json()
+                sc_id = sc["id"]
+
+                # 1. TryIt Replay on POST /orders -> safe-create passes, safe-custom MUST stay pending!
+                rp_ok = await client.post(
+                    f"/api/v1/projects/{pid}/replay",
+                    json={
+                        "method": "POST",
+                        "url": f"{order_srv.base_url}/orders",
+                        "body": {"amount": 25},
+                        "credential_id": cred_id,
+                    },
+                )
+                assert rp_ok.status_code == 200
+                rp_ok_data = rp_ok.json()
+                assert rp_ok_data["synced_scenarios"] == 1
+                assert rp_ok_data["synced_assertions"] == 1
+
+                sc1 = (await client.get(f"/api/v1/projects/{pid}/scenarios/{sc_id}")).json()
+                assert {a["id"]: a["status"] for a in sc1["assertions"]} == {
+                    "safe-create": "passed",
+                    "safe-custom": "pending",
+                }
+
+                # Even direct sync_assertion_evals_to_scenarios with passed=True on custom MUST NOT mark it passed!
+                sf = db_mod.get_session_factory()
+                async with sf() as session:
+                    sc_n, as_n = await sync_assertion_evals_to_scenarios(
+                        session,
+                        pid,
+                        [
+                            (
+                                "POST",
+                                "/orders",
+                                [
+                                    AssertionEvalResult(
+                                        id="safe-custom",
+                                        title="Manual cross-resource invariant",
+                                        operator="custom",
+                                        passed=True,
+                                    )
+                                ],
+                            )
+                        ],
+                    )
+                    assert (sc_n, as_n) == (0, 0)
+
+                # 2. TryIt Replay with EDITED URL (different endpoint POST /orders/ORD-MISSING/pay)
+                #    passing safe-create's id -> MUST NOT overwrite safe-create ("passed" -> "failed")!
+                rp_wrong_url = await client.post(
+                    f"/api/v1/projects/{pid}/replay",
+                    json={
+                        "method": "POST",
+                        "url": f"{order_srv.base_url}/orders/ORD-MISSING/pay",
+                        "body": {"pay_code": "BAD"},
+                        "credential_id": cred_id,
+                        "assertions": [
+                            {
+                                "id": "safe-create",
+                                "title": "Order created PENDING",
+                                "jsonpath": "$.data.status",
+                                "operator": "equals",
+                                "expected": "PENDING",
+                            }
+                        ],
+                    },
+                )
+                assert rp_wrong_url.status_code == 200
+                assert rp_wrong_url.json()["assertion_results"][0]["passed"] is False
+                assert rp_wrong_url.json()["synced_assertions"] == 0
+
+                # 3. TryIt Replay with EDITED METHOD (GET /orders instead of POST /orders)
+                #    passing safe-create's id -> MUST NOT overwrite safe-create!
+                rp_wrong_method = await client.post(
+                    f"/api/v1/projects/{pid}/replay",
+                    json={
+                        "method": "GET",
+                        "url": f"{order_srv.base_url}/orders",
+                        "credential_id": cred_id,
+                        "assertions": [
+                            {
+                                "id": "safe-create",
+                                "title": "Order created PENDING",
+                                "jsonpath": "$.data.status",
+                                "operator": "equals",
+                                "expected": "PENDING",
+                            }
+                        ],
+                    },
+                )
+                assert rp_wrong_method.status_code == 200
+                assert rp_wrong_method.json()["assertion_results"][0]["passed"] is False
+                assert rp_wrong_method.json()["synced_assertions"] == 0
+
+                # 4. TryIt Replay on SAME endpoint POST /orders but EDITED expected value ("CANCELLED")
+                #    passing safe-create's id -> MUST NOT overwrite safe-create!
+                rp_wrong_def = await client.post(
+                    f"/api/v1/projects/{pid}/replay",
+                    json={
+                        "method": "POST",
+                        "url": f"{order_srv.base_url}/orders",
+                        "body": {"amount": 25},
+                        "credential_id": cred_id,
+                        "assertions": [
+                            {
+                                "id": "safe-create",
+                                "title": "Order created PENDING",
+                                "jsonpath": "$.data.status",
+                                "operator": "equals",
+                                "expected": "CANCELLED",
+                            }
+                        ],
+                    },
+                )
+                assert rp_wrong_def.status_code == 200
+                assert rp_wrong_def.json()["assertion_results"][0]["passed"] is False
+                assert rp_wrong_def.json()["synced_assertions"] == 0
+
+                sc_final = (await client.get(f"/api/v1/projects/{pid}/scenarios/{sc_id}")).json()
+                assert {a["id"]: a["status"] for a in sc_final["assertions"]} == {
+                    "safe-create": "passed",
+                    "safe-custom": "pending",
+                }

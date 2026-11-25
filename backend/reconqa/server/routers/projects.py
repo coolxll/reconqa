@@ -58,6 +58,7 @@ from reconqa.modules.hub.chain_runner import _render_body_value, _render_path_st
 from reconqa.modules.hub.inventory import build_project_inventory
 from reconqa.server.routers.explore import find_project_explores
 from reconqa.server.routers.scenarios import (
+    _split_path_and_fragment,
     collect_project_scenario_assertions,
     match_endpoint_scenario_assertions,
     sync_assertion_evals_to_scenarios,
@@ -1207,8 +1208,17 @@ async def replay_project_endpoint(
             for assertion in assertions_to_eval
         ]
         if body.sync_scenarios and resp.assertion_results:
+            exec_path = urlparse(wire_url).path or "/"
+            _, virt_frag = _split_path_and_fragment(virtual_url)
+            if virt_frag:
+                exec_path = f"{exec_path}#{virt_frag}"
             synced_sc, synced_as = await sync_assertion_evals_to_scenarios(
-                db, project_id, [(method, virtual_url, resp.assertion_results)]
+                db,
+                project_id,
+                [(method, virtual_url, resp.assertion_results)],
+                executed_method=method,
+                executed_path=exec_path,
+                evaluated_assertions=assertions_to_eval,
             )
             resp.synced_scenarios = synced_sc
             resp.synced_assertions = synced_as

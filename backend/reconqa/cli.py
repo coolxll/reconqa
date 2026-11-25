@@ -551,6 +551,32 @@ def _print_gate_table(result: Any) -> None:
         console.print(wh_table)
 
 
+def _validate_api_url(url: str) -> tuple[bool, str | None]:
+    raw = (url or "").strip()
+    if not raw:
+        return False, "API URL is empty"
+    if any(ch.isspace() or ord(ch) < 32 for ch in raw):
+        return False, "API URL contains whitespace or control characters"
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return False, "Malformed API URL"
+    if (parts.scheme or "").lower() not in {"http", "https"}:
+        return False, "API URL must use http:// or https://"
+    if not parts.netloc or not parts.hostname:
+        return False, "API URL is missing a valid host"
+    try:
+        port = parts.port
+    except ValueError:
+        return False, "Malformed API URL port"
+    if port is not None and not (1 <= port <= 65535):
+        return False, f"API URL port {port} is out of range (1..65535)"
+    host = parts.hostname.strip().lower().rstrip(".")
+    if host in {"169.254.169.254", "169.254.170.2", "metadata.google.internal", "metadata.goog"}:
+        return False, f"Blocked cloud metadata host '{host}'"
+    return True, None
+
+
 @app.command("gate")
 def cmd_gate(
     run_dir: Path | None = typer.Option(None, "--run-dir", help="Offline run workspace directory."),
@@ -573,6 +599,20 @@ def cmd_gate(
     ),
     baseline_run_id: str | None = typer.Option(
         None, "--baseline-run-id", help="Baseline run ID for coverage/security diff."
+    ),
+    batch_id: str | None = typer.Option(
+        None, "--batch-id", help="Evaluate chain checkpoints tagged with a specific batch ID."
+    ),
+    execute_chains: bool = typer.Option(
+        False,
+        "--execute-chains",
+        help="Execute correlation chains in a fresh batch before evaluating the gate (requires --project-id).",
+    ),
+    credential_id: str | None = typer.Option(
+        None, "--credential-id", help="Optional credential ID when --execute-chains is enabled."
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="Optional target base URL override when --execute-chains is enabled."
     ),
     config: Path | None = typer.Option(None, "--config", help="Path to reconqa.yaml."),
     max_p0_chain_failures: int | None = typer.Option(
@@ -627,15 +667,21 @@ def cmd_gate(
     json_output: bool = typer.Option(False, "--json", help="Print pure JSON result to stdout."),
 ) -> None:
     """Evaluate release Quality Gate rules and optionally send Feishu/DingTalk/Slack alerts."""
-    from reconqa.models.schemas import QualityGateRequest, QualityGateResult
+    from fastapi import HTTPException
+
+    from reconqa.models.schemas import (
+        ChainBatchExecuteRequest,
+        QualityGateRequest,
+        QualityGateResult,
+    )
     from reconqa.modules.hub.quality_gate import (
         GateLookupError,
         dispatch_webhooks,
         evaluate_project_quality_gate_db,
         evaluate_run_dir_gate,
         merge_gate_config,
-        validate_webhook_url,
     )
+    from reconqa.server.routers.chains import execute_project_chain_batch
 
     err_console = Console(stderr=True) if json_output else console
 
@@ -646,6 +692,9 @@ def cmd_gate(
         raise typer.Exit(code=2)
     if api_url is not None and project_id is None:
         err_console.print("[red]--api-url requires --project-id.[/red]")
+        raise typer.Exit(code=2)
+    if execute_chains and project_id is None:
+        err_console.print("[red]--execute-chains requires --project-id.[/red]")
         raise typer.Exit(code=2)
     if run_dir is not None and not run_dir.is_dir():
         err_console.print(f"[red]Run directory does not exist:[/red] {run_dir}")
@@ -664,6 +713,10 @@ def cmd_gate(
     req = QualityGateRequest(
         run_id=run_id,
         baseline_run_id=baseline_run_id,
+        batch_id=batch_id,
+        execute_chains=execute_chains,
+        credential_id=credential_id,
+        base_url=base_url,
         max_p0_chain_failures=max_p0_chain_failures,
         max_new_high_security=max_new_high_security,
         max_coverage_drop_pct=max_coverage_drop,
@@ -683,6 +736,7 @@ def cmd_gate(
             baseline_dir=baseline_dir,
             chain_runs_dir=chain_runs_dir,
             run_id=run_id,
+            batch_id=batch_id,
             gate_config=effective_cfg,
             project_name=proj_cfg.project_name,
         )
@@ -701,17 +755,12 @@ def cmd_gate(
             )
     elif api_url is not None:
         assert project_id is not None
-        ok_url, url_err = validate_webhook_url(api_url)
+        ok_url, url_err = _validate_api_url(api_url)
         if not ok_url:
             err_console.print(f"[red]Invalid --api-url:[/red] {url_err}")
             raise typer.Exit(code=2)
         clean_api = api_url.strip().rstrip("/")
-        try:
-            api_parts = urlsplit(clean_api)
-            _ = api_parts.port
-        except ValueError as exc:
-            err_console.print(f"[red]Invalid --api-url:[/red] {exc}")
-            raise typer.Exit(code=2) from exc
+        api_parts = urlsplit(clean_api)
         host = (api_parts.hostname or "").strip().lower().rstrip(".")
         is_loopback = host in {"127.0.0.1", "localhost", "::1"}
         http_timeout = max(30.0, effective_cfg.webhook_timeout_sec + 10.0)
@@ -719,6 +768,10 @@ def cmd_gate(
             QualityGateRequest(
                 run_id=run_id,
                 baseline_run_id=baseline_run_id,
+                batch_id=batch_id,
+                execute_chains=execute_chains,
+                credential_id=credential_id,
+                base_url=base_url,
                 max_p0_chain_failures=effective_cfg.max_p0_chain_failures,
                 max_new_high_security=effective_cfg.max_new_high_security,
                 max_coverage_drop_pct=effective_cfg.max_coverage_drop_pct,
@@ -743,14 +796,19 @@ def cmd_gate(
                     f"{clean_api}/api/v1/projects/{project_id}/gate",
                     json=api_req.model_dump(mode="json", exclude_none=True),
                 )
-        except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
-            err_console.print(f"[red]Failed to reach ReconQA API:[/red] {exc}")
-            raise typer.Exit(code=1) from exc
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+            err_console.print("[red]Failed to reach ReconQA API.[/red]")
+            raise typer.Exit(code=1) from None
 
         if resp.status_code >= 400:
-            err_console.print(
-                f"[red]API returned HTTP {resp.status_code}:[/red] {resp.text[:300]}"
-            )
+            err_detail = ""
+            try:
+                body_err = resp.json()
+                if isinstance(body_err, dict) and isinstance(body_err.get("detail"), str):
+                    err_detail = f": {body_err['detail'][:200]}"
+            except Exception:
+                err_detail = ""
+            err_console.print(f"[red]API returned HTTP {resp.status_code}{err_detail}[/red]")
             raise typer.Exit(code=1)
 
         result = QualityGateResult.model_validate(resp.json())
@@ -759,15 +817,44 @@ def cmd_gate(
 
         async def _eval_local_db() -> QualityGateResult:
             import reconqa.models.db as db_mod
+            from reconqa.models.tables import Run
 
             try:
                 await db_mod.init_db()
                 factory = db_mod.get_session_factory()
                 async with factory() as db:
+                    eff_req = req
+                    if eff_req.execute_chains:
+                        should_exec = True
+                        if eff_req.run_id is not None:
+                            cand_run = await db.get(Run, eff_req.run_id)
+                            if cand_run is None or cand_run.project_id != project_id:
+                                raise GateLookupError(
+                                    f"Run '{eff_req.run_id}' not found in project '{project_id}'"
+                                )
+                            if cand_run.status != "completed":
+                                should_exec = False
+                        if should_exec:
+                            batch_resp = await execute_project_chain_batch(
+                                db,
+                                project_id,
+                                ChainBatchExecuteRequest(
+                                    run_id=eff_req.run_id,
+                                    base_url=eff_req.base_url,
+                                    credential_id=eff_req.credential_id,
+                                    sync_scenarios=True,
+                                ),
+                            )
+                            eff_req = eff_req.model_copy(
+                                update={
+                                    "batch_id": batch_resp.batch_id,
+                                    "run_id": eff_req.run_id or batch_resp.run_id,
+                                }
+                            )
                     gate_res, merged_cfg = await evaluate_project_quality_gate_db(
                         db,
                         project_id,
-                        req,
+                        eff_req,
                         project_config=proj_cfg,
                     )
                 webhooks_db: dict[str, str | None] = {
@@ -792,8 +879,9 @@ def cmd_gate(
 
         try:
             result = _run_async(_eval_local_db())
-        except GateLookupError as exc:
-            err_console.print(f"[red]{exc}[/red]")
+        except (GateLookupError, HTTPException) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            err_console.print(f"[red]{detail}[/red]")
             raise typer.Exit(code=1) from exc
 
     if json_output:

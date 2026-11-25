@@ -60,10 +60,14 @@ def _make_chain_checkpoint(
     status: str = "passed",
     project_id: str = "proj-1",
     run_id: str | None = "run-1",
+    chain_index: int | None = None,
+    batch_id: str | None = None,
     step_method: str = "POST",
     step_url: str = "https://api.example.test/api/v1/orders",
+    virtual_path: str = "",
+    updated_at: str | None = None,
 ) -> None:
-    now = datetime.now(UTC).isoformat()
+    now = updated_at or datetime.now(UTC).isoformat()
     _write_json(
         path,
         {
@@ -71,6 +75,8 @@ def _make_chain_checkpoint(
             "project_id": project_id,
             "run_id": run_id,
             "chain_name": chain_name,
+            "chain_index": chain_index,
+            "batch_id": batch_id,
             "status": status,
             "total_steps": 1,
             "completed_steps": 1 if status == "passed" else 0,
@@ -82,6 +88,7 @@ def _make_chain_checkpoint(
                     "name": "Step 1",
                     "method": step_method,
                     "url": step_url,
+                    "virtual_path": virtual_path,
                     "status": "passed" if status == "passed" else "failed",
                     "status_code": 200 if status == "passed" else 500,
                     "assertions": [],
@@ -152,7 +159,7 @@ def _build_offline_run_dir(
 class _RecordingWebhookHandler(BaseHTTPRequestHandler):
     records: list[dict[str, Any]] = []
     status_to_return: int = 200
-    response_body: dict[str, Any] = {"ok": True}
+    response_body: dict[str, Any] = {"code": 0, "errcode": 0, "ok": True}
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length") or "0")
@@ -884,8 +891,13 @@ async def test_api_post_project_gate_pass_fail_and_404(
 
 
 @pytest.mark.asyncio
-async def test_webhook_payload_formats_and_local_http_delivery(tmp_path: Path) -> None:
+async def test_webhook_payload_formats_and_local_http_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Verify Feishu/DingTalk/Slack payload structures, secret masking, and local HTTP delivery."""
+    import socket
+
+    monkeypatch.setattr(settings, "allow_local_webhooks", True)
     run_dir = _build_offline_run_dir(tmp_path / "run_wh", coverage_pct=88.0, k6_p95_ms=110.0)
     gate_res = evaluate_run_dir_gate(
         run_dir,
@@ -910,16 +922,17 @@ async def test_webhook_payload_formats_and_local_http_delivery(tmp_path: Path) -
     assert slack_payload["blocks"][1]["type"] == "section"
     assert slack_payload["blocks"][1]["text"]["type"] == "mrkdwn"
 
-    # Secret masking checks
+    # Secret masking checks (strict scheme://host only)
     secret_feishu = "https://user:pass@open.feishu.cn/open-apis/bot/v2/hook/sec-token-12345"
     secret_ding = "https://oapi.dingtalk.com/robot/send?access_token=ding-secret-999&sign=hmac-abc"
     secret_slack = "https://hooks.slack.com/services/T00/B00/slack-secret-xyz"
-    for raw, secret in (
-        (secret_feishu, "sec-token-12345"),
-        (secret_ding, "ding-secret-999"),
-        (secret_slack, "slack-secret-xyz"),
+    for raw, secret, expected_masked in (
+        (secret_feishu, "sec-token-12345", "https://open.feishu.cn"),
+        (secret_ding, "ding-secret-999", "https://oapi.dingtalk.com"),
+        (secret_slack, "slack-secret-xyz", "https://hooks.slack.com"),
     ):
         masked = mask_webhook_url(raw)
+        assert masked == expected_masked
         assert secret not in masked
         assert "user:pass" not in masked
         assert "hmac-abc" not in masked
@@ -927,6 +940,7 @@ async def test_webhook_payload_formats_and_local_http_delivery(tmp_path: Path) -
     # Real local ThreadingHTTPServer webhook delivery via CLI & dispatch_webhooks
     _RecordingWebhookHandler.records = []
     _RecordingWebhookHandler.status_to_return = 200
+    _RecordingWebhookHandler.response_body = {"code": 0, "errcode": 0, "ok": True}
     server, port, _ = _start_local_server(_RecordingWebhookHandler)
     try:
         feishu_url = f"http://127.0.0.1:{port}/open-apis/bot/v2/hook/topsecret-feishu"
@@ -955,6 +969,7 @@ async def test_webhook_payload_formats_and_local_http_delivery(tmp_path: Path) -
         out_json = json.loads(res.stdout)
         assert len(out_json["webhook_results"]) == 3
         assert all(w["sent"] is True and w["status_code"] == 200 for w in out_json["webhook_results"])
+        assert all(w["url_masked"] == "http://127.0.0.1" for w in out_json["webhook_results"])
 
         raw_stdout = res.stdout
         assert "topsecret-feishu" not in raw_stdout
@@ -967,30 +982,58 @@ async def test_webhook_payload_formats_and_local_http_delivery(tmp_path: Path) -
         assert by_path["/robot/send?access_token=topsecret-ding"]["msgtype"] == "markdown"
         assert "blocks" in by_path["/services/T00/B00/topsecret-slack"]
 
-        # Verify httpx.MockTransport path as well
+        # Verify httpx.MockTransport path against trusted vendor host
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda host, port, *a, **kw: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ],
+        )
         seen_mock: list[str] = []
 
         def _mock_handler(request: httpx.Request) -> httpx.Response:
             seen_mock.append(str(request.url))
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, json={"code": 0, "msg": "success"})
 
         deliveries = await dispatch_webhooks(
-            {"feishu": "https://hooks.example.test/bot/secret-abc"},
+            {"feishu": "https://open.feishu.cn/open-apis/bot/v2/hook/secret-abc"},
             gate_res,
             transport=httpx.MockTransport(_mock_handler),
         )
         assert len(deliveries) == 1
         assert deliveries[0].sent is True
+        assert deliveries[0].url_masked == "https://open.feishu.cn"
         assert "secret-abc" not in deliveries[0].url_masked
-        assert seen_mock == ["https://hooks.example.test/bot/secret-abc"]
+        assert seen_mock == ["https://open.feishu.cn/open-apis/bot/v2/hook/secret-abc"]
     finally:
         server.shutdown()
         server.server_close()
 
 
 @pytest.mark.asyncio
-async def test_webhook_validation_ssrf_and_failure_resilience(tmp_path: Path) -> None:
-    """Verify SSRF/scheme URL validation and graceful failure on HTTP 500 / 302 / network errors."""
+async def test_webhook_validation_ssrf_and_failure_resilience(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify SSRF/scheme/allowlist URL validation and graceful failure on HTTP 500 / 302 / network errors."""
+    import socket
+
+    monkeypatch.setattr(settings, "allow_local_webhooks", False)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *a, **kw: [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                ("127.0.0.1" if host == "localhost" else "93.184.216.34", int(port or 443)),
+            )
+        ],
+    )
+
+    # Default allow_local_webhooks=False rejects loopback, private, CGNAT, metadata, non-https, untrusted hosts
     for bad_url in (
         "",
         "not-a-url",
@@ -1001,24 +1044,64 @@ async def test_webhook_validation_ssrf_and_failure_resilience(tmp_path: Path) ->
         "http://169.254.170.2/v2/credentials",
         "http://metadata.google.internal/computeMetadata/v1/",
         "http://[::ffff:169.254.169.254]/latest/meta-data/",
+        "http://127.0.0.1:8080/hook",
+        "http://localhost:9000/hook",
+        "http://[::1]:8080/hook",
+        "https://10.0.0.5/hook",
+        "https://172.16.0.10/hook",
+        "https://192.168.1.50/hook",
+        "https://100.64.0.10/hook",
+        "https://[fc00::1]/hook",
+        "https://[fe80::1]/hook",
+        "http://open.feishu.cn/open-apis/bot/v2/hook/token",
+        "https://evil.example.test/open-apis/bot/v2/hook/token",
     ):
         ok, err = validate_webhook_url(bad_url)
         assert ok is False, f"Expected rejection for {bad_url}"
         assert err
 
-    for good_url in (
-        "http://127.0.0.1:8080/hook",
-        "http://localhost:9000/hook",
-        "https://open.feishu.cn/open-apis/bot/v2/hook/token",
+    # Trusted HTTPS vendor hosts pass by default
+    for good_url, prov in (
+        ("https://open.feishu.cn/open-apis/bot/v2/hook/token", "feishu"),
+        ("https://open.larksuite.com/open-apis/bot/v2/hook/token", "feishu"),
+        ("https://oapi.dingtalk.com/robot/send?access_token=abc", "dingtalk"),
+        ("https://hooks.slack.com/services/T00/B00/xyz", "slack"),
+        ("https://hooks.slack-gov.com/services/T00/B00/xyz", "slack"),
     ):
-        ok, err = validate_webhook_url(good_url)
+        ok, err = validate_webhook_url(good_url, provider=prov)
         assert ok is True, f"Unexpected rejection for {good_url}: {err}"
 
+    # Provider host mismatch rejected
+    ok_mismatch, _ = validate_webhook_url(
+        "https://hooks.slack.com/services/T00/B00/xyz", provider="feishu"
+    )
+    assert ok_mismatch is False
+
+    # With allow_local_webhooks=True, loopback over http/https is allowed while private/metadata still blocked
+    monkeypatch.setattr(settings, "allow_local_webhooks", True)
+    for local_ok in (
+        "http://127.0.0.1:8080/hook",
+        "https://127.0.0.1:8443/hook",
+        "http://localhost:9000/hook",
+        "http://[::1]:8080/hook",
+    ):
+        ok, err = validate_webhook_url(local_ok)
+        assert ok is True, f"Unexpected rejection for local {local_ok}: {err}"
+    for still_blocked in (
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.1/hook",
+        "https://192.168.1.1/hook",
+        "https://100.64.0.1/hook",
+    ):
+        ok, _ = validate_webhook_url(still_blocked)
+        assert ok is False, f"Expected {still_blocked} to remain blocked even with allow_local_webhooks=True"
+
+    monkeypatch.setattr(settings, "allow_local_webhooks", False)
     run_dir = _build_offline_run_dir(tmp_path / "run_res", coverage_pct=90.0, k6_p95_ms=80.0)
     gate_res = evaluate_run_dir_gate(run_dir)
     assert gate_res.passed is True
 
-    # Invalid URL + HTTP 500 + HTTP 302 redirect blocked + ConnectError never crash or flip pass
+    # Invalid URL + HTTP 500 + HTTP 302 redirect blocked + Timeout never crash or flip pass
     res_invalid = await dispatch_webhooks(
         {
             "feishu": "file:///etc/passwd",
@@ -1030,7 +1113,7 @@ async def test_webhook_validation_ssrf_and_failure_resilience(tmp_path: Path) ->
     assert all(r.sent is False and r.error for r in res_invalid)
 
     res_500 = await dispatch_webhooks(
-        {"dingtalk": "https://hooks.example.test/robot/send?access_token=abc"},
+        {"dingtalk": "https://oapi.dingtalk.com/robot/send?access_token=abc"},
         gate_res,
         transport=httpx.MockTransport(
             lambda req: httpx.Response(500, text="Internal Server Error")
@@ -1038,9 +1121,10 @@ async def test_webhook_validation_ssrf_and_failure_resilience(tmp_path: Path) ->
     )
     assert res_500[0].sent is False
     assert res_500[0].status_code == 500
+    assert res_500[0].error == "HTTP 500 webhook rejected"
 
     res_302 = await dispatch_webhooks(
-        {"slack": "https://hooks.example.test/services/T/B/sec"},
+        {"slack": "https://hooks.slack.com/services/T/B/sec"},
         gate_res,
         transport=httpx.MockTransport(
             lambda req: httpx.Response(302, headers={"Location": "http://169.254.169.254/"})
@@ -1048,22 +1132,27 @@ async def test_webhook_validation_ssrf_and_failure_resilience(tmp_path: Path) ->
     )
     assert res_302[0].sent is False
     assert res_302[0].status_code == 302
+    assert "redirect" in (res_302[0].error or "").lower()
 
     def _raise_timeout(req: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("timed out", request=req)
+        raise httpx.ReadTimeout("timed out for https://open.feishu.cn/hook/SECRET-LEAK", request=req)
 
     res_timeout = await dispatch_webhooks(
-        {"feishu": "https://hooks.example.test/open-apis/bot/v2/hook/sec"},
+        {"feishu": "https://open.feishu.cn/open-apis/bot/v2/hook/SECRET-LEAK"},
         gate_res,
         transport=httpx.MockTransport(_raise_timeout),
     )
     assert res_timeout[0].sent is False
     assert res_timeout[0].status_code is None
-    assert "timed out" in (res_timeout[0].error or "")
+    assert res_timeout[0].error == "Webhook request timed out"
+    assert "SECRET-LEAK" not in (res_timeout[0].error or "")
 
 
-def test_quality_gate_edge_cases_and_notify_on_pass_flag(tmp_path: Path) -> None:
+def test_quality_gate_edge_cases_and_notify_on_pass_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Verify unmapped P0 chains, no-double-count, openapi fallback, k6 raw p(95), and --no-notify-on-pass."""
+    monkeypatch.setattr(settings, "allow_local_webhooks", True)
     # 1. OpenAPI fallback + raw k6 http_req_duration.values["p(95)"] + unmapped failed chain
     run_edge = tmp_path / "edge_run"
     _write_json(
@@ -1202,22 +1291,36 @@ async def test_regression_malformed_port_ssrf_and_short_token_masking(
         assert ok is False, f"Expected SSRF rejection for {non_canonical_url}"
         assert err
 
-    # Canonical IPv6 loopback still allowed
+    # Canonical IPv6 loopback rejected by default, allowed when allow_local_webhooks=True
+    monkeypatch.setattr(settings, "allow_local_webhooks", False)
+    ok_v6_default, _ = validate_webhook_url("http://[::1]:8080/hook")
+    assert ok_v6_default is False
+    monkeypatch.setattr(settings, "allow_local_webhooks", True)
     ok_v6, err_v6 = validate_webhook_url("http://[::1]:8080/hook")
     assert ok_v6 is True, err_v6
+    monkeypatch.setattr(settings, "allow_local_webhooks", False)
 
-    # 6b. Short single-segment webhook path tokens are redacted
+    # 6b. Webhook URL is strictly masked to scheme://host only
     masked_short = mask_webhook_url("https://hooks.example.com/tok12345")
     assert "tok12345" not in masked_short
-    assert masked_short == "https://hooks.example.com/***"
+    assert masked_short == "https://hooks.example.com"
     masked_bad_port = mask_webhook_url("https://hooks.example.com:abc/secret-token")
     assert "secret-token" not in masked_bad_port
 
     # 1b. dispatch_webhooks, CLI --json, CLI --api-url, and POST /gate never crash on malformed port
+    import socket
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *a, **kw: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", int(port or 443)))
+        ],
+    )
     run_dir = _build_offline_run_dir(tmp_path / "run_port", coverage_pct=90.0, k6_p95_ms=80.0)
     gate_res = evaluate_run_dir_gate(run_dir)
     deliveries = await dispatch_webhooks(
-        {"slack": "https://hooks.example.com:abc/secret-hook"},
+        {"slack": "https://hooks.slack.com:abc/secret-hook"},
         gate_res,
     )
     assert len(deliveries) == 1
@@ -1225,18 +1328,19 @@ async def test_regression_malformed_port_ssrf_and_short_token_masking(
     assert deliveries[0].error
     assert "secret-hook" not in deliveries[0].url_masked
 
-    # Transport raising InvalidURL/ValueError is also caught cleanly
+    # Transport raising InvalidURL/ValueError is also caught cleanly without leaking raw message
     def _raise_invalid_url(req: httpx.Request) -> httpx.Response:
-        raise httpx.InvalidURL("Invalid port: 'abc'")
+        raise httpx.InvalidURL("Invalid port for https://hooks.slack.com/services/T/B/SECRET")
 
     deliveries_tx = await dispatch_webhooks(
-        {"slack": "https://hooks.example.com/services/T/B/sec"},
+        {"slack": "https://hooks.slack.com/services/T/B/SECRET"},
         gate_res,
         transport=httpx.MockTransport(_raise_invalid_url),
     )
     assert len(deliveries_tx) == 1
     assert deliveries_tx[0].sent is False
-    assert "Invalid port" in (deliveries_tx[0].error or "")
+    assert deliveries_tx[0].error == "Invalid webhook URL"
+    assert "SECRET" not in (deliveries_tx[0].error or "")
 
     runner = CliRunner()
     r_cli_bad_wh = runner.invoke(
@@ -1325,24 +1429,26 @@ def test_regression_graphql_p0_hints_and_k6_skipped_fallback(tmp_path: Path) -> 
         status="failed",
         step_method="POST",
         step_url="http://127.0.0.1:8080/graphql",
+        virtual_path="/graphql#GetOrderList",
     )
     res_gql_p1 = evaluate_run_dir_gate(run_gql_p1)
     assert res_gql_p1.passed is True
     assert res_gql_p1.metrics.p0_chain_failures == 0
 
-    # 3b. Different #fragment in step.url must NOT match POST /graphql#GetOrderList
+    # 3b. Different #fragment in virtual_path must NOT match POST /graphql#GetOrderList
     _make_chain_checkpoint(
         run_gql_p1 / "chain_runs" / "cp_gql_p1.json",
         chain_run_id="cp_gql_p1",
         chain_name="gql_other_chain",
         status="failed",
         step_method="POST",
-        step_url="http://127.0.0.1:8080/graphql#OtherOp",
+        step_url="http://127.0.0.1:8080/graphql",
+        virtual_path="/graphql#OtherOp",
     )
     res_gql_diff_frag = evaluate_run_dir_gate(run_gql_p1)
     assert res_gql_diff_frag.metrics.p0_chain_failures == 1  # unmapped conservatively
 
-    # 3c. P0 GraphQL scenario with stripped step.url avoids double-counting (1, not 2)
+    # 3c. P0 GraphQL scenario with virtual_path avoids double-counting (1, not 2)
     run_gql_p0 = tmp_path / "gql_p0"
     _build_offline_run_dir(run_gql_p0, coverage_pct=85.0, k6_p95_ms=100.0)
     _write_json(
@@ -1372,6 +1478,7 @@ def test_regression_graphql_p0_hints_and_k6_skipped_fallback(tmp_path: Path) -> 
         status="failed",
         step_method="POST",
         step_url="http://127.0.0.1:8080/graphql",
+        virtual_path="/graphql#DeleteOrder",
     )
     res_gql_p0 = evaluate_run_dir_gate(run_gql_p0)
     assert res_gql_p0.passed is False
@@ -1518,3 +1625,525 @@ async def test_regression_db_findings_fallback_when_findings_total_nonzero(
     assert payload["passed"] is False
     assert payload["metrics"]["high_security_count"] == 1
     assert payload["metrics"]["new_high_security_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_p1_webhook_business_codes_secret_free_errors_and_dns_ssrf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex Round 1 P1 #1 & #2: vendor business codes, secret-free errors, DNS SSRF blocking."""
+    import socket
+
+    run_dir = _build_offline_run_dir(tmp_path / "run_p1_wh", coverage_pct=90.0, k6_p95_ms=50.0)
+    gate_res = evaluate_run_dir_gate(run_dir)
+
+    # 1. DNS resolving trusted vendor host to private/CGNAT/metadata IP MUST be rejected
+    for bad_resolved_ip in ("10.0.0.5", "172.16.1.2", "192.168.0.10", "100.64.0.10", "127.0.0.1", "169.254.169.254"):
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda host, port, *a, _ip=bad_resolved_ip, **kw: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (_ip, 443))
+            ],
+        )
+        ok, err = validate_webhook_url(
+            "https://open.feishu.cn/open-apis/bot/v2/hook/tok",
+            provider="feishu",
+        )
+        assert ok is False, f"Expected DNS SSRF rejection for {bad_resolved_ip}"
+        assert err
+
+    # Restore safe public DNS resolution for vendor mock tests
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *a, **kw: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+
+    # 2. Feishu HTTP 200 with {"code": 19024} -> sent=False
+    feishu_fail = await dispatch_webhooks(
+        {"feishu": "https://open.feishu.cn/open-apis/bot/v2/hook/FEISHU-SECRET-TOKEN"},
+        gate_res,
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"code": 19024, "msg": "Key Words Not Match"})
+        ),
+    )
+    assert feishu_fail[0].sent is False
+    assert feishu_fail[0].status_code == 200
+    assert feishu_fail[0].error == "Feishu webhook rejected payload (code=19024)"
+    assert feishu_fail[0].url_masked == "https://open.feishu.cn"
+
+    # Feishu legacy StatusCode == 0 -> sent=True
+    feishu_ok = await dispatch_webhooks(
+        {"feishu": "https://open.larksuite.com/open-apis/bot/v2/hook/FEISHU-SECRET-TOKEN"},
+        gate_res,
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"StatusCode": 0, "StatusMessage": "success"})
+        ),
+    )
+    assert feishu_ok[0].sent is True
+    assert feishu_ok[0].url_masked == "https://open.larksuite.com"
+
+    # 3. DingTalk HTTP 200 with {"errcode": 310000} -> sent=False
+    ding_fail = await dispatch_webhooks(
+        {"dingtalk": "https://oapi.dingtalk.com/robot/send?access_token=DING-SECRET-TOKEN"},
+        gate_res,
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"errcode": 310000, "errmsg": "keywords not in content"})
+        ),
+    )
+    assert ding_fail[0].sent is False
+    assert ding_fail[0].status_code == 200
+    assert ding_fail[0].error == "DingTalk webhook rejected payload (errcode=310000)"
+    assert ding_fail[0].url_masked == "https://oapi.dingtalk.com"
+
+    # 4. Slack HTTP 200 text "ok" -> sent=True; non-"ok" -> sent=False
+    slack_ok = await dispatch_webhooks(
+        {"slack": "https://hooks.slack.com/services/T00/B00/SLACK-SECRET"},
+        gate_res,
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text="ok")),
+    )
+    assert slack_ok[0].sent is True
+    slack_bad = await dispatch_webhooks(
+        {"slack": "https://hooks.slack.com/services/T00/B00/SLACK-SECRET"},
+        gate_res,
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, text="invalid_payload")),
+    )
+    assert slack_bad[0].sent is False
+
+    # 5. Non-2xx echoing secret token in body MUST NEVER leak in API/CLI output
+    secret_token = "ULTRA-SECRET-WEBHOOK-TOKEN-987654"
+    _RecordingWebhookHandler.records = []
+    _RecordingWebhookHandler.status_to_return = 403
+    _RecordingWebhookHandler.response_body = {
+        "error": f"Forbidden for webhook token {secret_token}"
+    }
+    monkeypatch.setattr(settings, "allow_local_webhooks", True)
+    server, port, _ = _start_local_server(_RecordingWebhookHandler)
+    try:
+        wh_url = f"http://127.0.0.1:{port}/open-apis/bot/v2/hook/{secret_token}"
+        runner = CliRunner()
+        cli_res = runner.invoke(
+            cli_app,
+            [
+                "gate",
+                "--run-dir",
+                str(run_dir),
+                "--feishu-webhook",
+                wh_url,
+                "--json",
+            ],
+        )
+        assert cli_res.exit_code == 0, cli_res.output
+        assert secret_token not in cli_res.stdout
+        assert secret_token not in cli_res.output
+        data = json.loads(cli_res.stdout)
+        assert data["webhook_results"][0]["sent"] is False
+        assert data["webhook_results"][0]["status_code"] == 403
+        assert data["webhook_results"][0]["error"] == "HTTP 403 webhook rejected"
+        assert data["webhook_results"][0]["url_masked"] == "http://127.0.0.1"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.asyncio
+async def test_p1_gate_evidence_latest_chain_baseline_target_and_graphql_strict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex Round 1 P1 #9 & #10: incomplete candidate, missing P95, latest-per-chain, same-target earlier baseline, strict GraphQL."""
+    # 1. Missing P95 evidence when max_p95_ms is configured -> MUST FAIL (not skip/pass)
+    no_p95_dir = _build_offline_run_dir(
+        tmp_path / "no_p95", coverage_pct=85.0, k6_p95_ms=None, har_p95_total_ms=None
+    )
+    res_no_p95 = evaluate_run_dir_gate(
+        no_p95_dir,
+        gate_config=GateConfig(max_p95_ms=200.0),
+    )
+    assert res_no_p95.passed is False
+    p95_rule = next(r for r in res_no_p95.rules if r.rule == "p95_latency_ms")
+    assert p95_rule.passed is False
+    assert p95_rule.skipped is False
+    assert "Missing P95 latency evidence for configured max_p95_ms threshold" in p95_rule.message
+
+    # 2. Fixing & re-running a failed chain passes gate (latest checkpoint per (chain_index, chain_name))
+    rerun_dir = _build_offline_run_dir(tmp_path / "rerun_chain", coverage_pct=90.0, k6_p95_ms=100.0)
+    _write_json(
+        rerun_dir / "hub" / "scenarios.json",
+        [{"slug": "checkout-p0", "name": "Checkout P0", "priority": "P0", "assertions": []}],
+    )
+    t_old = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    t_new = datetime.now(UTC).isoformat()
+    _make_chain_checkpoint(
+        rerun_dir / "chain_runs" / "cp_1_fail.json",
+        chain_run_id="cp_1_fail",
+        chain_name="checkout-p0",
+        chain_index=0,
+        status="failed",
+        updated_at=t_old,
+    )
+    _make_chain_checkpoint(
+        rerun_dir / "chain_runs" / "cp_2_pass.json",
+        chain_run_id="cp_2_pass",
+        chain_name="checkout-p0",
+        chain_index=0,
+        status="passed",
+        updated_at=t_new,
+    )
+    res_rerun = evaluate_run_dir_gate(rerun_dir)
+    assert res_rerun.passed is True
+    assert res_rerun.metrics.p0_chain_failures == 0
+    assert res_rerun.metrics.total_chain_runs == 1
+
+    # 3. Strict GraphQL matching: /graphql#OpA failure (P1) MUST NOT fail P0 /graphql#OpB
+    gql_dir = _build_offline_run_dir(tmp_path / "gql_strict", coverage_pct=90.0, k6_p95_ms=80.0)
+    _write_json(
+        gql_dir / "hub" / "scenarios.json",
+        [
+            {
+                "slug": "gql-op-a",
+                "name": "GQL OpA",
+                "priority": "P1",
+                "assertions": [
+                    {
+                        "id": "a-op-a",
+                        "title": "OpA 200",
+                        "target_endpoint": "POST /graphql#OpA",
+                        "operator": "status_code",
+                        "expected": "200",
+                        "status": "passed",
+                    }
+                ],
+            },
+            {
+                "slug": "gql-op-b",
+                "name": "GQL OpB",
+                "priority": "P0",
+                "assertions": [
+                    {
+                        "id": "a-op-b",
+                        "title": "OpB 200",
+                        "target_endpoint": "POST /graphql#OpB",
+                        "operator": "status_code",
+                        "expected": "200",
+                        "status": "passed",
+                    }
+                ],
+            },
+        ],
+    )
+    _make_chain_checkpoint(
+        gql_dir / "chain_runs" / "cp_opa_fail.json",
+        chain_run_id="cp_opa_fail",
+        chain_name="graphql_chain_opa",
+        status="failed",
+        step_method="POST",
+        step_url="https://api.example.test/graphql",
+        virtual_path="/graphql#OpA",
+    )
+    res_gql = evaluate_run_dir_gate(gql_dir)
+    assert res_gql.passed is True
+    assert res_gql.metrics.p0_chain_failures == 0
+
+    # 4. DB Candidate incomplete run & Auto-baseline same-target + strictly-earlier checks
+    ws_dir = _setup_isolated_env(tmp_path, monkeypatch, "p1_evidence.db")
+    fastapi_app = create_app()
+    async with fastapi_app.router.lifespan_context(fastapi_app):
+        factory = db_mod.get_session_factory()
+        t1 = datetime.now(UTC) - timedelta(hours=3)
+        t2 = datetime.now(UTC) - timedelta(hours=2)
+        t3 = datetime.now(UTC) - timedelta(hours=1)
+
+        ws_t1 = _build_offline_run_dir(ws_dir / "ws_t1", coverage_pct=90.0, k6_p95_ms=100.0)
+        ws_t2_other = _build_offline_run_dir(ws_dir / "ws_t2_other", coverage_pct=95.0, k6_p95_ms=100.0)
+        ws_t3 = _build_offline_run_dir(ws_dir / "ws_t3", coverage_pct=88.0, k6_p95_ms=100.0)
+
+        from reconqa.models.tables import Target
+
+        async with factory() as db:
+            db.add(Project(id="p-ev", name="Evidence Project", slug="evidence-project"))
+            db.add(Target(id="tgt-a", project_id="p-ev", root_domain="a.test", base_url="https://a.test"))
+            db.add(Target(id="tgt-b", project_id="p-ev", root_domain="b.test", base_url="https://b.test"))
+            db.add(
+                Run(
+                    id="r-a-old",
+                    project_id="p-ev",
+                    target_id="tgt-a",
+                    status="completed",
+                    workspace_dir=str(ws_t1),
+                    summary_metrics={"coverage_pct": 90.0},
+                    started_at=t1,
+                    finished_at=t1,
+                )
+            )
+            db.add(
+                Run(
+                    id="r-b-mid",
+                    project_id="p-ev",
+                    target_id="tgt-b",
+                    status="completed",
+                    workspace_dir=str(ws_t2_other),
+                    summary_metrics={"coverage_pct": 95.0},
+                    started_at=t2,
+                    finished_at=t2,
+                )
+            )
+            db.add(
+                Run(
+                    id="r-a-new",
+                    project_id="p-ev",
+                    target_id="tgt-a",
+                    status="completed",
+                    workspace_dir=str(ws_t3),
+                    summary_metrics={"coverage_pct": 88.0},
+                    started_at=t3,
+                    finished_at=t3,
+                )
+            )
+            db.add(
+                Run(
+                    id="r-a-running",
+                    project_id="p-ev",
+                    target_id="tgt-a",
+                    status="running",
+                    workspace_dir=str(ws_t3),
+                    summary_metrics={},
+                    started_at=datetime.now(UTC),
+                )
+            )
+            await db.commit()
+
+        transport = httpx.ASGITransport(app=fastapi_app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            # 4a. Explicit incomplete run -> fails clearly with "Candidate run is not completed"
+            r_inc = await client.post(
+                "/api/v1/projects/p-ev/gate",
+                json={"run_id": "r-a-running"},
+            )
+            assert r_inc.status_code == 200
+            d_inc = r_inc.json()
+            assert d_inc["passed"] is False
+            assert "Candidate run is not completed" in d_inc["summary"]
+
+            # 4b. Evaluating r-a-new auto-selects r-a-old (same target_id, ignoring r-b-mid!)
+            r_same_tgt = await client.post(
+                "/api/v1/projects/p-ev/gate",
+                json={"run_id": "r-a-new"},
+            )
+            assert r_same_tgt.status_code == 200
+            d_same = r_same_tgt.json()
+            assert d_same["passed"] is True
+            assert d_same["baseline_run_id"] == "r-a-old"
+            assert d_same["metrics"]["coverage_drop_pct"] == 2.0
+
+            # 4c. Evaluating earliest run r-a-old has NO earlier same-target baseline (NEVER compares to newer r-a-new!)
+            r_earliest = await client.post(
+                "/api/v1/projects/p-ev/gate",
+                json={"run_id": "r-a-old"},
+            )
+            assert r_earliest.status_code == 200
+            d_early = r_earliest.json()
+            assert d_early["baseline_run_id"] is None
+            assert d_early["metrics"]["baseline_available"] is False
+
+        if db_mod._engine is not None:
+            await db_mod._engine.dispose()
+        db_mod._engine = None
+        db_mod._session_factory = None
+
+
+@pytest.mark.asyncio
+async def test_p1_batch_chain_execution_and_gate_execute_chains_e2e(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex Round 1 P1 #11: POST /chains/execute-batch + POST /gate execute_chains & batch_id + CLI."""
+    fail_chain_1 = {"flag": False}
+
+    class _BatchApiHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/api/health":
+                payload = json.dumps({"status": "ok"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if self.path == "/api/orders/summary":
+                code = 500 if fail_chain_1["flag"] else 200
+                payload = json.dumps({"code": 0 if code == 200 else 500}).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server, port, _ = _start_local_server(_BatchApiHandler)
+    srv_url = f"http://127.0.0.1:{port}"
+    try:
+        ws_dir = _setup_isolated_env(tmp_path, monkeypatch, "p1_batch_gate.db")
+        fastapi_app = create_app()
+        async with fastapi_app.router.lifespan_context(fastapi_app):
+            factory = db_mod.get_session_factory()
+            run_ws = _build_offline_run_dir(ws_dir / "run_batch_1", coverage_pct=90.0, k6_p95_ms=80.0)
+            _write_json(
+                run_ws / "hub" / "correlation.json",
+                {
+                    "variables": [],
+                    "chains": [
+                        {
+                            "name": "chain_health",
+                            "scenario": "health-p0",
+                            "steps": [
+                                {
+                                    "step": 1,
+                                    "scenario": "health-p0",
+                                    "method": "GET",
+                                    "path": "/api/health",
+                                    "raw_url": f"{srv_url}/api/health",
+                                    "expected_status": 200,
+                                }
+                            ],
+                        },
+                        {
+                            "name": "chain_orders",
+                            "scenario": "orders-p0",
+                            "steps": [
+                                {
+                                    "step": 1,
+                                    "scenario": "orders-p0",
+                                    "method": "GET",
+                                    "path": "/api/orders/summary",
+                                    "raw_url": f"{srv_url}/api/orders/summary",
+                                    "expected_status": 200,
+                                }
+                            ],
+                        },
+                    ],
+                },
+            )
+            now = datetime.now(UTC)
+            async with factory() as db:
+                db.add(Project(id="p-batch", name="Batch Gate Project", slug="batch-gate-project"))
+                db.add(
+                    Run(
+                        id="r-batch-1",
+                        project_id="p-batch",
+                        status="completed",
+                        workspace_dir=str(run_ws),
+                        config_snapshot={"target_url": srv_url},
+                        summary_metrics={"coverage_pct": 90.0},
+                        started_at=now,
+                        finished_at=now,
+                    )
+                )
+                db.add(
+                    ScenarioModel(
+                        id="sc-b-1",
+                        project_id="p-batch",
+                        slug="health-p0",
+                        name="Health P0",
+                        priority="P0",
+                        status="active",
+                        assertions_json="[]",
+                    )
+                )
+                db.add(
+                    ScenarioModel(
+                        id="sc-b-2",
+                        project_id="p-batch",
+                        slug="orders-p0",
+                        name="Orders P0",
+                        priority="P0",
+                        status="active",
+                        assertions_json="[]",
+                    )
+                )
+                await db.commit()
+
+            # Pre-existing stale failed checkpoint from an earlier run
+            _make_chain_checkpoint(
+                ws_dir / "chain_runs" / "cp_stale_fail.json",
+                chain_run_id="cp_stale_fail",
+                chain_name="stale_legacy_chain",
+                project_id="p-batch",
+                run_id="r-batch-1",
+                status="failed",
+                batch_id="batch_old0000000",
+            )
+
+            transport = httpx.ASGITransport(app=fastapi_app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                # 1. Execute batch when chain 1 fails
+                fail_chain_1["flag"] = True
+                b1_resp = await client.post(
+                    "/api/v1/projects/p-batch/chains/execute-batch",
+                    json={"run_id": "r-batch-1"},
+                )
+                assert b1_resp.status_code == 200, b1_resp.text
+                b1 = b1_resp.json()
+                assert b1["batch_id"].startswith("batch_")
+                assert b1["total_chains"] == 2
+                assert b1["passed_chains"] == 1
+                assert b1["failed_chains"] == 1
+                assert all(c["batch_id"] == b1["batch_id"] for c in b1["chain_runs"])
+
+                # Gate scoped to b1 fails
+                g_b1 = await client.post(
+                    "/api/v1/projects/p-batch/gate",
+                    json={"run_id": "r-batch-1", "batch_id": b1["batch_id"]},
+                )
+                assert g_b1.status_code == 200
+                assert g_b1.json()["passed"] is False
+                assert g_b1.json()["batch_id"] == b1["batch_id"]
+                assert g_b1.json()["metrics"]["p0_chain_failures"] == 1
+
+                # 2. Fix chain 1 & run POST /gate with execute_chains=True -> fresh batch passes (ignores stale_legacy_chain!)
+                fail_chain_1["flag"] = False
+                g_exec = await client.post(
+                    "/api/v1/projects/p-batch/gate",
+                    json={"run_id": "r-batch-1", "execute_chains": True},
+                )
+                assert g_exec.status_code == 200, g_exec.text
+                d_exec = g_exec.json()
+                assert d_exec["passed"] is True
+                assert d_exec["batch_id"] is not None
+                assert d_exec["batch_id"] != b1["batch_id"]
+                assert d_exec["metrics"]["total_chain_runs"] == 2
+                assert d_exec["metrics"]["p0_chain_failures"] == 0
+
+            if db_mod._engine is not None:
+                await db_mod._engine.dispose()
+            db_mod._engine = None
+            db_mod._session_factory = None
+
+        # 3. CLI --execute-chains and --batch-id in local DB mode
+        runner = CliRunner()
+        r_cli_exec = runner.invoke(
+            cli_app,
+            [
+                "gate",
+                "--project-id",
+                "p-batch",
+                "--run-id",
+                "r-batch-1",
+                "--execute-chains",
+                "--json",
+            ],
+        )
+        assert r_cli_exec.exit_code == 0, r_cli_exec.output
+        cli_d = json.loads(r_cli_exec.stdout)
+        assert cli_d["passed"] is True
+        assert cli_d["batch_id"].startswith("batch_")
+        assert cli_d["metrics"]["total_chain_runs"] == 2
+    finally:
+        server.shutdown()
+        server.server_close()

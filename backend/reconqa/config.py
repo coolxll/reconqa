@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     default_cmd_timeout: int = Field(default=300)
     http_timeout: float = Field(default=15.0)
+    allow_local_webhooks: bool = Field(default=False)
     k6_proxy_url: str | None = Field(default=None)
     zap_api_url: str | None = Field(default=None)
     zap_api_key: str | None = Field(default=None)

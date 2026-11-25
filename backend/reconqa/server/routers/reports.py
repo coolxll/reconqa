@@ -18,7 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from reconqa.config import doctor_check, load_project_config, settings
 from reconqa.models.db import get_db
-from reconqa.models.schemas import FindingOut, QualityGateRequest, QualityGateResult
+from reconqa.models.schemas import (
+    ChainBatchExecuteRequest,
+    FindingOut,
+    QualityGateRequest,
+    QualityGateResult,
+)
 from reconqa.models.tables import Finding, Project, Run, ScenarioModel, Target
 from reconqa.modules.hub.acceptance_report import (
     build_acceptance_report_data,
@@ -33,6 +38,7 @@ from reconqa.modules.hub.quality_gate import (
     dispatch_webhooks,
     evaluate_project_quality_gate_db,
 )
+from reconqa.server.routers.chains import execute_project_chain_batch
 from reconqa.server.routers.projects import _compute_project_inventory
 from reconqa.server.routers.scenarios import (
     _build_scenario_list_response,
@@ -756,9 +762,41 @@ async def evaluate_project_quality_gate(
     body: QualityGateRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ) -> QualityGateResult:
-    """Evaluate quality gate rules for a project run and optionally dispatch webhooks."""
+    """Evaluate quality gate rules for a project run and optionally execute chains & dispatch webhooks."""
     req = body or QualityGateRequest()
     proj_cfg = load_project_config()
+
+    if req.execute_chains:
+        should_execute_batch = True
+        if req.run_id is not None:
+            cand_run = await db.get(Run, req.run_id)
+            if cand_run is None or cand_run.project_id != project_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Run '{req.run_id}' not found in project '{project_id}'",
+                )
+            if cand_run.status != "completed":
+                should_execute_batch = False
+        if should_execute_batch:
+            batch_resp = await execute_project_chain_batch(
+                db,
+                project_id,
+                ChainBatchExecuteRequest(
+                    run_id=req.run_id,
+                    chain_indices=req.chain_indices,
+                    base_url=req.base_url,
+                    credential_id=req.credential_id,
+                    db_dsn_ref=req.db_dsn_ref,
+                    sync_scenarios=True,
+                ),
+            )
+            req = req.model_copy(
+                update={
+                    "batch_id": batch_resp.batch_id,
+                    "run_id": req.run_id or batch_resp.run_id,
+                }
+            )
+
     try:
         result, effective_cfg = await evaluate_project_quality_gate_db(
             db,

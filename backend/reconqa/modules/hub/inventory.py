@@ -699,7 +699,15 @@ def build_project_inventory(
                 media_req["schema"] = ep["request_schema"]
             if ep["request_example"] is not None:
                 media_req["example"] = ep["request_example"]
-            op_obj["requestBody"] = {"content": {"application/json": media_req}}
+            req_media_type = "application/json"
+            if isinstance(ep["request_example"], str):
+                non_comment = "\n".join(
+                    line for line in ep["request_example"].splitlines()
+                    if not line.lstrip().startswith("#")
+                ).lstrip()
+                if non_comment.startswith(("query", "mutation", "subscription", "{")):
+                    req_media_type = "application/graphql"
+            op_obj["requestBody"] = {"content": {req_media_type: media_req}}
 
         responses_obj: dict[str, Any] = {}
         primary_code = str(ep["status_codes"][0]) if ep["status_codes"] else "200"

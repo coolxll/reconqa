@@ -5,10 +5,14 @@ from __future__ import annotations
 import html
 import json
 import math
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from pydantic import BaseModel, Field
+
+from reconqa.modules.discovery.auth_resolver import sanitize_url_for_storage
 
 _DEFENSE_SLOTS: tuple[str, ...] = (
     "happy_path",
@@ -194,6 +198,8 @@ class AcceptancePerformanceSummary(BaseModel):
     high_critical_items: list[AcceptanceFindingItem] = Field(default_factory=list)
     har_perf_summary: dict[str, Any] | None = None
     slowest_ttfb: list[dict[str, Any]] = Field(default_factory=list)
+    slowest_total: list[dict[str, Any]] = Field(default_factory=list)
+    largest_responses: list[dict[str, Any]] = Field(default_factory=list)
     k6_analysis: dict[str, Any] | None = None
 
 
@@ -305,17 +311,257 @@ def _is_perf_category(category: str) -> bool:
     return low.startswith("perf_") or low == "performance"
 
 
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>'\"`)\]]+")
+_REL_PATH_QUERY_RE = re.compile(r"(?<![A-Za-z0-9_.:/])(?:/[^\s<>'\"`)\]]*)\?[^\s<>'\"`)\]]+")
+_EMBEDDED_CRED_RE = re.compile(r"(https?://)([^:/@\s]+):([^/@\s]+)@")
+_SENSITIVE_QUERY_EXACT = frozenset(
+    {
+        "token",
+        "access_token",
+        "accesstoken",
+        "auth",
+        "sig",
+        "signature",
+        "key",
+        "apikey",
+        "api_key",
+        "api-key",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "code",
+        "ticket",
+        "session",
+        "jwt",
+        "cookie",
+        "credential",
+    }
+)
+_SENSITIVE_FIELD_HINTS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "cookie",
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "jwt",
+    "signature",
+    "credential",
+    "session_id",
+    "sessionid",
+)
+
+
+def _is_sensitive_query_param(key: str) -> bool:
+    low = str(key or "").strip().lower()
+    if not low:
+        return False
+    if low in _SENSITIVE_QUERY_EXACT:
+        return True
+    if low.endswith(("_sig", "-sig")) or low.startswith(("sig_", "sig-")):
+        return True
+    return any(
+        hint in low
+        for hint in (
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "pwd",
+            "apikey",
+            "api_key",
+            "api-key",
+            "signature",
+            "credential",
+            "cookie",
+            "auth",
+            "session",
+            "jwt",
+        )
+    )
+
+
+def _is_sensitive_field_key(key: str) -> bool:
+    low = str(key or "").strip().lower()
+    if not low:
+        return False
+    return any(hint in low for hint in _SENSITIVE_FIELD_HINTS)
+
+
+def _sanitize_url(url: str) -> str:
+    """Strip userinfo and redact sensitive query parameters from a URL or path+query string."""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    cleaned = sanitize_url_for_storage(raw)
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        return _EMBEDDED_CRED_RE.sub(r"\1", cleaned)
+
+    netloc = parts.netloc
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[-1]
+
+    query = parts.query
+    if query:
+        pairs = parse_qsl(query, keep_blank_values=True)
+        changed = False
+        out_chunks: list[str] = []
+        for k, v in pairs:
+            if _is_sensitive_query_param(k) and v:
+                out_chunks.append(f"{k}=[REDACTED]")
+                changed = True
+            else:
+                out_chunks.append(f"{k}={v}" if v != "" else k)
+        if changed:
+            query = "&".join(out_chunks)
+        elif "%5BREDACTED%5D" in query or "%5bredacted%5d" in query.lower():
+            query = re.sub(r"%5BREDACTED%5D", "[REDACTED]", query, flags=re.IGNORECASE)
+
+    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+
+def _sanitize_text_urls(text: str) -> str:
+    """Sanitize standalone or embedded URLs and path?query tokens inside free text."""
+    raw = str(text if text is not None else "")
+    if not raw:
+        return raw
+    stripped = raw.strip()
+    if stripped.startswith(("http://", "https://")) and not any(ch.isspace() for ch in stripped):
+        return _sanitize_url(stripped)
+    cleaned = _URL_IN_TEXT_RE.sub(lambda m: _sanitize_url(m.group(0)), raw)
+    cleaned = _REL_PATH_QUERY_RE.sub(lambda m: _sanitize_url(m.group(0)), cleaned)
+    return cleaned
+
+
+def _sanitize_obj_recursive(obj: Any) -> Any:
+    """Recursively sanitize URLs and sensitive key values inside nested dicts/lists/strings."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            ks = str(k)
+            if _is_sensitive_field_key(ks) and not isinstance(v, (dict, list)):
+                out[ks] = "[REDACTED]" if v not in (None, "") else v
+            else:
+                out[ks] = _sanitize_obj_recursive(v)
+        return out
+    if isinstance(obj, list):
+        return [_sanitize_obj_recursive(item) for item in obj]
+    if isinstance(obj, str):
+        return _sanitize_text_urls(obj)
+    return obj
+
+
+def _sanitize_report(report: AcceptanceReportData) -> AcceptanceReportData:
+    """Return a sanitized copy of AcceptanceReportData with all URLs and secrets scrubbed."""
+    sanitized_scenarios: list[AcceptanceScenarioItem] = []
+    for sc_item in report.scenarios.scenarios:
+        clean_assertions = [
+            a.model_copy(
+                update={
+                    "target_endpoint": _sanitize_text_urls(a.target_endpoint),
+                    "expected": _sanitize_text_urls(a.expected),
+                }
+            )
+            for a in sc_item.assertions
+        ]
+        sanitized_scenarios.append(sc_item.model_copy(update={"assertions": clean_assertions}))
+
+    sanitized_chains: list[AcceptanceChainEvidenceItem] = []
+    for ch in report.chain_evidence.chains:
+        clean_steps: list[AcceptanceChainStepEvidence] = []
+        for st in ch.step_results:
+            clean_a_evs = [
+                ae.model_copy(
+                    update={
+                        "title": _sanitize_text_urls(ae.title),
+                        "actual": _sanitize_obj_recursive(ae.actual),
+                        "expected": _sanitize_text_urls(ae.expected),
+                        "message": _sanitize_text_urls(ae.message),
+                    }
+                )
+                for ae in st.assertions
+            ]
+            clean_steps.append(
+                st.model_copy(
+                    update={
+                        "name": _sanitize_text_urls(st.name),
+                        "url": _sanitize_text_urls(st.url),
+                        "error": _sanitize_text_urls(st.error) if st.error is not None else None,
+                        "assertions": clean_a_evs,
+                    }
+                )
+            )
+        sanitized_chains.append(ch.model_copy(update={"step_results": clean_steps}))
+
+    def _clean_findings(items: list[AcceptanceFindingItem]) -> list[AcceptanceFindingItem]:
+        return [
+            f.model_copy(
+                update={
+                    "endpoint": _sanitize_text_urls(f.endpoint),
+                    "title": _sanitize_text_urls(f.title),
+                    "evidence": _sanitize_obj_recursive(f.evidence)
+                    if isinstance(f.evidence, dict)
+                    else {},
+                }
+            )
+            for f in items
+        ]
+
+    perf = report.performance
+    return report.model_copy(
+        update={
+            "scenarios": report.scenarios.model_copy(update={"scenarios": sanitized_scenarios}),
+            "chain_evidence": report.chain_evidence.model_copy(update={"chains": sanitized_chains}),
+            "security_findings": report.security_findings.model_copy(
+                update={"high_critical_items": _clean_findings(report.security_findings.high_critical_items)}
+            ),
+            "performance": perf.model_copy(
+                update={
+                    "high_critical_items": _clean_findings(perf.high_critical_items),
+                    "har_perf_summary": _sanitize_obj_recursive(perf.har_perf_summary)
+                    if isinstance(perf.har_perf_summary, dict)
+                    else None,
+                    "slowest_ttfb": [
+                        _sanitize_obj_recursive(x) for x in perf.slowest_ttfb if isinstance(x, dict)
+                    ],
+                    "slowest_total": [
+                        _sanitize_obj_recursive(x) for x in perf.slowest_total if isinstance(x, dict)
+                    ],
+                    "largest_responses": [
+                        _sanitize_obj_recursive(x)
+                        for x in perf.largest_responses
+                        if isinstance(x, dict)
+                    ],
+                    "k6_analysis": _sanitize_obj_recursive(perf.k6_analysis)
+                    if isinstance(perf.k6_analysis, dict)
+                    else None,
+                }
+            ),
+        }
+    )
+
+
 def _normalize_finding(raw: Any) -> AcceptanceFindingItem:
     d = _to_dict(raw)
     sev = str(d.get("severity") or "info").strip().lower()
     ev = d.get("evidence")
+    clean_ev = _sanitize_obj_recursive(dict(ev)) if isinstance(ev, dict) else {}
     return AcceptanceFindingItem(
         id=str(d.get("id") or ""),
         category=str(d.get("category") or ""),
         severity=sev,
-        endpoint=str(d.get("endpoint") or ""),
-        title=str(d.get("title") or ""),
-        evidence=dict(ev) if isinstance(ev, dict) else {},
+        endpoint=_sanitize_text_urls(str(d.get("endpoint") or "")),
+        title=_sanitize_text_urls(str(d.get("title") or "")),
+        evidence=clean_ev,
     )
 
 
@@ -624,14 +870,32 @@ def build_acceptance_report_data(
 
     har_summary = None
     slowest_ttfb: list[dict[str, Any]] = []
+    slowest_total: list[dict[str, Any]] = []
+    largest_responses: list[dict[str, Any]] = []
     if isinstance(har_perf_report, dict):
         if isinstance(har_perf_report.get("summary"), dict):
-            har_summary = dict(har_perf_report["summary"])
+            har_summary = _sanitize_obj_recursive(dict(har_perf_report["summary"]))
         raw_slow = har_perf_report.get("slowest_ttfb")
         if isinstance(raw_slow, list):
-            slowest_ttfb = [dict(x) for x in raw_slow[:10] if isinstance(x, dict)]
+            slowest_ttfb = [
+                _sanitize_obj_recursive(dict(x)) for x in raw_slow[:10] if isinstance(x, dict)
+            ]
+        raw_slow_total = har_perf_report.get("slowest_total")
+        if isinstance(raw_slow_total, list):
+            slowest_total = [
+                _sanitize_obj_recursive(dict(x)) for x in raw_slow_total[:10] if isinstance(x, dict)
+            ]
+        raw_largest = (
+            har_perf_report.get("largest_responses")
+            if isinstance(har_perf_report.get("largest_responses"), list)
+            else har_perf_report.get("largest_bodies")
+        )
+        if isinstance(raw_largest, list):
+            largest_responses = [
+                _sanitize_obj_recursive(dict(x)) for x in raw_largest[:10] if isinstance(x, dict)
+            ]
 
-    k6_clean = dict(k6_analysis) if isinstance(k6_analysis, dict) else None
+    k6_clean = _sanitize_obj_recursive(dict(k6_analysis)) if isinstance(k6_analysis, dict) else None
 
     sec_model = AcceptanceSecurityFindings(
         total_count=sec_total,
@@ -646,6 +910,8 @@ def build_acceptance_report_data(
         high_critical_items=perf_hc,
         har_perf_summary=har_summary,
         slowest_ttfb=slowest_ttfb,
+        slowest_total=slowest_total,
+        largest_responses=largest_responses,
         k6_analysis=k6_clean,
     )
 
@@ -671,29 +937,31 @@ def build_acceptance_report_data(
         high_critical_perf_count=perf_model.high_critical_count,
     )
 
-    return AcceptanceReportData(
-        project_id=str(project_id),
-        project_name=str(project_name or project_id),
-        project_slug=str(project_slug or ""),
-        run_id=run_id,
-        generated_at=generated_at or datetime.now(UTC).isoformat(),
-        summary=summary,
-        api_coverage=api_coverage,
-        capability_map=cap_map_model,
-        scenarios=scenario_stats,
-        chain_evidence=chain_summary,
-        security_findings=sec_model,
-        performance=perf_model,
+    return _sanitize_report(
+        AcceptanceReportData(
+            project_id=str(project_id),
+            project_name=str(project_name or project_id),
+            project_slug=str(project_slug or ""),
+            run_id=run_id,
+            generated_at=generated_at or datetime.now(UTC).isoformat(),
+            summary=summary,
+            api_coverage=api_coverage,
+            capability_map=cap_map_model,
+            scenarios=scenario_stats,
+            chain_evidence=chain_summary,
+            security_findings=sec_model,
+            performance=perf_model,
+        )
     )
 
 
 def _coerce_report(data: AcceptanceReportData | dict[str, Any]) -> AcceptanceReportData:
     if isinstance(data, AcceptanceReportData):
-        return data
+        return _sanitize_report(data)
     if isinstance(data, dict):
         # Allow callers passing either full AcceptanceReportData dict or partial dict
         if "summary" in data and "api_coverage" in data and "generated_at" in data:
-            return AcceptanceReportData.model_validate(data)
+            return _sanitize_report(AcceptanceReportData.model_validate(data))
         return build_acceptance_report_data(
             project_id=str(data.get("project_id") or "unknown"),
             project_name=str(data.get("project_name") or data.get("project_id") or "Project"),
@@ -1027,6 +1295,21 @@ def render_acceptance_report_markdown(data: AcceptanceReportData | dict[str, Any
                 "",
             ]
         )
+
+    if perf.slowest_ttfb:
+        lines.extend(
+            [
+                "| Method | Endpoint / URL | TTFB (ms) |",
+                "| :---: | --- | ---: |",
+            ]
+        )
+        for item in perf.slowest_ttfb[:10]:
+            target_label = str(item.get("url") or item.get("path") or "/")
+            lines.append(
+                f"| `{_md_cell(item.get('method', 'GET'))}` | `{_md_cell(target_label)}` | "
+                f"{_safe_float(item.get('ttfb_ms'), 0.0):.1f} |"
+            )
+        lines.append("")
 
     if perf.k6_analysis:
         k6 = perf.k6_analysis
@@ -1494,6 +1777,18 @@ def render_acceptance_report_html(data: AcceptanceReportData | dict[str, Any]) -
             f"large_bodies=<strong>{_esc(hp.get('large_body_count', 0))}</strong>"
             "</p>"
         )
+    if perf.slowest_ttfb:
+        parts.append(
+            "<table><thead><tr><th>Method</th><th>Endpoint / URL</th><th>TTFB (ms)</th></tr></thead><tbody>"
+        )
+        for item in perf.slowest_ttfb[:10]:
+            target_label = str(item.get("url") or item.get("path") or "/")
+            parts.append(
+                f"<tr><td><code>{_esc(item.get('method', 'GET'))}</code></td>"
+                f"<td><code>{_esc(target_label)}</code></td>"
+                f"<td>{_safe_float(item.get('ttfb_ms'), 0.0):.1f}</td></tr>"
+            )
+        parts.append("</tbody></table>")
     if perf.k6_analysis:
         k6 = perf.k6_analysis
         k6_m = k6.get("metrics") if isinstance(k6.get("metrics"), dict) else {}

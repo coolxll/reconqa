@@ -7,7 +7,7 @@ import math
 import re
 import uuid
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from reconqa.modules.discovery.auth_resolver import redact_secrets, sanitize_url_for_storage
 from reconqa.modules.hub.assertion_engine import _tokenize_jsonpath
@@ -25,6 +25,9 @@ POSTMAN_SCHEMA_V2_1 = "https://schema.getpostman.com/json/collection/v2.1.0/coll
 _SINGLE_BRACE_PARAM_RE = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})")
 _DOUBLE_BRACE_VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}")
 _EMBEDDED_CRED_URL_RE = re.compile(r"(https?://)([^:/@\s]+):([^/@\s]+)@")
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>'\"`)\]]+")
+_REL_PATH_QUERY_RE = re.compile(r"(?<![A-Za-z0-9_.:/])(?:/[^\s<>'\"`)\]]*)\?[^\s<>'\"`)\]]+")
+_GQL_RAW_PREFIX_RE = re.compile(r"^(?:query|mutation|subscription|fragment)\b")
 _INLINE_REGEX_FLAGS_RE = re.compile(r"^\(\?([ims]+)\)")
 _COMMON_SHORT_SECRETS = frozenset(
     {
@@ -126,9 +129,45 @@ def _templatize_header(key: str, value: Any, collected_secrets: list[str]) -> st
     return val_str
 
 
+_EXTRA_SENSITIVE_QUERY_EXACT = frozenset(
+    {
+        "sig",
+        "signature",
+        "cookie",
+        "credential",
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-security-token",
+    }
+)
+
+
+def _is_sensitive_query_param(key: str) -> bool:
+    if _is_sensitive_query_key(key):
+        return True
+    low = str(key or "").strip().lower()
+    if not low:
+        return False
+    if low in _EXTRA_SENSITIVE_QUERY_EXACT:
+        return True
+    if low.endswith(("_sig", "-sig")) or low.startswith(("sig_", "sig-")):
+        return True
+    return any(
+        hint in low
+        for hint in (
+            "signature",
+            "credential",
+            "cookie",
+            "auth",
+            "session",
+            "jwt",
+        )
+    )
+
+
 def _sanitize_query_value(key: str, value: Any, collected_secrets: list[str]) -> str:
     val_str = str(value if value is not None else "")
-    if _is_sensitive_query_key(key):
+    if _is_sensitive_query_param(key):
         if _contains_template(val_str):
             return val_str
         if val_str.strip():
@@ -137,8 +176,57 @@ def _sanitize_query_value(key: str, value: Any, collected_secrets: list[str]) ->
     return val_str
 
 
+def _sanitize_url_token(raw_url: str, collected_secrets: list[str]) -> str:
+    """Redact user:pass@ credentials and sensitive query params inside a URL or path?query."""
+    _collect_userinfo_secrets(raw_url, collected_secrets)
+    cleaned = _strip_embedded_credential_urls(raw_url)
+    if "?" not in cleaned:
+        return cleaned
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        return cleaned
+    if not parts.query:
+        return cleaned
+
+    changed = False
+    out_chunks: list[str] = []
+    for chunk in parts.query.split("&"):
+        if not chunk:
+            out_chunks.append(chunk)
+            continue
+        if "=" in chunk:
+            rk, rv = chunk.split("=", 1)
+            k = unquote(rk)
+            v = rv if _contains_template(rv) else unquote(rv)
+            if _is_sensitive_query_param(k) and v.strip() and not _contains_template(v):
+                _record_collected_secret(v, collected_secrets)
+                out_chunks.append(f"{rk}=[REDACTED]")
+                changed = True
+                continue
+        out_chunks.append(chunk)
+
+    if not changed:
+        return cleaned
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(out_chunks), parts.fragment))
+
+
+def _sanitize_text_urls(text: str, collected_secrets: list[str]) -> str:
+    if not text:
+        return text
+    cleaned = _URL_IN_TEXT_RE.sub(
+        lambda m: _sanitize_url_token(m.group(0), collected_secrets),
+        text,
+    )
+    cleaned = _REL_PATH_QUERY_RE.sub(
+        lambda m: _sanitize_url_token(m.group(0), collected_secrets),
+        cleaned,
+    )
+    return cleaned
+
+
 def _sanitize_payload(payload: Any, collected_secrets: list[str]) -> Any:
-    """Recursively redact sensitive fields in JSON bodies/examples while preserving `{{var}}`."""
+    """Recursively redact sensitive fields and signed/credential URLs while preserving `{{var}}`."""
     if payload is None:
         return None
     if isinstance(payload, dict):
@@ -165,13 +253,7 @@ def _sanitize_payload(payload: Any, collected_secrets: list[str]) -> Any:
                 return json.dumps(sanitized, ensure_ascii=False, indent=2)
             except Exception:
                 pass
-        if "://" in payload and "@" in payload:
-            if stripped.startswith(("http://", "https://")) and not any(
-                ch.isspace() for ch in stripped
-            ):
-                return _strip_embedded_credential_urls(sanitize_url_for_storage(payload))
-            return _strip_embedded_credential_urls(payload)
-        return payload
+        return _sanitize_text_urls(payload, collected_secrets)
     return payload
 
 
@@ -240,6 +322,7 @@ def _build_postman_url(
     wire_path: str,
     query_items: list[dict[str, Any]],
     path_vars: list[dict[str, str]],
+    host_var: str = "baseUrl",
 ) -> dict[str, Any]:
     clean_path = wire_path if wire_path.startswith("/") else f"/{wire_path}"
     if clean_path != "/":
@@ -251,13 +334,14 @@ def _build_postman_url(
         for q in query_items
         if not q.get("disabled", False)
     ]
-    raw_url = "{{baseUrl}}" + (clean_path if clean_path != "/" else "/")
+    host_token = f"{{{{{host_var or 'baseUrl'}}}}}"
+    raw_url = host_token + (clean_path if clean_path != "/" else "/")
     if active_query:
         raw_url += "?" + "&".join(active_query)
 
     url_obj: dict[str, Any] = {
         "raw": raw_url,
-        "host": ["{{baseUrl}}"],
+        "host": [host_token],
         "path": segments,
     }
     if query_items:
@@ -278,7 +362,11 @@ def _parse_numeric_expectation(raw: str) -> tuple[str, float | None]:
     return "finite", val
 
 
-def _compile_assertion_js(assertion: Any, idx: int) -> tuple[list[str], bool]:
+def _compile_assertion_js(
+    assertion: Any,
+    idx: int,
+    collected_secrets: list[str] | None = None,
+) -> tuple[list[str], bool]:
     """Compile a ScenarioAssertion into Postman `pm.test(...)` JS lines.
 
     Returns `(lines, needs_json_helper)`.
@@ -329,11 +417,26 @@ def _compile_assertion_js(assertion: Any, idx: int) -> tuple[list[str], bool]:
             h_part, v_part = expected.split(":", 1)
             header_name = h_part.strip()
             header_expected = v_part.strip()
-        h_js = json.dumps(header_name or "content-type", ensure_ascii=False)
-        hv_js = json.dumps(header_expected, ensure_ascii=False)
+        eff_hdr = header_name or "content-type"
+        h_js = json.dumps(eff_hdr, ensure_ascii=False)
+        if _is_sensitive_header_name(eff_hdr) and header_expected.strip() and not _contains_template(
+            header_expected
+        ):
+            if collected_secrets is not None:
+                _record_collected_secret(header_expected, collected_secrets)
+            safe_hdr = eff_hdr.replace("\r", " ").replace("\n", " ")
+            return [
+                f"// Sensitive expected value redacted for header {safe_hdr}",
+                f"pm.test({title_js}, function () {{",
+                f'    var _hdrVal = String(pm.response.headers.get({h_js}) || "");',
+                "    pm.expect(_hdrVal).to.be.ok;",
+                "});",
+            ], False
+        clean_hdr_exp = _redact_non_structural_text(header_expected, collected_secrets)
+        hv_js = json.dumps(clean_hdr_exp, ensure_ascii=False)
         return [
             f"pm.test({title_js}, function () {{",
-            f"    pm.expect(String(pm.response.headers.get({h_js}) || \"\")).to.eql({hv_js});",
+            f'    pm.expect(String(pm.response.headers.get({h_js}) || "")).to.eql({hv_js});',
             "});",
         ], False
 
@@ -351,6 +454,18 @@ def _compile_assertion_js(assertion: Any, idx: int) -> tuple[list[str], bool]:
     if op == "var_equals":
         var_name = jsonpath.lstrip("$.").strip() or "var"
         var_js = json.dumps(var_name, ensure_ascii=False)
+        if _is_sensitive_field_key(var_name) and expected.strip() and not _contains_template(
+            expected
+        ):
+            if collected_secrets is not None:
+                _record_collected_secret(expected, collected_secrets)
+            safe_var = var_name.replace("\r", " ").replace("\n", " ")
+            return [
+                f"// Sensitive expected value redacted for variable {safe_var}",
+                f"pm.test({title_js}, function () {{",
+                f"    pm.expect(pm.collectionVariables.get({var_js})).to.be.ok;",
+                "});",
+            ], False
         return [
             f"pm.test({title_js}, function () {{",
             f"    pm.expect(String(pm.collectionVariables.get({var_js}))).to.eql({exp_js});",
@@ -360,6 +475,23 @@ def _compile_assertion_js(assertion: Any, idx: int) -> tuple[list[str], bool]:
     tokens = _tokenize_jsonpath(jsonpath)
     tokens_js = json.dumps(tokens, ensure_ascii=False)
     val_expr = f"_rqGet(_rqJson, {tokens_js})"
+
+    if (
+        op in {"equals", "not_equals", "contains", "not_contains", "matches", "array_contains"}
+        and expected.strip()
+        and not _contains_template(expected)
+        and any(isinstance(tok, str) and _is_sensitive_field_key(tok) for tok in tokens)
+    ):
+        if collected_secrets is not None:
+            _record_collected_secret(expected, collected_secrets)
+        safe_jp = jsonpath.replace("\r", " ").replace("\n", " ")
+        return [
+            f"// Sensitive expected value redacted for {safe_jp}",
+            f"pm.test({title_js}, function () {{",
+            f"    var _val = {val_expr};",
+            "    pm.expect(_val).to.be.ok;",
+            "});",
+        ], True
 
     if op == "json_schema":
         try:
@@ -379,6 +511,9 @@ def _compile_assertion_js(assertion: Any, idx: int) -> tuple[list[str], bool]:
             "});",
         ], True
 
+    clean_expected = _redact_non_structural_text(expected, collected_secrets)
+    if clean_expected != expected:
+        exp_js = json.dumps(clean_expected, ensure_ascii=False)
     body_lines: list[str] = [
         f"pm.test({title_js}, function () {{",
         f"    var _val = {val_expr};",
@@ -489,6 +624,7 @@ def _build_test_event(
     expected_statuses: list[int] | None = None,
     extracts: dict[str, str] | None = None,
     assertions: list[Any] | None = None,
+    collected_secrets: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     script_blocks: list[str] = []
     needs_json_helper = bool(extracts)
@@ -503,7 +639,7 @@ def _build_test_event(
         )
         if str(op) == "status_code":
             has_status_assertion = True
-        a_lines, a_needs_json = _compile_assertion_js(assertion, idx)
+        a_lines, a_needs_json = _compile_assertion_js(assertion, idx, collected_secrets)
         if a_lines:
             compiled_assertions.append(a_lines)
         if a_needs_json:
@@ -604,7 +740,7 @@ def _collect_template_vars(obj: Any, out: set[str]) -> None:
 def _redact_non_structural_text(text: str, secrets: list[str]) -> str:
     if _DOUBLE_BRACE_VAR_RE.fullmatch(text.strip()):
         return text
-    cleaned = _strip_embedded_credential_urls(text)
+    cleaned = _sanitize_text_urls(text, [])
     if secrets:
         cleaned = redact_secrets(cleaned, secrets)
     return cleaned
@@ -682,6 +818,93 @@ def _final_redact(collection: dict[str, Any], secrets: list[str]) -> dict[str, A
     return collection
 
 
+def _normalize_origin(
+    raw_url_or_host: str,
+    *,
+    default_scheme: str = "https",
+    known_origins_by_netloc: dict[str, str] | None = None,
+    collected_secrets: list[str] | None = None,
+) -> str:
+    raw = str(raw_url_or_host or "").strip()
+    if not raw:
+        return ""
+    if collected_secrets is not None:
+        _collect_userinfo_secrets(raw, collected_secrets)
+    if "://" in raw:
+        sanitized = sanitize_url_for_storage(raw)
+        try:
+            parts = urlsplit(sanitized)
+        except ValueError:
+            return ""
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+        return ""
+    host = raw.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip().lower()
+    if "@" in host:
+        host = host.rsplit("@", 1)[-1]
+    if not host:
+        return ""
+    if known_origins_by_netloc and host in known_origins_by_netloc:
+        return known_origins_by_netloc[host]
+    return f"{default_scheme}://{host}"
+
+
+def _lookup_openapi_op(
+    openapi_doc: dict[str, Any] | None,
+    ep_path: str,
+    method: str,
+) -> dict[str, Any] | None:
+    if not isinstance(openapi_doc, dict):
+        return None
+    paths = openapi_doc.get("paths")
+    if not isinstance(paths, dict):
+        return None
+    path_item = paths.get(ep_path) or paths.get(_strip_fragment(ep_path))
+    if not isinstance(path_item, dict):
+        return None
+    op = path_item.get(method.lower())
+    return op if isinstance(op, dict) else None
+
+
+def _is_raw_graphql_request(
+    *,
+    ep_path: str,
+    payload: Any,
+    header_map: dict[str, tuple[str, str]],
+    explicit_content_type: str = "",
+    openapi_op: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    ct_entry = header_map.get("content-type")
+    existing_ct = ct_entry[1].strip() if ct_entry else ""
+    if "application/graphql" in existing_ct.lower():
+        return True, existing_ct
+    if "application/graphql" in (explicit_content_type or "").lower():
+        return True, explicit_content_type.strip()
+    if isinstance(openapi_op, dict):
+        req_body = openapi_op.get("requestBody")
+        if isinstance(req_body, dict) and isinstance(req_body.get("content"), dict):
+            content_keys = list(req_body["content"].keys())
+            gql_key = next(
+                (str(k) for k in content_keys if "application/graphql" in str(k).lower()),
+                None,
+            )
+            has_json = any("json" in str(k).lower() for k in content_keys)
+            if gql_key and (not has_json or isinstance(payload, str)):
+                return True, gql_key
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if stripped and not stripped.startswith(("{", "[")):
+            path_low = _strip_fragment(ep_path).lower()
+            is_gql_path = any(
+                seg in {"graphql", "gql"} or seg.endswith("graphql")
+                for seg in path_low.split("/")
+                if seg
+            )
+            if is_gql_path or _GQL_RAW_PREFIX_RE.match(stripped):
+                return True, "application/graphql"
+    return False, ""
+
+
 def export_postman_collection(
     *,
     project_id: str,
@@ -702,19 +925,97 @@ def export_postman_collection(
     collected_secrets: list[str] = []
     discovered_vars: set[str] = set()
 
-    # Resolve baseUrl safely
+    known_origins_by_netloc: dict[str, str] = {}
+    if isinstance(openapi_doc, dict):
+        for srv in openapi_doc.get("servers") or []:
+            if isinstance(srv, dict) and srv.get("url"):
+                srv_origin = _normalize_origin(
+                    str(srv["url"]), collected_secrets=collected_secrets
+                )
+                if srv_origin:
+                    netloc = (urlsplit(srv_origin).netloc or "").lower()
+                    if netloc and netloc not in known_origins_by_netloc:
+                        known_origins_by_netloc[netloc] = srv_origin
+
+    endpoints = list((inventory or {}).get("endpoints") or [])
+
+    # Resolve primary baseUrl safely
     candidate_base = (base_url or "").strip()
     if not candidate_base and isinstance(openapi_doc, dict):
         servers = openapi_doc.get("servers") or []
         if isinstance(servers, list) and servers and isinstance(servers[0], dict):
             candidate_base = str(servers[0].get("url") or "").strip()
     if not candidate_base:
+        for ep in endpoints:
+            if not isinstance(ep, dict):
+                continue
+            cand = str(
+                ep.get("origin") or ep.get("base_url") or ep.get("server_url") or ep.get("host") or ""
+            ).strip()
+            if cand:
+                candidate_base = _normalize_origin(
+                    cand,
+                    known_origins_by_netloc=known_origins_by_netloc,
+                    collected_secrets=collected_secrets,
+                )
+                if candidate_base:
+                    break
+    if not candidate_base:
+        for ch in chains or []:
+            if not isinstance(ch, dict):
+                continue
+            for st in ch.get("steps") or []:
+                if isinstance(st, dict) and "://" in str(st.get("raw_url") or ""):
+                    candidate_base = _normalize_origin(
+                        str(st["raw_url"]),
+                        known_origins_by_netloc=known_origins_by_netloc,
+                        collected_secrets=collected_secrets,
+                    )
+                    if candidate_base:
+                        break
+            if candidate_base:
+                break
+    if not candidate_base:
         candidate_base = "https://api.example.com"
+
     _collect_userinfo_secrets(candidate_base, collected_secrets)
-    resolved_base_url = sanitize_url_for_storage(candidate_base).rstrip("/") or "https://api.example.com"
+    resolved_base_url = (
+        sanitize_url_for_storage(candidate_base).rstrip("/") or "https://api.example.com"
+    )
+    primary_origin = (
+        _normalize_origin(resolved_base_url, collected_secrets=collected_secrets)
+        or "https://api.example.com"
+    )
+    primary_scheme = (urlsplit(primary_origin).scheme or "https").lower()
+
+    origin_to_var: dict[str, str] = {primary_origin: "baseUrl"}
+    extra_host_vars: dict[str, str] = {}
+
+    def _resolve_host_var(raw_origin_or_host: str) -> str:
+        origin = _normalize_origin(
+            raw_origin_or_host,
+            default_scheme=primary_scheme,
+            known_origins_by_netloc=known_origins_by_netloc,
+            collected_secrets=collected_secrets,
+        )
+        if not origin or origin == primary_origin:
+            return "baseUrl"
+        if origin in origin_to_var:
+            return origin_to_var[origin]
+        parts = urlsplit(origin)
+        slug = re.sub(r"[^a-zA-Z0-9]+", "_", parts.netloc or "").strip("_").lower() or "service"
+        var_name = f"baseUrl_{slug}"
+        if var_name in extra_host_vars and extra_host_vars[var_name] != origin:
+            var_name = f"baseUrl_{parts.scheme.lower()}_{slug}"
+        suffix = 2
+        while var_name in extra_host_vars and extra_host_vars[var_name] != origin:
+            var_name = f"baseUrl_{slug}_{suffix}"
+            suffix += 1
+        origin_to_var[origin] = var_name
+        extra_host_vars[var_name] = origin
+        return var_name
 
     # Folder 1: Asset Library Endpoints
-    endpoints = list((inventory or {}).get("endpoints") or [])
     grouped_endpoints: dict[str, list[dict[str, Any]]] = {}
 
     for ep in endpoints:
@@ -725,6 +1026,19 @@ def export_postman_collection(
         summary = str(ep.get("summary") or "").strip()
         wire_path = _strip_fragment(ep_path) or "/"
         pm_path, path_vars = _convert_single_brace_params(wire_path)
+        openapi_op = _lookup_openapi_op(openapi_doc, ep_path, method)
+
+        ep_origin_cand = str(
+            ep.get("origin") or ep.get("base_url") or ep.get("server_url") or ep.get("host") or ""
+        ).strip()
+        if not ep_origin_cand and isinstance(openapi_op, dict):
+            ep_origin_cand = str(openapi_op.get("x-origin") or openapi_op.get("x-host") or "").strip()
+            if not ep_origin_cand and isinstance(openapi_op.get("servers"), list):
+                for srv in openapi_op["servers"]:
+                    if isinstance(srv, dict) and srv.get("url"):
+                        ep_origin_cand = str(srv["url"]).strip()
+                        break
+        ep_host_var = _resolve_host_var(ep_origin_cand)
 
         # Headers
         header_map: dict[str, tuple[str, str]] = {}
@@ -764,6 +1078,12 @@ def export_postman_collection(
         # Body
         req_body_obj: dict[str, Any] | None = None
         raw_payload = ep.get("request_example")
+        if raw_payload is None and isinstance(openapi_op, dict):
+            req_b = openapi_op.get("requestBody")
+            if isinstance(req_b, dict) and isinstance(req_b.get("content"), dict):
+                gql_media = req_b["content"].get("application/graphql")
+                if isinstance(gql_media, dict) and gql_media.get("example") is not None:
+                    raw_payload = gql_media["example"]
         if raw_payload is None and isinstance(ep.get("request_schema"), dict):
             raw_payload = _synthesize_schema_example(ep["request_schema"])
         if raw_payload is not None and method not in {"GET", "HEAD"}:
@@ -772,19 +1092,35 @@ def export_postman_collection(
                 raw_text = json.dumps(sanitized_body, ensure_ascii=False, indent=2)
             else:
                 raw_text = str(sanitized_body)
-            req_body_obj = {
-                "mode": "raw",
-                "raw": raw_text,
-                "options": {"raw": {"language": "json"}},
-            }
-            if "content-type" not in header_map:
-                header_map["content-type"] = ("Content-Type", "application/json")
+            is_raw_gql, gql_ct = _is_raw_graphql_request(
+                ep_path=ep_path,
+                payload=sanitized_body,
+                header_map=header_map,
+                explicit_content_type=str(ep.get("request_content_type") or ""),
+                openapi_op=openapi_op,
+            )
+            if is_raw_gql:
+                req_body_obj = {
+                    "mode": "raw",
+                    "raw": raw_text,
+                    "options": {"raw": {"language": "text"}},
+                }
+                header_map["content-type"] = ("Content-Type", gql_ct)
+            else:
+                req_body_obj = {
+                    "mode": "raw",
+                    "raw": raw_text,
+                    "options": {"raw": {"language": "json"}},
+                }
+                if "content-type" not in header_map:
+                    header_map["content-type"] = ("Content-Type", "application/json")
 
         headers_list = [{"key": orig_k, "value": v, "type": "text"} for orig_k, v in header_map.values()]
         url_obj = _build_postman_url(
             wire_path=pm_path,
             query_items=query_items,
             path_vars=path_vars,
+            host_var=ep_host_var,
         )
 
         matched_assertions = _match_step_scenario_assertions(
@@ -793,6 +1129,7 @@ def export_postman_collection(
         events = _build_test_event(
             expected_statuses=list(ep.get("status_codes") or []),
             assertions=matched_assertions,
+            collected_secrets=collected_secrets,
         )
 
         item_name = f"{method} {ep_path}"
@@ -859,13 +1196,21 @@ def export_postman_collection(
 
         chain_items: list[dict[str, Any]] = []
         for st_dict, is_cleanup in step_entries:
-            _collect_userinfo_secrets(str(st_dict.get("raw_url") or ""), collected_secrets)
+            raw_step_url_orig = str(st_dict.get("raw_url") or "")
+            _collect_userinfo_secrets(raw_step_url_orig, collected_secrets)
             virtual_frag = (
                 _extract_virtual_fragment(str(st_dict.get("path") or ""))
-                or _extract_virtual_fragment(str(st_dict.get("raw_url") or ""))
+                or _extract_virtual_fragment(raw_step_url_orig)
             )
             explicit_step_name = str(st_dict.get("name") or "").strip()
             step_in = _apply_uses_to_step(st_dict)
+
+            step_origin_cand = ""
+            if "://" in raw_step_url_orig:
+                step_origin_cand = raw_step_url_orig
+            elif "://" in str(step_in.raw_url or ""):
+                step_origin_cand = str(step_in.raw_url)
+            step_host_var = _resolve_host_var(step_origin_cand)
 
             raw_step_path = str(step_in.path or "/")
             virtual_step_path = (
@@ -904,13 +1249,27 @@ def export_postman_collection(
                     raw_text = json.dumps(sanitized_body, ensure_ascii=False, indent=2)
                 else:
                     raw_text = str(sanitized_body)
-                req_body_obj = {
-                    "mode": "raw",
-                    "raw": raw_text,
-                    "options": {"raw": {"language": "json"}},
-                }
-                if "content-type" not in header_map:
-                    header_map["content-type"] = ("Content-Type", "application/json")
+                is_raw_gql, gql_ct = _is_raw_graphql_request(
+                    ep_path=virtual_step_path,
+                    payload=sanitized_body,
+                    header_map=header_map,
+                    explicit_content_type=str(st_dict.get("request_content_type") or ""),
+                )
+                if is_raw_gql:
+                    req_body_obj = {
+                        "mode": "raw",
+                        "raw": raw_text,
+                        "options": {"raw": {"language": "text"}},
+                    }
+                    header_map["content-type"] = ("Content-Type", gql_ct)
+                else:
+                    req_body_obj = {
+                        "mode": "raw",
+                        "raw": raw_text,
+                        "options": {"raw": {"language": "json"}},
+                    }
+                    if "content-type" not in header_map:
+                        header_map["content-type"] = ("Content-Type", "application/json")
 
             headers_list = [
                 {"key": orig_k, "value": v, "type": "text"}
@@ -920,6 +1279,7 @@ def export_postman_collection(
                 wire_path=pm_step_path,
                 query_items=query_items,
                 path_vars=step_path_vars,
+                host_var=step_host_var,
             )
 
             matched_assertions = _match_step_scenario_assertions(
@@ -945,6 +1305,7 @@ def export_postman_collection(
                 else None,
                 extracts=step_in.extracts,
                 assertions=combined_assertions,
+                collected_secrets=collected_secrets,
             )
 
             step_item_name = explicit_step_name or f"{step_in.method} {virtual_step_path}"
@@ -975,11 +1336,20 @@ def export_postman_collection(
     # Variables
     variables: list[dict[str, str]] = [
         {"key": "baseUrl", "value": resolved_base_url, "type": "string"},
-        {"key": "authToken", "value": "", "type": "string"},
-        {"key": "authCookie", "value": "", "type": "string"},
-        {"key": "apiKey", "value": "", "type": "string"},
     ]
-    for var_name in sorted(discovered_vars - _BUILTIN_VARS):
+    for host_var_key in sorted(extra_host_vars.keys()):
+        variables.append(
+            {"key": host_var_key, "value": extra_host_vars[host_var_key], "type": "string"}
+        )
+    variables.extend(
+        [
+            {"key": "authToken", "value": "", "type": "string"},
+            {"key": "authCookie", "value": "", "type": "string"},
+            {"key": "apiKey", "value": "", "type": "string"},
+        ]
+    )
+    reserved_vars = _BUILTIN_VARS | set(extra_host_vars.keys())
+    for var_name in sorted(discovered_vars - reserved_vars):
         variables.append({"key": var_name, "value": "", "type": "string"})
 
     col_name = f"{project_name} — ReconQA Collection"

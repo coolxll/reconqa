@@ -396,6 +396,8 @@ class HarEntry:
     has_auth: bool = False
     graphql_operation_name: str | None = None
     graphql_operation_type: str | None = None
+    graphql_batch_index: int | None = None
+    graphql_batch_size: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -430,6 +432,8 @@ class HarEntry:
             "has_auth": self.has_auth,
             "graphql_operation_name": self.graphql_operation_name,
             "graphql_operation_type": self.graphql_operation_type,
+            "graphql_batch_index": self.graphql_batch_index,
+            "graphql_batch_size": self.graphql_batch_size,
         }
 
 
@@ -717,12 +721,19 @@ _GQL_ANON_TYPE_RE = re.compile(
 _GQL_FRAGMENT_HEAD_RE = re.compile(r"fragment\b")
 
 
+_VALID_GQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def _sanitize_graphql_op_name(name: str | None) -> str | None:
     raw = str(name or "").strip()
     if not raw:
         return None
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("_").lstrip("/!.")
-    return cleaned or None
+    if _VALID_GQL_IDENT_RE.fullmatch(raw):
+        return raw
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).lstrip("/!.")
+    if not cleaned or not any(ch.isalnum() or ch == "_" for ch in cleaned):
+        return None
+    return cleaned
 
 
 def _is_graphql_path_or_mime(raw_path: str, req_mime: str) -> bool:
@@ -805,7 +816,7 @@ def _extract_graphql_ops_for_request(
     req_json: Any,
     query_params: dict[str, str],
     resp_json: Any,
-) -> list[tuple[str | None, str | None, Any, Any]]:
+) -> list[tuple[str | None, str | None, Any, Any, int | None, int | None]]:
     on_gql_endpoint = _is_graphql_path_or_mime(raw_path, req_mime)
 
     # Case A: Batched GraphQL JSON array
@@ -833,21 +844,24 @@ def _extract_graphql_ops_for_request(
                 )
                 item_ops.append((op_name, q_type))
 
-            if len(req_json) == 1:
-                return [(item_ops[0][0], item_ops[0][1], req_json, resp_json)]
+            batch_size = len(req_json)
+            if batch_size == 1:
+                return [(item_ops[0][0], item_ops[0][1], req_json, resp_json, 0, 1)]
 
             if any(op_n is not None for op_n, _ in item_ops):
-                resp_is_paired_list = isinstance(resp_json, list) and len(resp_json) == len(req_json)
+                resp_is_paired_list = isinstance(resp_json, list) and len(resp_json) == batch_size
                 return [
                     (
                         item_ops[idx][0],
                         item_ops[idx][1],
                         item,
                         resp_json[idx] if resp_is_paired_list else resp_json,
+                        idx,
+                        batch_size,
                     )
                     for idx, item in enumerate(req_json)
                 ]
-            return [(None, item_ops[0][1], req_json, resp_json)]
+            return [(None, item_ops[0][1], req_json, resp_json, None, batch_size)]
 
     # Case B: Single GraphQL JSON object
     if isinstance(req_json, dict):
@@ -862,12 +876,12 @@ def _extract_graphql_ops_for_request(
                 if isinstance(raw_op, str) and raw_op.strip()
                 else q_name
             )
-            return [(op_name, q_type, req_json, resp_json)]
+            return [(op_name, q_type, req_json, resp_json, None, None)]
 
     # Case C: Raw application/graphql body
     if "graphql" in (req_mime or "").lower() and req_json is None and req_body_raw:
         op_name, op_type = _extract_op_from_graphql_query(req_body_raw)
-        return [(op_name, op_type, req_json, resp_json)]
+        return [(op_name, op_type, req_json, resp_json, None, None)]
 
     # Case D: GET GraphQL query params
     if method == "GET" and on_gql_endpoint:
@@ -879,9 +893,9 @@ def _extract_graphql_ops_for_request(
             if isinstance(raw_op, str) and raw_op.strip()
             else q_name
         )
-        return [(op_name, q_type, req_json, resp_json)]
+        return [(op_name, q_type, req_json, resp_json, None, None)]
 
-    return [(None, None, req_json, resp_json)]
+    return [(None, None, req_json, resp_json, None, None)]
 
 
 def parse_har_file(
@@ -1018,10 +1032,13 @@ def parse_har_file(
             query_params,
             resp_json,
         )
-        for op_name, op_type, entry_req_json, entry_resp_json in gql_ops:
+        for op_name, op_type, entry_req_json, entry_resp_json, batch_idx, batch_sz in gql_ops:
             entry_norm_path = (
                 f"{base_normalized_path}#{op_name}" if op_name else base_normalized_path
             )
+            preserved_body_raw = req_body_raw
+            if preserved_body_raw is None and batch_sz is not None and isinstance(req_json, list):
+                preserved_body_raw = json.dumps(req_json, ensure_ascii=False)
             entry = HarEntry(
                 index=raw_idx,
                 scenario=scenario_name,
@@ -1038,7 +1055,7 @@ def parse_har_file(
                 request_headers=req_headers,
                 request_cookies=req_cookies,
                 request_mime_type=req_mime,
-                request_body_raw=req_body_raw,
+                request_body_raw=preserved_body_raw,
                 request_json=entry_req_json,
                 request_form=req_form,
                 status=status_code,
@@ -1055,6 +1072,8 @@ def parse_har_file(
                 has_auth=has_auth,
                 graphql_operation_name=op_name,
                 graphql_operation_type=op_type,
+                graphql_batch_index=batch_idx,
+                graphql_batch_size=batch_sz,
             )
             parsed.append((ts_ms, raw_idx, entry))
 

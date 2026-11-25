@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import math
@@ -12,14 +13,14 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 import yaml
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from reconqa.config import GateConfig, ProjectConfig
+from reconqa.config import GateConfig, ProjectConfig, settings
 from reconqa.models.schemas import (
     ChainRunOut,
     GateRuleResult,
@@ -45,7 +46,15 @@ _BLOCKED_METADATA_HOSTS = frozenset(
     }
 )
 _LINK_LOCAL_V4 = ipaddress.ip_network("169.254.0.0/16")
+_LINK_LOCAL_V6 = ipaddress.ip_network("fe80::/10")
+_CGNAT_V4 = ipaddress.ip_network("100.64.0.0/10")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_WEBHOOK_VENDOR_HOSTS: dict[str, frozenset[str]] = {
+    "feishu": frozenset({"open.feishu.cn", "open.larksuite.com"}),
+    "dingtalk": frozenset({"oapi.dingtalk.com"}),
+    "slack": frozenset({"hooks.slack.com", "hooks.slack-gov.com"}),
+}
+_ALL_WEBHOOK_VENDOR_HOSTS: frozenset[str] = frozenset().union(*_WEBHOOK_VENDOR_HOSTS.values())
 
 _SIMILARITY_SUFFIX_RE = re.compile(r"\s*\(similarity=\d+(?:\.\d+)?\)")
 _WS_RE = re.compile(r"\s+")
@@ -249,6 +258,7 @@ def _load_offline_checkpoints(
     chain_runs_dir: Path | None,
     *,
     run_id: str | None = None,
+    batch_id: str | None = None,
 ) -> tuple[list[ChainRunOut], dict[str, str]]:
     if chain_runs_dir is None or not chain_runs_dir.is_dir():
         return [], {}
@@ -261,6 +271,8 @@ def _load_offline_checkpoints(
         if raw is None:
             continue
         if run_id and raw.get("run_id") and raw.get("run_id") != run_id:
+            continue
+        if batch_id and raw.get("batch_id") != batch_id:
             continue
         try:
             out = checkpoint_to_out(raw)
@@ -314,24 +326,25 @@ def _endpoint_matches_target(method: str, url_or_path: str, target_endpoint: str
     return endpoint_matches_target(method, url_or_path, target_endpoint)
 
 
-def _step_matches_target(step_method: str, step_url: str, target_endpoint: str) -> bool:
-    """Match a persisted ChainStepResult against a ScenarioAssertion target_endpoint.
+def _step_matches_target(
+    step_method: str,
+    step_url: str,
+    target_endpoint: str,
+    *,
+    virtual_path: str = "",
+) -> bool:
+    """Strictly match a persisted ChainStepResult against a ScenarioAssertion target_endpoint.
 
-    chain_runner strips GraphQL `#OperationName` fragments before persisting step.url.
-    When step_url has no `#fragment` and target_endpoint has a non-SPA `#OperationName`
-    fragment, also match against the base endpoint (without stripping `#/` SPA routes
-    or relaxing comparisons when step_url already carries a different `#fragment`).
+    GraphQL operations are matched strictly via ``virtual_path`` (e.g. ``/graphql#GetOrderList``);
+    a bare ``/graphql`` endpoint NEVER matches a target with a ``#OperationName`` fragment.
     """
-    if _endpoint_matches_target(step_method, step_url, target_endpoint):
-        return True
-    raw_target = (target_endpoint or "").strip()
-    raw_url = (step_url or "").strip()
-    if "#" in raw_target and "#" not in raw_url:
-        base_target, raw_frag = raw_target.split("#", 1)
-        frag = raw_frag.split("?", 1)[0].strip()
-        if frag and not frag.startswith(("/", "!")) and base_target.strip():
-            return _endpoint_matches_target(step_method, raw_url, base_target.strip())
-    return False
+    vp = (virtual_path or "").strip()
+    if vp:
+        if _endpoint_matches_target(step_method, vp, target_endpoint):
+            return True
+        if "#" in vp:
+            return False
+    return _endpoint_matches_target(step_method, step_url, target_endpoint)
 
 
 def _extract_scenario_entries(
@@ -421,7 +434,12 @@ def _resolve_chain_priority(
             assertions: list[ScenarioAssertion] = sc["assertions"]
             if any(
                 a.target_endpoint
-                and _step_matches_target(step.method, step.url, a.target_endpoint)
+                and _step_matches_target(
+                    step.method,
+                    step.url,
+                    a.target_endpoint,
+                    virtual_path=step.virtual_path,
+                )
                 for a in assertions
             ):
                 prio = sc["priority"]
@@ -469,6 +487,23 @@ def merge_gate_config(
     return cfg
 
 
+def _deduplicate_latest_chain_runs(
+    chain_runs: Sequence[ChainRunOut],
+    *,
+    batch_id: str | None = None,
+) -> list[ChainRunOut]:
+    """Keep only the latest checkpoint per (chain_index, chain_name) (optionally scoped to batch_id)."""
+    filtered = [c for c in chain_runs if (not batch_id or c.batch_id == batch_id)]
+    latest_by_key: dict[tuple[int | None, str], tuple[str, ChainRunOut]] = {}
+    for ch in filtered:
+        key = (ch.chain_index, (ch.chain_name or "").strip())
+        ts = str(ch.updated_at or ch.created_at or "")
+        existing = latest_by_key.get(key)
+        if existing is None or ts > existing[0]:
+            latest_by_key[key] = (ts, ch)
+    return [entry[1] for entry in latest_by_key.values()]
+
+
 def evaluate_quality_gate(
     *,
     current_findings: Sequence[dict[str, Any] | Finding] = (),
@@ -488,10 +523,12 @@ def evaluate_quality_gate(
     target_label: str = "",
     run_id: str | None = None,
     baseline_run_id: str | None = None,
+    batch_id: str | None = None,
 ) -> QualityGateResult:
     """Evaluate all 4 Quality Gate rules over normalized project/run inputs."""
     cfg = gate_config or GateConfig()
     hints = chain_priority_hints or {}
+    effective_chain_runs = _deduplicate_latest_chain_runs(chain_runs, batch_id=batch_id)
 
     # --- Rule 1: P0 chain / scenario failures ---
     scenario_entries = _extract_scenario_entries(scenarios)
@@ -526,7 +563,7 @@ def evaluate_quality_gate(
     p0_failed_chains = 0
     failed_chain_names: list[str] = []
     failed_chain_p0_slugs: set[str] = set()
-    for chain in chain_runs:
+    for chain in effective_chain_runs:
         prio, matched_slugs = _resolve_chain_priority(
             chain,
             priority_hints=hints,
@@ -691,9 +728,12 @@ def evaluate_quality_gate(
         rule4_passed = True
         rule4_msg = "Skipped: max_p95_ms threshold is not configured"
     elif p95_ms is None:
-        rule4_skipped = True
-        rule4_passed = True
-        rule4_msg = f"Skipped: no P95 latency data available (threshold={cfg.max_p95_ms:.2f}ms)"
+        rule4_skipped = False
+        rule4_passed = False
+        rule4_msg = (
+            f"Missing P95 latency evidence for configured max_p95_ms threshold "
+            f"(max {cfg.max_p95_ms:.2f}ms)"
+        )
     else:
         rule4_skipped = False
         rule4_passed = p95_ms <= cfg.max_p95_ms
@@ -727,7 +767,7 @@ def evaluate_quality_gate(
         p0_chain_failures=p0_chain_failures,
         p0_failed_chains=p0_failed_chains,
         p0_failed_assertions=p0_failed_assertions,
-        total_chain_runs=len(chain_runs),
+        total_chain_runs=len(effective_chain_runs),
         high_security_count=high_security_count,
         baseline_high_security_count=baseline_high_security_count,
         new_high_security_count=new_high_security_count,
@@ -746,6 +786,7 @@ def evaluate_quality_gate(
         target_label=resolved_label,
         run_id=run_id,
         baseline_run_id=baseline_run_id,
+        batch_id=batch_id,
         passed=overall_passed,
         status="passed" if overall_passed else "failed",
         evaluated_at=datetime.now(UTC).isoformat(),
@@ -763,6 +804,7 @@ def evaluate_run_dir_gate(
     chain_runs_dir: Path | None = None,
     run_id: str | None = None,
     baseline_run_id: str | None = None,
+    batch_id: str | None = None,
     gate_config: GateConfig | None = None,
     project_name: str = "",
     target_label: str = "",
@@ -780,7 +822,9 @@ def evaluate_run_dir_gate(
     resolved_chain_dir = chain_runs_dir or (
         run_dir / "chain_runs" if (run_dir / "chain_runs").is_dir() else None
     )
-    chain_runs, priority_hints = _load_offline_checkpoints(resolved_chain_dir, run_id=run_id)
+    chain_runs, priority_hints = _load_offline_checkpoints(
+        resolved_chain_dir, run_id=run_id, batch_id=batch_id
+    )
     scenarios = _load_offline_scenarios(run_dir)
 
     return evaluate_quality_gate(
@@ -801,6 +845,7 @@ def evaluate_run_dir_gate(
         target_label=target_label or project_name or run_dir.name,
         run_id=run_id,
         baseline_run_id=baseline_run_id,
+        batch_id=batch_id,
     )
 
 
@@ -816,6 +861,76 @@ async def _load_run_findings_db(db: AsyncSession, run_obj: Run) -> list[dict[str
     if ws is not None and ws.is_dir():
         return extract_run_findings(ws)
     return []
+
+
+def _run_timestamp(run_obj: Run) -> datetime | None:
+    ts = run_obj.finished_at or run_obj.started_at
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
+
+
+def _run_target_host(run_obj: Run) -> str:
+    cfg = run_obj.config_snapshot if isinstance(run_obj.config_snapshot, dict) else {}
+    target_url = str(cfg.get("target_url") or "").strip()
+    if not target_url:
+        return ""
+    try:
+        parsed = urlsplit(target_url)
+    except ValueError:
+        return ""
+    return (parsed.hostname or "").strip().lower().rstrip(".")
+
+
+def _runs_same_target(candidate: Run, other: Run) -> bool:
+    cand_host = _run_target_host(candidate)
+    other_host = _run_target_host(other)
+    if cand_host and other_host and cand_host != other_host:
+        return False
+    if candidate.target_id is not None:
+        return other.target_id == candidate.target_id
+    if other.target_id is not None:
+        return False
+    return cand_host == other_host
+
+
+def _build_incomplete_candidate_result(
+    *,
+    project: Project,
+    run_obj: Run | None,
+    batch_id: str | None,
+    detail: str,
+) -> QualityGateResult:
+    rule = GateRuleResult(
+        rule="candidate_run_completed",
+        label="Candidate Run Completed",
+        passed=False,
+        skipped=False,
+        actual=None,
+        threshold=None,
+        message=detail,
+        details={
+            "run_id": run_obj.id if run_obj is not None else None,
+            "run_status": run_obj.status if run_obj is not None else None,
+        },
+    )
+    return QualityGateResult(
+        project_id=project.id,
+        project_name=project.name,
+        target_label=project.name,
+        run_id=run_obj.id if run_obj is not None else None,
+        baseline_run_id=None,
+        batch_id=batch_id,
+        passed=False,
+        status="failed",
+        evaluated_at=datetime.now(UTC).isoformat(),
+        rules=[rule],
+        metrics=QualityGateMetrics(),
+        summary=f"FAILED: {detail}",
+        webhook_results=[],
+    )
 
 
 async def evaluate_project_quality_gate_db(
@@ -844,13 +959,46 @@ async def evaluate_project_quality_gate_db(
         selected_run = await db.get(Run, req.run_id)
         if selected_run is None or selected_run.project_id != project_id:
             raise GateLookupError(f"Run '{req.run_id}' not found in project '{project_id}'")
+        if selected_run.status != "completed":
+            return (
+                _build_incomplete_candidate_result(
+                    project=project,
+                    run_obj=selected_run,
+                    batch_id=req.batch_id,
+                    detail=f"Candidate run is not completed (run_id={selected_run.id}, status={selected_run.status})",
+                ),
+                effective_cfg,
+            )
     else:
         for r in all_runs:
             if r.status == "completed":
                 selected_run = r
                 break
-        if selected_run is None and all_runs:
-            selected_run = all_runs[0]
+        if selected_run is None:
+            if all_runs:
+                latest_incomplete = all_runs[0]
+                return (
+                    _build_incomplete_candidate_result(
+                        project=project,
+                        run_obj=latest_incomplete,
+                        batch_id=req.batch_id,
+                        detail=(
+                            f"Candidate run is not completed "
+                            f"(no completed runs; latest run_id={latest_incomplete.id}, status={latest_incomplete.status})"
+                        ),
+                    ),
+                    effective_cfg,
+                )
+            if req.batch_id is None:
+                return (
+                    _build_incomplete_candidate_result(
+                        project=project,
+                        run_obj=None,
+                        batch_id=None,
+                        detail="No completed candidate run found in project for quality gate evaluation.",
+                    ),
+                    effective_cfg,
+                )
 
     baseline_run: Run | None = None
     if req.baseline_run_id is not None:
@@ -860,20 +1008,22 @@ async def evaluate_project_quality_gate_db(
                 f"Baseline run '{req.baseline_run_id}' not found in project '{project_id}'"
             )
     elif selected_run is not None:
-        sel_ts = selected_run.finished_at or selected_run.started_at
-        completed_others = [
-            r for r in all_runs if r.status == "completed" and r.id != selected_run.id
-        ]
+        sel_ts = _run_timestamp(selected_run)
         if sel_ts is not None:
-            earlier = [
+            earlier_same_target = [
                 r
-                for r in completed_others
-                if (r.finished_at or r.started_at) is not None
-                and (r.finished_at or r.started_at) <= sel_ts
+                for r in all_runs
+                if r.status == "completed"
+                and r.id != selected_run.id
+                and _runs_same_target(selected_run, r)
+                and (_run_timestamp(r) is not None)
+                and (_run_timestamp(r) < sel_ts)  # type: ignore[operator]
             ]
-            baseline_run = earlier[0] if earlier else (completed_others[0] if completed_others else None)
-        elif completed_others:
-            baseline_run = completed_others[0]
+            earlier_same_target.sort(
+                key=lambda r: _run_timestamp(r) or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )
+            baseline_run = earlier_same_target[0] if earlier_same_target else None
 
     sc_rows = list(
         (await db.execute(select(ScenarioModel).where(ScenarioModel.project_id == project_id)))
@@ -881,7 +1031,36 @@ async def evaluate_project_quality_gate_db(
         .all()
     )
 
-    if req.run_id is not None:
+    if req.batch_id is not None:
+        chain_runs = list_checkpoints(project_id, batch_id=req.batch_id, limit=200)
+        if not chain_runs:
+            return (
+                _build_incomplete_candidate_result(
+                    project=project,
+                    run_obj=selected_run,
+                    batch_id=req.batch_id,
+                    detail=f"Batch '{req.batch_id}' not found or contains no chain execution checkpoints.",
+                ),
+                effective_cfg,
+            )
+        if selected_run is not None:
+            mismatched = [
+                cp for cp in chain_runs if cp.run_id is not None and cp.run_id != selected_run.id
+            ]
+            if mismatched:
+                return (
+                    _build_incomplete_candidate_result(
+                        project=project,
+                        run_obj=selected_run,
+                        batch_id=req.batch_id,
+                        detail=(
+                            f"Batch '{req.batch_id}' belongs to a different run "
+                            f"({mismatched[0].run_id}) than candidate run ({selected_run.id})."
+                        ),
+                    ),
+                    effective_cfg,
+                )
+    elif req.run_id is not None:
         chain_runs = list_checkpoints(project_id, run_id=req.run_id, limit=200)
     else:
         all_cps = list_checkpoints(project_id, run_id=None, limit=200)
@@ -941,6 +1120,7 @@ async def evaluate_project_quality_gate_db(
         target_label=project.name,
         run_id=selected_run.id if selected_run is not None else None,
         baseline_run_id=baseline_run.id if baseline_run is not None else None,
+        batch_id=req.batch_id,
     )
     return result, effective_cfg
 
@@ -959,8 +1139,41 @@ def _is_loopback_host(host: str) -> bool:
     return ip.is_loopback
 
 
-def validate_webhook_url(url: str) -> tuple[bool, str | None]:
-    """Validate webhook URL: http/https only, no control chars, SSRF-safe (loopback allowed)."""
+def _classify_blocked_ip(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    allow_loopback: bool,
+) -> str | None:
+    """Return a controlled block reason if IP is disallowed for webhook delivery."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+
+    if str(ip) in _BLOCKED_METADATA_HOSTS:
+        return "cloud metadata IP"
+    if isinstance(ip, ipaddress.IPv4Address) and ip in _LINK_LOCAL_V4:
+        return "link-local IP"
+    if isinstance(ip, ipaddress.IPv6Address) and ip in _LINK_LOCAL_V6:
+        return "link-local IP"
+    if ip.is_link_local:
+        return "link-local IP"
+    if isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_V4:
+        return "CGNAT IP"
+    if ip.is_loopback:
+        return None if allow_loopback else "loopback IP"
+    if ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+        return "reserved IP"
+    if ip.is_private:
+        return "private IP"
+    return None
+
+
+def validate_webhook_url(
+    url: str,
+    *,
+    provider: str | None = None,
+    allow_local: bool | None = None,
+) -> tuple[bool, str | None]:
+    """Validate webhook URL: HTTPS + vendor host allowlist + DNS SSRF protection."""
     raw = (url or "").strip()
     if not raw:
         return False, "Webhook URL is empty"
@@ -969,18 +1182,19 @@ def validate_webhook_url(url: str) -> tuple[bool, str | None]:
 
     try:
         parts = urlsplit(raw)
-    except ValueError as exc:
-        return False, f"Malformed webhook URL: {exc}"
+    except ValueError:
+        return False, "Malformed webhook URL"
 
-    if parts.scheme.lower() not in {"http", "https"}:
-        return False, f"Unsupported URL scheme '{parts.scheme or 'none'}'; only http/https allowed"
+    scheme = (parts.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return False, f"Unsupported URL scheme '{parts.scheme or 'none'}'; only https allowed"
     if not parts.netloc or not parts.hostname:
         return False, "Webhook URL is missing a valid host"
 
     try:
         port = parts.port
-    except ValueError as exc:
-        return False, f"Malformed webhook URL port: {exc}"
+    except ValueError:
+        return False, "Malformed webhook URL port"
     if port is not None and not (1 <= port <= 65535):
         return False, f"Webhook URL port {port} is out of range (1..65535)"
 
@@ -988,34 +1202,82 @@ def validate_webhook_url(url: str) -> tuple[bool, str | None]:
     if host in _BLOCKED_METADATA_HOSTS:
         return False, f"Blocked cloud metadata host '{host}'"
 
-    if not _is_loopback_host(host):
+    # Check literal IP (and reject non-canonical IPv4 forms like decimal/hex/octal)
+    literal_ip: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
         try:
-            ip = ipaddress.ip_address(host)
-            if isinstance(ip, ipaddress.IPv4Address) and ip in _LINK_LOCAL_V4:
-                return False, f"Blocked link-local IP address '{host}'"
-            if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-                mapped = ip.ipv4_mapped
-                if mapped in _LINK_LOCAL_V4 or str(mapped) in _BLOCKED_METADATA_HOSTS:
-                    return False, f"Blocked link-local IPv4-mapped address '{host}'"
-            if ip.is_link_local:
-                return False, f"Blocked link-local IP address '{host}'"
-        except ValueError:
+            packed = socket.inet_aton(host)
+        except OSError:
+            packed = None
+        if packed is not None:
+            canonical_ip = ipaddress.IPv4Address(packed)
+            if host != str(canonical_ip):
+                return False, f"Blocked non-canonical IPv4 literal '{host}'"
+            literal_ip = canonical_ip
+
+    eff_allow_local = settings.allow_local_webhooks if allow_local is None else bool(allow_local)
+
+    if eff_allow_local and _is_loopback_host(host):
+        if literal_ip is not None:
+            reason = _classify_blocked_ip(literal_ip, allow_loopback=True)
+            if reason is not None:
+                return False, f"Blocked webhook target ({reason})"
+            return True, None
+        # Hostname is 'localhost' — verify DNS resolves strictly to loopback IPs
+        try:
+            infos = socket.getaddrinfo(host, port or (443 if scheme == "https" else 80), type=socket.SOCK_STREAM)
+        except OSError:
+            return False, f"Failed to resolve local webhook host '{host}'"
+        if not infos:
+            return False, f"No DNS records found for local webhook host '{host}'"
+        for info in infos:
             try:
-                packed = socket.inet_aton(host)
-            except OSError:
-                packed = None
-            if packed is not None:
-                canonical_ip = ipaddress.IPv4Address(packed)
-                if host != str(canonical_ip):
-                    return False, f"Blocked non-canonical IPv4 literal '{host}'"
-                if canonical_ip in _LINK_LOCAL_V4:
-                    return False, f"Blocked link-local IP address '{host}'"
+                resolved_ip = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                return False, f"Invalid resolved IP address for webhook host '{host}'"
+            reason = _classify_blocked_ip(resolved_ip, allow_loopback=True)
+            if reason is not None or not resolved_ip.is_loopback:
+                return False, f"Local webhook host '{host}' resolved to non-loopback address"
+        return True, None
+
+    if scheme != "https":
+        return False, "Webhook URL must use https:// scheme"
+
+    if literal_ip is not None:
+        reason = _classify_blocked_ip(literal_ip, allow_loopback=False)
+        if reason is not None:
+            return False, f"Blocked webhook target ({reason})"
+        return False, "Webhook URL must use a trusted vendor hostname, not a raw IP address"
+
+    if provider is not None:
+        allowed_hosts = _WEBHOOK_VENDOR_HOSTS.get(provider.strip().lower())
+        if not allowed_hosts or host not in allowed_hosts:
+            return False, f"Webhook host '{host}' is not allowed for provider '{provider}'"
+    elif host not in _ALL_WEBHOOK_VENDOR_HOSTS:
+        return False, f"Webhook host '{host}' is not in the trusted webhook vendor allowlist"
+
+    try:
+        infos = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return False, f"Failed to resolve webhook host '{host}'"
+    if not infos:
+        return False, f"No DNS records found for webhook host '{host}'"
+    for info in infos:
+        try:
+            resolved_ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False, f"Invalid resolved IP address for webhook host '{host}'"
+        reason = _classify_blocked_ip(resolved_ip, allow_loopback=False)
+        if reason is not None:
+            return False, f"Webhook host '{host}' resolved to blocked {reason}"
 
     return True, None
 
 
 def mask_webhook_url(url: str) -> str:
-    """Redact userinfo, query parameter values, and trailing secret path tokens."""
+    """Redact webhook URL to scheme://host only (stripping userinfo, port, path, query, tokens)."""
     raw = (url or "").strip()
     if not raw:
         return ""
@@ -1024,38 +1286,15 @@ def mask_webhook_url(url: str) -> str:
     except ValueError:
         return "[invalid-url]"
 
-    if not parts.scheme or not parts.netloc:
+    if not parts.scheme or not parts.netloc or not parts.hostname:
         return "[invalid-url]"
 
-    hostname = parts.hostname or ""
+    hostname = parts.hostname.strip().lower()
     if ":" in hostname and not hostname.startswith("["):
         host_repr = f"[{hostname}]"
     else:
         host_repr = hostname
-    try:
-        port = parts.port
-    except ValueError:
-        port = None
-    netloc = f"{host_repr}:{port}" if port is not None else host_repr
-
-    segments = [seg for seg in parts.path.split("/") if seg]
-    if len(segments) >= 2:
-        segments[-1] = "***"
-        masked_path = "/" + "/".join(segments)
-    elif len(segments) == 1:
-        masked_path = "/***"
-    else:
-        masked_path = parts.path
-
-    masked_query = ""
-    if parts.query:
-        pairs = parse_qsl(parts.query, keep_blank_values=True)
-        if pairs:
-            masked_query = urlencode([(k, "***") for k, _ in pairs])
-        else:
-            masked_query = "***"
-
-    return urlunsplit((parts.scheme.lower(), netloc, masked_path, masked_query, ""))
+    return f"{parts.scheme.lower()}://{host_repr}"
 
 
 def _build_webhook_title_and_markdown(result: QualityGateResult) -> tuple[str, str]:
@@ -1124,6 +1363,78 @@ def format_webhook_payload(
     raise ValueError(f"Unsupported webhook provider: {provider}")
 
 
+def _safe_vendor_code(val: Any) -> str:
+    if isinstance(val, int) and not isinstance(val, bool):
+        return str(val)
+    raw = str(val or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", raw):
+        return raw
+    return "unknown"
+
+
+def _verify_vendor_webhook_response(
+    provider: Literal["feishu", "dingtalk", "slack"],
+    resp: httpx.Response,
+) -> tuple[bool, str | None]:
+    """Verify HTTP 2xx vendor-specific business codes without ever echoing raw response bodies."""
+    if provider == "slack":
+        if resp.status_code != 200:
+            return False, f"HTTP {resp.status_code} webhook rejected"
+        text_norm = (resp.text or "").strip().lower()
+        if text_norm == "ok":
+            return True, None
+        try:
+            data = resp.json()
+        except Exception:
+            return False, "Slack webhook rejected payload"
+        if isinstance(data, dict) and data.get("ok") is True:
+            return True, None
+        return False, "Slack webhook rejected payload"
+
+    try:
+        data = resp.json()
+    except Exception:
+        return False, f"{provider.capitalize()} webhook returned unexpected response payload"
+
+    if not isinstance(data, dict):
+        return False, f"{provider.capitalize()} webhook returned unexpected response payload"
+
+    if provider == "feishu":
+        if "code" in data:
+            code_val = data["code"]
+            if not isinstance(code_val, bool) and code_val == 0:
+                return True, None
+            return False, f"Feishu webhook rejected payload (code={_safe_vendor_code(code_val)})"
+        if "StatusCode" in data:
+            sc_val = data["StatusCode"]
+            if not isinstance(sc_val, bool) and sc_val == 0:
+                return True, None
+            return False, f"Feishu webhook rejected payload (code={_safe_vendor_code(sc_val)})"
+        return False, "Feishu webhook returned unexpected response payload"
+
+    if provider == "dingtalk":
+        if "errcode" in data:
+            err_val = data["errcode"]
+            if not isinstance(err_val, bool) and err_val == 0:
+                return True, None
+            return False, f"DingTalk webhook rejected payload (errcode={_safe_vendor_code(err_val)})"
+        return False, "DingTalk webhook returned unexpected response payload"
+
+    return False, "Unsupported webhook provider"
+
+
+def _classify_webhook_exception(exc: Exception) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return "Webhook request timed out"
+    if isinstance(exc, httpx.ConnectError):
+        return "Webhook connection failed"
+    if isinstance(exc, httpx.TooManyRedirects):
+        return "Webhook redirect blocked"
+    if isinstance(exc, (httpx.InvalidURL, ValueError)):
+        return "Invalid webhook URL"
+    return "Webhook HTTP transport error"
+
+
 async def dispatch_webhooks(
     webhooks: dict[str, str | None],
     result: QualityGateResult,
@@ -1138,7 +1449,11 @@ async def dispatch_webhooks(
             continue
         provider: Literal["feishu", "dingtalk", "slack"] = raw_provider  # type: ignore[assignment]
         masked = mask_webhook_url(raw_url)
-        valid, err = validate_webhook_url(raw_url)
+        valid, err = await asyncio.to_thread(
+            validate_webhook_url,
+            raw_url,
+            provider=provider,
+        )
         if not valid:
             deliveries.append(
                 WebhookDeliveryResult(
@@ -1168,13 +1483,24 @@ async def dispatch_webhooks(
                     headers={"Content-Type": "application/json"},
                 )
             if 200 <= resp.status_code < 300:
+                ok_vendor, vendor_err = _verify_vendor_webhook_response(provider, resp)
                 deliveries.append(
                     WebhookDeliveryResult(
                         provider=provider,
                         url_masked=masked,
-                        sent=True,
+                        sent=ok_vendor,
                         status_code=resp.status_code,
-                        error=None,
+                        error=vendor_err,
+                    )
+                )
+            elif 300 <= resp.status_code < 400:
+                deliveries.append(
+                    WebhookDeliveryResult(
+                        provider=provider,
+                        url_masked=masked,
+                        sent=False,
+                        status_code=resp.status_code,
+                        error=f"HTTP {resp.status_code} webhook redirect blocked",
                     )
                 )
             else:
@@ -1184,7 +1510,7 @@ async def dispatch_webhooks(
                         url_masked=masked,
                         sent=False,
                         status_code=resp.status_code,
-                        error=f"HTTP {resp.status_code}: {resp.text[:200]}",
+                        error=f"HTTP {resp.status_code} webhook rejected",
                     )
                 )
         except (httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
@@ -1194,7 +1520,7 @@ async def dispatch_webhooks(
                     url_masked=masked,
                     sent=False,
                     status_code=None,
-                    error=str(exc)[:300],
+                    error=_classify_webhook_exception(exc),
                 )
             )
     return deliveries
